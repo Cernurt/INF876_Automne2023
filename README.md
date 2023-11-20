@@ -1,2 +1,4 @@
 # INF876_Automne2023
-BABABABbibiibBOUBOUBBOU
+let the grind begin.
+
+Répo de projet de cloud computing INF876
