@@ -1,5 +1,6 @@
 #!/bin/bash
 
+
 clear
 
 echo "
@@ -45,25 +46,29 @@ echo "Running bandit on $python_program..."
 
 bandit "$python_program"
 
-
+echo "-------------------------------------------------------------"
+echo " "
 echo "Do you want to run a dynamic analysis on the python program? (y/n)"
 read answer
 
-
 if [ "$answer" = "y" ]; then
-    echo "Enter the memory you want to predict:"
-    read number
+   
+    echo -n "Running the Python script now " 
     
-    echo "Running the Python script..."
-    if [[ $number =~ ^[0-9]+$ ]]; then
-        echo "Running the Python script with the time needed for $number MB..."
     
-        python3 main_ia_memory_predict.py $python_program $number 
-    else
-        echo "Invalid input. Please enter a valid number."
-    fi
+    scalene $python_program &
+    PID=$!
+    i=1
+    sp="/-\|"
+    echo -n ' '
+    while [ -d /proc/$PID ]
+    do
+        sleep 0.3
+        printf "\b${sp:i++%${#sp}:1}"
+    done 
+
 elif [ "$answer" = "n" ]; then
-    echo "Okay, not running the Dynamic analysis."
+    echo "Okay, not running the Dynamic analysis..."
 else
-    echo "Invalid input. Please enter 'yes' or 'no'."
+    echo "Invalid input. PLEASE enter 'y' or 'n'."
 fi
