@@ -9,5 +9,6 @@ COPY . /app
 RUN pip install pylint && \
 pip install bandit && \
 pip install numpy && \
-pip install scipy
+pip install scipy && \
+pip install scalene
 
