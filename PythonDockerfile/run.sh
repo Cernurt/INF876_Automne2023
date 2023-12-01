@@ -16,7 +16,7 @@ echo "
 "
 
 if [ $# -eq 0 ]; then
-    echo "Usage: $0 <python_program>"
+    echo "Usage: $0 <python_program> (-y)"
     exit 1
 fi
 
@@ -31,6 +31,13 @@ fi
 if [[ ! "$python_program" =~ \.py$ ]]; then
     echo "Error: '$python_program' is not a valid Python program (missing .py extension)."
     exit 1
+fi
+
+
+if [[ $2 = "-y" ]]; then 
+    autoskip=1
+else 
+    autoskip=O
 fi
 
 echo "Running pylint on $python_program..."
@@ -48,10 +55,18 @@ bandit "$python_program"
 
 echo "-------------------------------------------------------------"
 echo " "
-echo "Do you want to run a dynamic analysis on the python program? (y/n)"
-read answer
 
-if [ "$answer" = "y" ]; then
+
+if [[ $autoskip = 1 ]]; then
+
+    answer="y"
+
+else
+    echo "Do you want to run a dynamic analysis on the python program? (y/n)"
+    read answer
+fi
+
+if [ $answer = "y" ]; then
    
     echo -n "Running the Python script now " 
     
