@@ -8,5 +8,6 @@ COPY . /app
 # Run the specified Python script when the container launches
 RUN pip install pylint && \
 pip install bandit && \
-pip install -U scalene
+pip install numpy && \
+pip install scipy
 
