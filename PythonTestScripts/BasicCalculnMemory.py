@@ -2,7 +2,7 @@ import numpy as np
 import time
 
 # Create a large array to consume memory
-large_array = np.random.rand(10000, 10000)
+large_array = np.random.rand(2000, 2000)
 
 # Perform a time-consuming operation on the array
 start_time = time.time()
