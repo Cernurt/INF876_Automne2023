@@ -31,16 +31,16 @@ if [[ ! "$python_program" =~ \.py$ ]]; then
     exit 1
 fi
 
-docker build PythonDockerfile/ -t temp
+docker build PythonDockerfile/ -t temp 1>/dev/null
 
-docker run -d --name memory_guesser -it temp:latest /bin/bash
+docker run -d --name memory_guesser -it temp:latest /bin/bash 1>/dev/null
 
-docker cp $python_program memory_guesser:/app/prog.py
+docker cp $python_program memory_guesser:/app/prog.py 1>/dev/null
 
-docker exec memory_guesser chmod +x /app/run.sh
+docker exec memory_guesser chmod +x /app/run.sh 1>/dev/null
 
 docker exec memory_guesser /app/run.sh /app/prog.py -y
 
-docker stop memory_guesser
+docker stop memory_guesser 1>/dev/null
 
-docker container rm memory_guesser
+docker container rm memory_guesser 1>/dev/null
