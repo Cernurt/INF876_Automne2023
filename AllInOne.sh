@@ -14,6 +14,8 @@ echo "
 
 "
 
+echo "If you meet an error with Python libraries, feel free to add 'pip install <yourlibraryname>' to the dockerfile !"
+
 if [ $# -eq 0 ]; then
     echo "Usage: $0 <python_program>"
     exit 1
