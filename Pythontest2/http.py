@@ -1,378 +1,394 @@
-import os
-import random
-import time
+import datetime as dt
+from typing import Any
 
-from .common import FileDownloader
-from ..networking import Request
-from ..networking.exceptions import (
-    CertificateVerifyError,
-    HTTPError,
-    TransportError,
+import posthoganalytics
+import structlog
+from django.db import transaction
+from django.utils.timezone import now
+from rest_framework import mixins, request, response, serializers, viewsets
+from rest_framework.decorators import action
+from rest_framework.exceptions import (
+    NotAuthenticated,
+    NotFound,
+    PermissionDenied,
+    ValidationError,
 )
-from ..utils import (
-    ContentTooShortError,
-    RetryManager,
-    ThrottledDownload,
-    XAttrMetadataError,
-    XAttrUnavailableError,
-    encodeFilename,
-    int_or_none,
-    parse_http_range,
-    try_call,
-    write_xattr,
+from rest_framework.pagination import CursorPagination
+from rest_framework.permissions import IsAuthenticated
+from rest_framework_dataclasses.serializers import DataclassSerializer
+
+from posthog.api.routing import StructuredViewSetMixin
+from posthog.batch_exports.models import (
+    BATCH_EXPORT_INTERVALS,
+    BatchExportLogEntry,
+    BatchExportLogEntryLevel,
+    fetch_batch_export_log_entries,
 )
-from ..utils.networking import HTTPHeaderDict
+from posthog.batch_exports.service import (
+    BatchExportIdError,
+    BatchExportServiceError,
+    BatchExportServiceRPCError,
+    BatchExportServiceScheduleNotFound,
+    backfill_export,
+    cancel_running_batch_export_backfill,
+    batch_export_delete_schedule,
+    pause_batch_export,
+    sync_batch_export,
+    unpause_batch_export,
+)
+from posthog.models import (
+    BatchExport,
+    BatchExportBackfill,
+    BatchExportDestination,
+    BatchExportRun,
+    Team,
+    User,
+)
+from posthog.permissions import (
+    ProjectMembershipNecessaryPermissions,
+    TeamMemberAccessPermission,
+)
+from posthog.temporal.common.client import sync_connect
+from posthog.utils import relative_date_parse
+
+logger = structlog.get_logger(__name__)
 
 
-class HttpFD(FileDownloader):
-    def real_download(self, filename, info_dict):
-        url = info_dict['url']
-        request_data = info_dict.get('request_data', None)
+def validate_date_input(date_input: Any) -> dt.datetime:
+    """Parse any datetime input as a proper dt.datetime.
 
-        class DownloadContext(dict):
-            __getattr__ = dict.get
-            __setattr__ = dict.__setitem__
-            __delattr__ = dict.__delitem__
+    Args:
+        date_input: The datetime input to parse.
 
-        ctx = DownloadContext()
-        ctx.filename = filename
-        ctx.tmpfilename = self.temp_name(filename)
-        ctx.stream = None
+    Raises:
+        ValidationError: If the input cannot be parsed.
 
-        # Disable compression
-        headers = HTTPHeaderDict({'Accept-Encoding': 'identity'}, info_dict.get('http_headers'))
+    Returns:
+        The parsed dt.datetime.
+    """
+    try:
+        # The Right Way (TM) to check this would be by calling isinstance, but that doesn't feel very Pythonic.
+        # As far as I'm concerned, if you give me something that quacks like an isoformatted str, you are golden.
+        # Read more here: https://github.com/python/mypy/issues/2420.
+        # Once PostHog is 3.11, try/except is zero cost if nothing is raised: https://bugs.python.org/issue40222.
+        parsed = dt.datetime.fromisoformat(date_input.replace("Z", "+00:00"))  # type: ignore
+    except (TypeError, ValueError):
+        raise ValidationError(f"Input {date_input} is not a valid ISO formatted datetime.")
+    return parsed
 
-        is_test = self.params.get('test', False)
-        chunk_size = self._TEST_FILE_SIZE if is_test else (
-            self.params.get('http_chunk_size')
-            or info_dict.get('downloader_options', {}).get('http_chunk_size')
-            or 0)
 
-        ctx.open_mode = 'wb'
-        ctx.resume_len = 0
-        ctx.block_size = self.params.get('buffersize', 1024)
-        ctx.start_time = time.time()
+class BatchExportRunSerializer(serializers.ModelSerializer):
+    """Serializer for a BatchExportRun model."""
 
-        # parse given Range
-        req_start, req_end, _ = parse_http_range(headers.get('Range'))
+    class Meta:
+        model = BatchExportRun
+        fields = "__all__"
+        # TODO: Why aren't all these read only?
+        read_only_fields = ["batch_export"]
 
-        if self.params.get('continuedl', True):
-            # Establish possible resume length
-            if os.path.isfile(encodeFilename(ctx.tmpfilename)):
-                ctx.resume_len = os.path.getsize(
-                    encodeFilename(ctx.tmpfilename))
 
-        ctx.is_resume = ctx.resume_len > 0
+class RunsCursorPagination(CursorPagination):
+    ordering = "-created_at"
+    page_size = 100
 
-        class SucceedDownload(Exception):
-            pass
 
-        class RetryDownload(Exception):
-            def __init__(self, source_error):
-                self.source_error = source_error
+class BatchExportRunViewSet(StructuredViewSetMixin, viewsets.ReadOnlyModelViewSet):
+    queryset = BatchExportRun.objects.all()
+    permission_classes = [
+        IsAuthenticated,
+        ProjectMembershipNecessaryPermissions,
+        TeamMemberAccessPermission,
+    ]
+    serializer_class = BatchExportRunSerializer
+    pagination_class = RunsCursorPagination
 
-        class NextFragment(Exception):
-            pass
+    def get_queryset(self, date_range: tuple[dt.datetime, dt.datetime] | None = None):
+        if not isinstance(self.request.user, User) or self.request.user.current_team is None:
+            raise NotAuthenticated()
 
-        def establish_connection():
-            ctx.chunk_size = (random.randint(int(chunk_size * 0.95), chunk_size)
-                              if not is_test and chunk_size else chunk_size)
-            if ctx.resume_len > 0:
-                range_start = ctx.resume_len
-                if req_start is not None:
-                    # offset the beginning of Range to be within request
-                    range_start += req_start
-                if ctx.is_resume:
-                    self.report_resuming_byte(ctx.resume_len)
-                ctx.open_mode = 'ab'
-            elif req_start is not None:
-                range_start = req_start
-            elif ctx.chunk_size > 0:
-                range_start = 0
-            else:
-                range_start = None
-            ctx.is_resume = False
+        if date_range:
+            return self.queryset.filter(
+                batch_export_id=self.kwargs["parent_lookup_batch_export_id"],
+                created_at__range=date_range,
+            ).order_by("-created_at")
+        else:
+            return self.queryset.filter(batch_export_id=self.kwargs["parent_lookup_batch_export_id"]).order_by(
+                "-created_at"
+            )
 
-            if ctx.chunk_size:
-                chunk_aware_end = range_start + ctx.chunk_size - 1
-                # we're not allowed to download outside Range
-                range_end = chunk_aware_end if req_end is None else min(chunk_aware_end, req_end)
-            elif req_end is not None:
-                # there's no need for chunked downloads, so download until the end of Range
-                range_end = req_end
-            else:
-                range_end = None
+    def list(self, request: request.Request, *args, **kwargs) -> response.Response:
+        """Get all BatchExportRuns for a BatchExport."""
+        if not isinstance(request.user, User) or request.user.team is None:
+            raise NotAuthenticated()
 
-            if try_call(lambda: range_start > range_end):
-                ctx.resume_len = 0
-                ctx.open_mode = 'wb'
-                raise RetryDownload(Exception(f'Conflicting range. (start={range_start} > end={range_end})'))
+        after = self.request.query_params.get("after", "-7d")
+        before = self.request.query_params.get("before", None)
+        after_datetime = relative_date_parse(after, request.user.team.timezone_info)
+        before_datetime = relative_date_parse(before, request.user.team.timezone_info) if before else now()
+        date_range = (after_datetime, before_datetime)
 
-            if try_call(lambda: range_end >= ctx.content_len):
-                range_end = ctx.content_len - 1
+        page = self.paginate_queryset(self.get_queryset(date_range=date_range))
+        serializer = self.get_serializer(page, many=True)
+        return self.get_paginated_response(serializer.data)
 
-            request = Request(url, request_data, headers)
-            has_range = range_start is not None
-            if has_range:
-                request.headers['Range'] = f'bytes={int(range_start)}-{int_or_none(range_end) or ""}'
-            # Establish connection
+
+class BatchExportDestinationSerializer(serializers.ModelSerializer):
+    """Serializer for an BatchExportDestination model."""
+
+    class Meta:
+        model = BatchExportDestination
+        fields = ["type", "config"]
+
+    def create(self, validated_data: dict) -> BatchExportDestination:
+        """Create a BatchExportDestination."""
+        export_destination = BatchExportDestination.objects.create(**validated_data)
+        return export_destination
+
+    def to_representation(self, instance: BatchExportDestination) -> dict:
+        data = super().to_representation(instance)
+        data["config"] = {
+            k: v for k, v in data["config"].items() if k not in BatchExportDestination.secret_fields[instance.type]
+        }
+        return data
+
+
+class BatchExportSerializer(serializers.ModelSerializer):
+    """Serializer for a BatchExport model."""
+
+    destination = BatchExportDestinationSerializer()
+    latest_runs = BatchExportRunSerializer(many=True, read_only=True)
+    interval = serializers.ChoiceField(choices=BATCH_EXPORT_INTERVALS)
+
+    class Meta:
+        model = BatchExport
+        fields = [
+            "id",
+            "name",
+            "destination",
+            "interval",
+            "paused",
+            "created_at",
+            "last_updated_at",
+            "last_paused_at",
+            "start_at",
+            "end_at",
+            "latest_runs",
+        ]
+        read_only_fields = ["id", "created_at", "last_updated_at", "latest_runs"]
+
+    def create(self, validated_data: dict) -> BatchExport:
+        """Create a BatchExport."""
+        destination_data = validated_data.pop("destination")
+        team_id = self.context["team_id"]
+
+        if validated_data["interval"] not in ("hour", "day", "week"):
+            team = Team.objects.get(id=team_id)
+
+            if not posthoganalytics.feature_enabled(
+                "high-frequency-batch-exports",
+                str(team.uuid),
+                groups={"organization": str(team.organization.id)},
+                group_properties={
+                    "organization": {
+                        "id": str(team.organization.id),
+                        "created_at": team.organization.created_at,
+                    }
+                },
+                send_feature_flag_events=False,
+            ):
+                raise PermissionDenied("Higher frequency exports are not enabled for this team.")
+
+        destination = BatchExportDestination(**destination_data)
+        batch_export = BatchExport(team_id=team_id, destination=destination, **validated_data)
+        sync_batch_export(batch_export, created=True)
+
+        with transaction.atomic():
+            destination.save()
+            batch_export.save()
+
+        return batch_export
+
+    def update(self, batch_export: BatchExport, validated_data: dict) -> BatchExport:
+        """Update a BatchExport."""
+        destination_data = validated_data.pop("destination", None)
+
+        with transaction.atomic():
+            if destination_data:
+                batch_export.destination.type = destination_data.get("type", batch_export.destination.type)
+                batch_export.destination.config = {
+                    **batch_export.destination.config,
+                    **destination_data.get("config", {}),
+                }
+
+            batch_export.destination.save()
+            batch_export = super().update(batch_export, validated_data)
+
+            sync_batch_export(batch_export, created=False)
+
+        return batch_export
+
+
+class BatchExportViewSet(StructuredViewSetMixin, viewsets.ModelViewSet):
+    queryset = BatchExport.objects.all()
+    permission_classes = [
+        IsAuthenticated,
+        ProjectMembershipNecessaryPermissions,
+        TeamMemberAccessPermission,
+    ]
+    serializer_class = BatchExportSerializer
+
+    def get_queryset(self):
+        if not isinstance(self.request.user, User) or self.request.user.current_team is None:
+            raise NotAuthenticated()
+
+        return (
+            self.queryset.filter(team_id=self.team_id)
+            .exclude(deleted=True)
+            .order_by("-created_at")
+            .prefetch_related("destination")
+        )
+
+    @action(methods=["POST"], detail=True)
+    def backfill(self, request: request.Request, *args, **kwargs) -> response.Response:
+        """Trigger a backfill for a BatchExport."""
+        if not isinstance(request.user, User) or request.user.current_team is None:
+            raise NotAuthenticated()
+
+        start_at_input = request.data.get("start_at", None)
+        end_at_input = request.data.get("end_at", None)
+
+        if start_at_input is None or end_at_input is None:
+            raise ValidationError("Both 'start_at' and 'end_at' must be specified")
+
+        start_at = validate_date_input(start_at_input)
+        end_at = validate_date_input(end_at_input)
+
+        if start_at >= end_at:
+            raise ValidationError("The initial backfill datetime 'start_at' happens after 'end_at'")
+
+        team_id = request.user.current_team.id
+
+        batch_export = self.get_object()
+        temporal = sync_connect()
+        backfill_id = backfill_export(temporal, str(batch_export.pk), team_id, start_at, end_at)
+
+        return response.Response({"backfill_id": backfill_id})
+
+    @action(methods=["POST"], detail=True)
+    def pause(self, request: request.Request, *args, **kwargs) -> response.Response:
+        """Pause a BatchExport."""
+        if not isinstance(request.user, User) or request.user.current_team is None:
+            raise NotAuthenticated()
+
+        user_id = request.user.distinct_id
+        team_id = request.user.current_team.id
+        note = f"Pause requested by user {user_id} from team {team_id}"
+
+        batch_export = self.get_object()
+        temporal = sync_connect()
+
+        try:
+            pause_batch_export(temporal, str(batch_export.id), note=note)
+        except BatchExportIdError:
+            raise NotFound(f"BatchExport ID '{str(batch_export.id)}' not found.")
+        except BatchExportServiceRPCError:
+            raise ValidationError("Invalid request to pause a BatchExport could not be carried out")
+        except BatchExportServiceError:
+            raise
+
+        return response.Response({"paused": True})
+
+    @action(methods=["POST"], detail=True)
+    def unpause(self, request: request.Request, *args, **kwargs) -> response.Response:
+        """Unpause a BatchExport."""
+        if not isinstance(request.user, User) or request.user.current_team is None:
+            raise NotAuthenticated()
+
+        user_id = request.user.distinct_id
+        team_id = request.user.current_team.id
+        note = f"Unpause requested by user {user_id} from team {team_id}"
+        backfill = request.data.get("backfill", False)
+
+        batch_export = self.get_object()
+        temporal = sync_connect()
+
+        try:
+            unpause_batch_export(temporal, str(batch_export.id), note=note, backfill=backfill)
+        except BatchExportIdError:
+            raise NotFound(f"BatchExport ID '{str(batch_export.id)}' not found.")
+        except BatchExportServiceRPCError:
+            raise ValidationError("Invalid request to unpause a BatchExport could not be carried out")
+        except BatchExportServiceError:
+            raise
+
+        return response.Response({"paused": False})
+
+    def perform_destroy(self, instance: BatchExport):
+        """Perform a BatchExport destroy by clearing Temporal and Django state.
+
+        If the underlying Temporal Schedule doesn't exist, we ignore the error and proceed with the delete anyways.
+        The Schedule could have been manually deleted causing Django and Temporal to go out of sync. For whatever reason,
+        since we are deleting, we assume that we can recover from this state by finishing the delete operation by calling
+        instance.save().
+        """
+        temporal = sync_connect()
+
+        instance.deleted = True
+
+        try:
+            batch_export_delete_schedule(temporal, str(instance.pk))
+        except BatchExportServiceScheduleNotFound as e:
+            logger.warning("The Schedule %s could not be deleted as it was not found", e.schedule_id)
+
+        instance.save()
+
+        for backfill in BatchExportBackfill.objects.filter(batch_export=instance):
+            if backfill.status == BatchExportBackfill.Status.RUNNING:
+                cancel_running_batch_export_backfill(temporal, backfill.workflow_id)
+
+
+class BatchExportLogEntrySerializer(DataclassSerializer):
+    class Meta:
+        dataclass = BatchExportLogEntry
+
+
+class BatchExportLogViewSet(StructuredViewSetMixin, mixins.ListModelMixin, viewsets.GenericViewSet):
+    permission_classes = [
+        IsAuthenticated,
+        ProjectMembershipNecessaryPermissions,
+        TeamMemberAccessPermission,
+    ]
+    serializer_class = BatchExportLogEntrySerializer
+
+    def get_queryset(self):
+        limit_raw = self.request.GET.get("limit")
+        limit: int | None
+        if limit_raw:
             try:
-                ctx.data = self.ydl.urlopen(request)
-                # When trying to resume, Content-Range HTTP header of response has to be checked
-                # to match the value of requested Range HTTP header. This is due to a webservers
-                # that don't support resuming and serve a whole file with no Content-Range
-                # set in response despite of requested Range (see
-                # https://github.com/ytdl-org/youtube-dl/issues/6057#issuecomment-126129799)
-                if has_range:
-                    content_range = ctx.data.headers.get('Content-Range')
-                    content_range_start, content_range_end, content_len = parse_http_range(content_range)
-                    # Content-Range is present and matches requested Range, resume is possible
-                    if range_start == content_range_start and (
-                            # Non-chunked download
-                            not ctx.chunk_size
-                            # Chunked download and requested piece or
-                            # its part is promised to be served
-                            or content_range_end == range_end
-                            or content_len < range_end):
-                        ctx.content_len = content_len
-                        if content_len or req_end:
-                            ctx.data_len = min(content_len or req_end, req_end or content_len) - (req_start or 0)
-                        return
-                    # Content-Range is either not present or invalid. Assuming remote webserver is
-                    # trying to send the whole file, resume is not possible, so wiping the local file
-                    # and performing entire redownload
-                    elif range_start > 0:
-                        self.report_unable_to_resume()
-                    ctx.resume_len = 0
-                    ctx.open_mode = 'wb'
-                ctx.data_len = ctx.content_len = int_or_none(ctx.data.headers.get('Content-length', None))
-            except HTTPError as err:
-                if err.status == 416:
-                    # Unable to resume (requested range not satisfiable)
-                    try:
-                        # Open the connection again without the range header
-                        ctx.data = self.ydl.urlopen(
-                            Request(url, request_data, headers))
-                        content_length = ctx.data.headers['Content-Length']
-                    except HTTPError as err:
-                        if err.status < 500 or err.status >= 600:
-                            raise
-                    else:
-                        # Examine the reported length
-                        if (content_length is not None
-                                and (ctx.resume_len - 100 < int(content_length) < ctx.resume_len + 100)):
-                            # The file had already been fully downloaded.
-                            # Explanation to the above condition: in issue #175 it was revealed that
-                            # YouTube sometimes adds or removes a few bytes from the end of the file,
-                            # changing the file size slightly and causing problems for some users. So
-                            # I decided to implement a suggested change and consider the file
-                            # completely downloaded if the file size differs less than 100 bytes from
-                            # the one in the hard drive.
-                            self.report_file_already_downloaded(ctx.filename)
-                            self.try_rename(ctx.tmpfilename, ctx.filename)
-                            self._hook_progress({
-                                'filename': ctx.filename,
-                                'status': 'finished',
-                                'downloaded_bytes': ctx.resume_len,
-                                'total_bytes': ctx.resume_len,
-                            }, info_dict)
-                            raise SucceedDownload()
-                        else:
-                            # The length does not match, we start the download over
-                            self.report_unable_to_resume()
-                            ctx.resume_len = 0
-                            ctx.open_mode = 'wb'
-                            return
-                elif err.status < 500 or err.status >= 600:
-                    # Unexpected HTTP error
-                    raise
-                raise RetryDownload(err)
-            except CertificateVerifyError:
-                raise
-            except TransportError as err:
-                raise RetryDownload(err)
+                limit = int(limit_raw)
+            except ValueError:
+                raise ValidationError("Query param limit must be omitted or an integer!")
+        else:
+            limit = None
 
-        def close_stream():
-            if ctx.stream is not None:
-                if not ctx.tmpfilename == '-':
-                    ctx.stream.close()
-                ctx.stream = None
+        after_raw: str | None = self.request.GET.get("after")
+        after: dt.datetime | None = None
+        if after_raw is not None:
+            after = dt.datetime.fromisoformat(after_raw.replace("Z", "+00:00"))
 
-        def download():
-            data_len = ctx.data.headers.get('Content-length')
+        before_raw: str | None = self.request.GET.get("before")
+        before: dt.datetime | None = None
+        if before_raw is not None:
+            before = dt.datetime.fromisoformat(before_raw.replace("Z", "+00:00"))
 
-            if ctx.data.headers.get('Content-encoding'):
-                # Content-encoding is present, Content-length is not reliable anymore as we are
-                # doing auto decompression. (See: https://github.com/yt-dlp/yt-dlp/pull/6176)
-                data_len = None
-
-            # Range HTTP header may be ignored/unsupported by a webserver
-            # (e.g. extractor/scivee.py, extractor/bambuser.py).
-            # However, for a test we still would like to download just a piece of a file.
-            # To achieve this we limit data_len to _TEST_FILE_SIZE and manually control
-            # block size when downloading a file.
-            if is_test and (data_len is None or int(data_len) > self._TEST_FILE_SIZE):
-                data_len = self._TEST_FILE_SIZE
-
-            if data_len is not None:
-                data_len = int(data_len) + ctx.resume_len
-                min_data_len = self.params.get('min_filesize')
-                max_data_len = self.params.get('max_filesize')
-                if min_data_len is not None and data_len < min_data_len:
-                    self.to_screen(
-                        f'\r[download] File is smaller than min-filesize ({data_len} bytes < {min_data_len} bytes). Aborting.')
-                    return False
-                if max_data_len is not None and data_len > max_data_len:
-                    self.to_screen(
-                        f'\r[download] File is larger than max-filesize ({data_len} bytes > {max_data_len} bytes). Aborting.')
-                    return False
-
-            byte_counter = 0 + ctx.resume_len
-            block_size = ctx.block_size
-            start = time.time()
-
-            # measure time over whole while-loop, so slow_down() and best_block_size() work together properly
-            now = None  # needed for slow_down() in the first loop run
-            before = start  # start measuring
-
-            def retry(e):
-                close_stream()
-                ctx.resume_len = (byte_counter if ctx.tmpfilename == '-'
-                                  else os.path.getsize(encodeFilename(ctx.tmpfilename)))
-                raise RetryDownload(e)
-
-            while True:
-                try:
-                    # Download and write
-                    data_block = ctx.data.read(block_size if not is_test else min(block_size, data_len - byte_counter))
-                except TransportError as err:
-                    retry(err)
-
-                byte_counter += len(data_block)
-
-                # exit loop when download is finished
-                if len(data_block) == 0:
-                    break
-
-                # Open destination file just in time
-                if ctx.stream is None:
-                    try:
-                        ctx.stream, ctx.tmpfilename = self.sanitize_open(
-                            ctx.tmpfilename, ctx.open_mode)
-                        assert ctx.stream is not None
-                        ctx.filename = self.undo_temp_name(ctx.tmpfilename)
-                        self.report_destination(ctx.filename)
-                    except OSError as err:
-                        self.report_error('unable to open for writing: %s' % str(err))
-                        return False
-
-                    if self.params.get('xattr_set_filesize', False) and data_len is not None:
-                        try:
-                            write_xattr(ctx.tmpfilename, 'user.ytdl.filesize', str(data_len).encode())
-                        except (XAttrUnavailableError, XAttrMetadataError) as err:
-                            self.report_error('unable to set filesize xattr: %s' % str(err))
-
-                try:
-                    ctx.stream.write(data_block)
-                except OSError as err:
-                    self.to_stderr('\n')
-                    self.report_error('unable to write data: %s' % str(err))
-                    return False
-
-                # Apply rate limit
-                self.slow_down(start, now, byte_counter - ctx.resume_len)
-
-                # end measuring of one loop run
-                now = time.time()
-                after = now
-
-                # Adjust block size
-                if not self.params.get('noresizebuffer', False):
-                    block_size = self.best_block_size(after - before, len(data_block))
-
-                before = after
-
-                # Progress message
-                speed = self.calc_speed(start, now, byte_counter - ctx.resume_len)
-                if ctx.data_len is None:
-                    eta = None
-                else:
-                    eta = self.calc_eta(start, time.time(), ctx.data_len - ctx.resume_len, byte_counter - ctx.resume_len)
-
-                self._hook_progress({
-                    'status': 'downloading',
-                    'downloaded_bytes': byte_counter,
-                    'total_bytes': ctx.data_len,
-                    'tmpfilename': ctx.tmpfilename,
-                    'filename': ctx.filename,
-                    'eta': eta,
-                    'speed': speed,
-                    'elapsed': now - ctx.start_time,
-                    'ctx_id': info_dict.get('ctx_id'),
-                }, info_dict)
-
-                if data_len is not None and byte_counter == data_len:
-                    break
-
-                if speed and speed < (self.params.get('throttledratelimit') or 0):
-                    # The speed must stay below the limit for 3 seconds
-                    # This prevents raising error when the speed temporarily goes down
-                    if ctx.throttle_start is None:
-                        ctx.throttle_start = now
-                    elif now - ctx.throttle_start > 3:
-                        if ctx.stream is not None and ctx.tmpfilename != '-':
-                            ctx.stream.close()
-                        raise ThrottledDownload()
-                elif speed:
-                    ctx.throttle_start = None
-
-            if ctx.stream is None:
-                self.to_stderr('\n')
-                self.report_error('Did not get any data blocks')
-                return False
-
-            if not is_test and ctx.chunk_size and ctx.content_len is not None and byte_counter < ctx.content_len:
-                ctx.resume_len = byte_counter
-                raise NextFragment()
-
-            if ctx.tmpfilename != '-':
-                ctx.stream.close()
-
-            if data_len is not None and byte_counter != data_len:
-                err = ContentTooShortError(byte_counter, int(data_len))
-                retry(err)
-
-            self.try_rename(ctx.tmpfilename, ctx.filename)
-
-            # Update file modification time
-            if self.params.get('updatetime', True):
-                info_dict['filetime'] = self.try_utime(ctx.filename, ctx.data.headers.get('last-modified', None))
-
-            self._hook_progress({
-                'downloaded_bytes': byte_counter,
-                'total_bytes': byte_counter,
-                'filename': ctx.filename,
-                'status': 'finished',
-                'elapsed': time.time() - ctx.start_time,
-                'ctx_id': info_dict.get('ctx_id'),
-            }, info_dict)
-
-            return True
-
-        for retry in RetryManager(self.params.get('retries'), self.report_retry):
-            try:
-                establish_connection()
-                return download()
-            except RetryDownload as err:
-                retry.error = err.source_error
-                continue
-            except NextFragment:
-                retry.error = None
-                retry.attempt -= 1
-                continue
-            except SucceedDownload:
-                return True
-            except:  # noqa: E722
-                close_stream()
-                raise
-        return False
+        level_filter = [BatchExportLogEntryLevel[t.upper()] for t in (self.request.GET.getlist("level_filter", []))]
+        return fetch_batch_export_log_entries(
+            team_id=self.parents_query_dict["team_id"],
+            batch_export_id=self.parents_query_dict["batch_export_id"],
+            run_id=self.parents_query_dict.get("run_id", None),
+            after=after,
+            before=before,
+            search=self.request.GET.get("search"),
+            limit=limit,
+            level_filter=level_filter,
+        )

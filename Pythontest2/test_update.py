@@ -1,219 +1,243 @@
-#!/usr/bin/env python3
+import datetime as dt
+import json
 
-# Allow direct execution
-import os
-import sys
-import unittest
+import pytest
+from asgiref.sync import async_to_sync
+from django.conf import settings
+from django.test.client import Client as HttpClient
+from rest_framework import status
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from posthog.api.test.batch_exports.conftest import describe_schedule, start_test_worker
+from posthog.api.test.batch_exports.operations import (
+    create_batch_export_ok,
+    get_batch_export_ok,
+    patch_batch_export,
+    put_batch_export,
+)
+from posthog.api.test.test_organization import create_organization
+from posthog.api.test.test_team import create_team
+from posthog.api.test.test_user import create_user
+from posthog.batch_exports.service import sync_batch_export
+from posthog.models import BatchExport, BatchExportDestination
+from posthog.temporal.common.client import sync_connect
+from posthog.temporal.common.codec import EncryptionCodec
 
-
-from test.helper import FakeYDL, report_warning
-from yt_dlp.update import Updater, UpdateInfo
-
-TEST_API_DATA = {
-    'yt-dlp/yt-dlp/latest': {
-        'tag_name': '2023.12.31',
-        'target_commitish': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-        'name': 'yt-dlp 2023.12.31',
-        'body': 'BODY',
-    },
-    'yt-dlp/yt-dlp-nightly-builds/latest': {
-        'tag_name': '2023.12.31.123456',
-        'target_commitish': 'master',
-        'name': 'yt-dlp nightly 2023.12.31.123456',
-        'body': 'Generated from: https://github.com/yt-dlp/yt-dlp/commit/cccccccccccccccccccccccccccccccccccccccc',
-    },
-    'yt-dlp/yt-dlp-master-builds/latest': {
-        'tag_name': '2023.12.31.987654',
-        'target_commitish': 'master',
-        'name': 'yt-dlp master 2023.12.31.987654',
-        'body': 'Generated from: https://github.com/yt-dlp/yt-dlp/commit/dddddddddddddddddddddddddddddddddddddddd',
-    },
-    'yt-dlp/yt-dlp/tags/testing': {
-        'tag_name': 'testing',
-        'target_commitish': '9999999999999999999999999999999999999999',
-        'name': 'testing',
-        'body': 'BODY',
-    },
-    'fork/yt-dlp/latest': {
-        'tag_name': '2050.12.31',
-        'target_commitish': 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
-        'name': '2050.12.31',
-        'body': 'BODY',
-    },
-    'fork/yt-dlp/tags/pr0000': {
-        'tag_name': 'pr0000',
-        'target_commitish': 'ffffffffffffffffffffffffffffffffffffffff',
-        'name': 'pr1234 2023.11.11.000000',
-        'body': 'BODY',
-    },
-    'fork/yt-dlp/tags/pr1234': {
-        'tag_name': 'pr1234',
-        'target_commitish': '0000000000000000000000000000000000000000',
-        'name': 'pr1234 2023.12.31.555555',
-        'body': 'BODY',
-    },
-    'fork/yt-dlp/tags/pr9999': {
-        'tag_name': 'pr9999',
-        'target_commitish': '1111111111111111111111111111111111111111',
-        'name': 'pr9999',
-        'body': 'BODY',
-    },
-    'fork/yt-dlp-satellite/tags/pr987': {
-        'tag_name': 'pr987',
-        'target_commitish': 'master',
-        'name': 'pr987',
-        'body': 'Generated from: https://github.com/yt-dlp/yt-dlp/commit/2222222222222222222222222222222222222222',
-    },
-}
-
-TEST_LOCKFILE_COMMENT = '# This file is used for regulating self-update'
-
-TEST_LOCKFILE_V1 = r'''%s
-lock 2022.08.18.36 .+ Python 3\.6
-lock 2023.11.16 (?!win_x86_exe).+ Python 3\.7
-lock 2023.11.16 win_x86_exe .+ Windows-(?:Vista|2008Server)
-''' % TEST_LOCKFILE_COMMENT
-
-TEST_LOCKFILE_V2_TMPL = r'''%s
-lockV2 yt-dlp/yt-dlp 2022.08.18.36 .+ Python 3\.6
-lockV2 yt-dlp/yt-dlp 2023.11.16 (?!win_x86_exe).+ Python 3\.7
-lockV2 yt-dlp/yt-dlp 2023.11.16 win_x86_exe .+ Windows-(?:Vista|2008Server)
-lockV2 yt-dlp/yt-dlp-nightly-builds 2023.11.15.232826 (?!win_x86_exe).+ Python 3\.7
-lockV2 yt-dlp/yt-dlp-nightly-builds 2023.11.15.232826 win_x86_exe .+ Windows-(?:Vista|2008Server)
-lockV2 yt-dlp/yt-dlp-master-builds 2023.11.15.232812 (?!win_x86_exe).+ Python 3\.7
-lockV2 yt-dlp/yt-dlp-master-builds 2023.11.15.232812 win_x86_exe .+ Windows-(?:Vista|2008Server)
-'''
-
-TEST_LOCKFILE_V2 = TEST_LOCKFILE_V2_TMPL % TEST_LOCKFILE_COMMENT
-
-TEST_LOCKFILE_ACTUAL = TEST_LOCKFILE_V2_TMPL % TEST_LOCKFILE_V1.rstrip('\n')
-
-TEST_LOCKFILE_FORK = r'''%s# Test if a fork blocks updates to non-numeric tags
-lockV2 fork/yt-dlp pr0000 .+ Python 3.6
-lockV2 fork/yt-dlp pr1234 (?!win_x86_exe).+ Python 3\.7
-lockV2 fork/yt-dlp pr1234 win_x86_exe .+ Windows-(?:Vista|2008Server)
-lockV2 fork/yt-dlp pr9999 .+ Python 3.11
-''' % TEST_LOCKFILE_ACTUAL
+pytestmark = [
+    pytest.mark.django_db,
+]
 
 
-class FakeUpdater(Updater):
-    current_version = '2022.01.01'
-    current_commit = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+def test_can_put_config(client: HttpClient):
+    temporal = sync_connect()
 
-    _channel = 'stable'
-    _origin = 'yt-dlp/yt-dlp'
+    destination_data = {
+        "type": "S3",
+        "config": {
+            "bucket_name": "my-production-s3-bucket",
+            "region": "us-east-1",
+            "prefix": "posthog-events/",
+            "aws_access_key_id": "abc123",
+            "aws_secret_access_key": "secret",
+        },
+    }
 
-    def _download_update_spec(self, *args, **kwargs):
-        return TEST_LOCKFILE_ACTUAL
+    batch_export_data = {
+        "name": "my-production-s3-bucket-destination",
+        "destination": destination_data,
+        "interval": "hour",
+        "start_at": "2023-07-19 00:00:00",
+        "end_at": "2023-07-20 00:00:00",
+    }
 
-    def _call_api(self, tag):
-        tag = f'tags/{tag}' if tag != 'latest' else tag
-        return TEST_API_DATA[f'{self.requested_repo}/{tag}']
+    organization = create_organization("Test Org")
+    team = create_team(organization)
+    user = create_user("test@user.com", "Test User", organization)
+    client.force_login(user)
 
-    def _report_error(self, msg, *args, **kwargs):
-        report_warning(msg)
+    with start_test_worker(temporal):
+        batch_export = create_batch_export_ok(
+            client,
+            team.pk,
+            batch_export_data,
+        )
 
+        # If we try to update without all fields, it should fail with a 400 error
+        new_batch_export_data = {
+            "name": "my-production-s3-bucket-destination",
+            "interval": "hour",
+        }
+        response = put_batch_export(client, team.pk, batch_export["id"], new_batch_export_data)
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
 
-class TestUpdate(unittest.TestCase):
-    maxDiff = None
+        old_schedule = describe_schedule(temporal, batch_export["id"])
 
-    def test_update_spec(self):
-        ydl = FakeYDL()
-        updater = FakeUpdater(ydl, 'stable')
+        # We should be able to update if we specify all fields
+        new_destination_data = {**destination_data}
+        new_destination_data["config"]["bucket_name"] = "my-new-production-s3-bucket"
+        new_destination_data["config"]["aws_secret_access_key"] = "new-secret"
+        new_batch_export_data = {
+            "name": "my-production-s3-bucket-destination",
+            "destination": new_destination_data,
+            "interval": "day",
+            "start_at": "2022-07-19 00:00:00",
+        }
 
-        def test(lockfile, identifier, input_tag, expect_tag, exact=False, repo='yt-dlp/yt-dlp'):
-            updater._identifier = identifier
-            updater._exact = exact
-            updater.requested_repo = repo
-            result = updater._process_update_spec(lockfile, input_tag)
-            self.assertEqual(
-                result, expect_tag,
-                f'{identifier!r} requesting {repo}@{input_tag} (exact={exact}) '
-                f'returned {result!r} instead of {expect_tag!r}')
+        response = put_batch_export(client, team.pk, batch_export["id"], new_batch_export_data)
+        assert response.status_code == status.HTTP_200_OK
 
-        for lockfile in (TEST_LOCKFILE_V1, TEST_LOCKFILE_V2, TEST_LOCKFILE_ACTUAL, TEST_LOCKFILE_FORK):
-            # Normal operation
-            test(lockfile, 'zip Python 3.12.0', '2023.12.31', '2023.12.31')
-            test(lockfile, 'zip stable Python 3.12.0', '2023.12.31', '2023.12.31', exact=True)
-            # Python 3.6 --update should update only to its lock
-            test(lockfile, 'zip Python 3.6.0', '2023.11.16', '2022.08.18.36')
-            # --update-to an exact version later than the lock should return None
-            test(lockfile, 'zip stable Python 3.6.0', '2023.11.16', None, exact=True)
-            # Python 3.7 should be able to update to its lock
-            test(lockfile, 'zip Python 3.7.0', '2023.11.16', '2023.11.16')
-            test(lockfile, 'zip stable Python 3.7.1', '2023.11.16', '2023.11.16', exact=True)
-            # Non-win_x86_exe builds on py3.7 must be locked
-            test(lockfile, 'zip Python 3.7.1', '2023.12.31', '2023.11.16')
-            test(lockfile, 'zip stable Python 3.7.1', '2023.12.31', None, exact=True)
-            test(  # Windows Vista w/ win_x86_exe must be locked
-                lockfile, 'win_x86_exe stable Python 3.7.9 (CPython x86 32bit) - Windows-Vista-6.0.6003-SP2',
-                '2023.12.31', '2023.11.16')
-            test(  # Windows 2008Server w/ win_x86_exe must be locked
-                lockfile, 'win_x86_exe Python 3.7.9 (CPython x86 32bit) - Windows-2008Server',
-                '2023.12.31', None, exact=True)
-            test(  # Windows 7 w/ win_x86_exe py3.7 build should be able to update beyond lock
-                lockfile, 'win_x86_exe stable Python 3.7.9 (CPython x86 32bit) - Windows-7-6.1.7601-SP1',
-                '2023.12.31', '2023.12.31')
-            test(  # Windows 8.1 w/ '2008Server' in platform string should be able to update beyond lock
-                lockfile, 'win_x86_exe Python 3.7.9 (CPython x86 32bit) - Windows-post2008Server-6.2.9200',
-                '2023.12.31', '2023.12.31', exact=True)
+        # get the batch export and validate e.g. that interval has been updated to day
+        batch_export = get_batch_export_ok(client, team.pk, batch_export["id"])
+        assert batch_export["interval"] == "day"
 
-        # Forks can block updates to non-numeric tags rather than lock
-        test(TEST_LOCKFILE_FORK, 'zip Python 3.6.3', 'pr0000', None, repo='fork/yt-dlp')
-        test(TEST_LOCKFILE_FORK, 'zip stable Python 3.7.4', 'pr0000', 'pr0000', repo='fork/yt-dlp')
-        test(TEST_LOCKFILE_FORK, 'zip stable Python 3.7.4', 'pr1234', None, repo='fork/yt-dlp')
-        test(TEST_LOCKFILE_FORK, 'zip Python 3.8.1', 'pr1234', 'pr1234', repo='fork/yt-dlp', exact=True)
-        test(
-            TEST_LOCKFILE_FORK, 'win_x86_exe stable Python 3.7.9 (CPython x86 32bit) - Windows-Vista-6.0.6003-SP2',
-            'pr1234', None, repo='fork/yt-dlp')
-        test(
-            TEST_LOCKFILE_FORK, 'win_x86_exe stable Python 3.7.9 (CPython x86 32bit) - Windows-7-6.1.7601-SP1',
-            '2023.12.31', '2023.12.31', repo='fork/yt-dlp')
-        test(TEST_LOCKFILE_FORK, 'zip Python 3.11.2', 'pr9999', None, repo='fork/yt-dlp', exact=True)
-        test(TEST_LOCKFILE_FORK, 'zip stable Python 3.12.0', 'pr9999', 'pr9999', repo='fork/yt-dlp')
+        # validate the underlying temporal schedule has been updated
+        codec = EncryptionCodec(settings=settings)
+        new_schedule = describe_schedule(temporal, batch_export["id"])
+        assert old_schedule.schedule.spec.intervals[0].every != new_schedule.schedule.spec.intervals[0].every
+        assert new_schedule.schedule.spec.intervals[0].every == dt.timedelta(days=1)
+        assert new_schedule.schedule.spec.start_at == dt.datetime(2022, 7, 19, 0, 0, 0, tzinfo=dt.timezone.utc)
+        assert new_schedule.schedule.spec.end_at == dt.datetime(2023, 7, 20, 0, 0, 0, tzinfo=dt.timezone.utc)
 
-    def test_query_update(self):
-        ydl = FakeYDL()
-
-        def test(target, expected, current_version=None, current_commit=None, identifier=None):
-            updater = FakeUpdater(ydl, target)
-            if current_version:
-                updater.current_version = current_version
-            if current_commit:
-                updater.current_commit = current_commit
-            updater._identifier = identifier or 'zip'
-            update_info = updater.query_update(_output=True)
-            self.assertDictEqual(
-                update_info.__dict__ if update_info else {}, expected.__dict__ if expected else {})
-
-        test('yt-dlp/yt-dlp@latest', UpdateInfo(
-            '2023.12.31', version='2023.12.31', requested_version='2023.12.31', commit='b' * 40))
-        test('yt-dlp/yt-dlp-nightly-builds@latest', UpdateInfo(
-            '2023.12.31.123456', version='2023.12.31.123456', requested_version='2023.12.31.123456', commit='c' * 40))
-        test('yt-dlp/yt-dlp-master-builds@latest', UpdateInfo(
-            '2023.12.31.987654', version='2023.12.31.987654', requested_version='2023.12.31.987654', commit='d' * 40))
-        test('fork/yt-dlp@latest', UpdateInfo(
-            '2050.12.31', version='2050.12.31', requested_version='2050.12.31', commit='e' * 40))
-        test('fork/yt-dlp@pr0000', UpdateInfo(
-            'pr0000', version='2023.11.11.000000', requested_version='2023.11.11.000000', commit='f' * 40))
-        test('fork/yt-dlp@pr1234', UpdateInfo(
-            'pr1234', version='2023.12.31.555555', requested_version='2023.12.31.555555', commit='0' * 40))
-        test('fork/yt-dlp@pr9999', UpdateInfo(
-            'pr9999', version=None, requested_version=None, commit='1' * 40))
-        test('fork/yt-dlp-satellite@pr987', UpdateInfo(
-            'pr987', version=None, requested_version=None, commit='2' * 40))
-        test('yt-dlp/yt-dlp', None, current_version='2024.01.01')
-        test('stable', UpdateInfo(
-            '2023.12.31', version='2023.12.31', requested_version='2023.12.31', commit='b' * 40))
-        test('nightly', UpdateInfo(
-            '2023.12.31.123456', version='2023.12.31.123456', requested_version='2023.12.31.123456', commit='c' * 40))
-        test('master', UpdateInfo(
-            '2023.12.31.987654', version='2023.12.31.987654', requested_version='2023.12.31.987654', commit='d' * 40))
-        test('testing', None, current_commit='9' * 40)
-        test('testing', UpdateInfo('testing', commit='9' * 40))
+        decoded_payload = async_to_sync(codec.decode)(new_schedule.schedule.action.args)
+        args = json.loads(decoded_payload[0].data)
+        assert args["bucket_name"] == "my-new-production-s3-bucket"
+        assert args["aws_secret_access_key"] == "new-secret"
 
 
-if __name__ == '__main__':
-    unittest.main()
+@pytest.mark.parametrize("interval", ["hour", "day"])
+def test_can_patch_config(client: HttpClient, interval):
+    temporal = sync_connect()
+
+    destination_data = {
+        "type": "S3",
+        "config": {
+            "bucket_name": "my-production-s3-bucket",
+            "region": "us-east-1",
+            "prefix": "posthog-events/",
+            "aws_access_key_id": "abc123",
+            "aws_secret_access_key": "secret",
+        },
+    }
+
+    batch_export_data = {
+        "name": "my-production-s3-bucket-destination",
+        "destination": destination_data,
+        "interval": interval,
+    }
+
+    organization = create_organization("Test Org")
+    team = create_team(organization)
+    user = create_user("test@user.com", "Test User", organization)
+    client.force_login(user)
+
+    with start_test_worker(temporal):
+        batch_export = create_batch_export_ok(
+            client,
+            team.pk,
+            batch_export_data,
+        )
+        old_schedule = describe_schedule(temporal, batch_export["id"])
+
+        # We should be able to update the destination config, excluding the aws
+        # credentials. The existing values should be preserved.
+        new_destination_data = {
+            "type": "S3",
+            "config": {
+                "bucket_name": "my-new-production-s3-bucket",
+                "region": "us-east-1",
+                "prefix": "posthog-events/",
+            },
+        }
+
+        new_batch_export_data = {
+            "name": "my-production-s3-bucket-destination",
+            "destination": new_destination_data,
+        }
+
+        response = patch_batch_export(client, team.pk, batch_export["id"], new_batch_export_data)
+        assert response.status_code == status.HTTP_200_OK, response.json()
+
+        # get the batch export and validate e.g. that bucket_name and interval
+        # has been preserved.
+        batch_export = get_batch_export_ok(client, team.pk, batch_export["id"])
+        assert batch_export["interval"] == interval
+        assert batch_export["destination"]["config"]["bucket_name"] == "my-new-production-s3-bucket"
+
+        # validate the underlying temporal schedule has been updated
+        codec = EncryptionCodec(settings=settings)
+        new_schedule = describe_schedule(temporal, batch_export["id"])
+        assert old_schedule.schedule.spec.intervals[0].every == new_schedule.schedule.spec.intervals[0].every
+        decoded_payload = async_to_sync(codec.decode)(new_schedule.schedule.action.args)
+        args = json.loads(decoded_payload[0].data)
+        assert args["bucket_name"] == "my-new-production-s3-bucket"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("interval", ["hour", "day"])
+def test_can_patch_config_with_invalid_old_values(client: HttpClient, interval):
+    temporal = sync_connect()
+
+    destination_data = {
+        "type": "S3",
+        "config": {
+            "bucket_name": "my-production-s3-bucket",
+            "region": "us-east-1",
+            "prefix": "posthog-events/",
+            "aws_access_key_id": "abc123",
+            "aws_secret_access_key": "secret",
+            "invalid_key": "invalid_value",
+        },
+    }
+
+    batch_export_data = {
+        "name": "my-production-s3-bucket-destination",
+        "interval": interval,
+    }
+
+    organization = create_organization("Test Org")
+    team = create_team(organization)
+    user = create_user("test@user.com", "Test User", organization)
+    client.force_login(user)
+
+    # Create a BatchExport straight in the database/temporal to avoid going through the API
+    # as that's what we are trying to test here.
+    destination = BatchExportDestination(**destination_data)
+    batch_export = BatchExport(team=team, destination=destination, **batch_export_data)
+
+    sync_batch_export(batch_export, created=True)
+
+    destination.save()
+    batch_export.save()
+
+    with start_test_worker(temporal):
+        # We should be able to update the destination config, even if there is an invalid config
+        # in the existing keys.
+        new_destination_data = {
+            "type": "S3",
+            "config": {
+                "bucket_name": "my-new-production-s3-bucket",
+                "region": "us-east-1",
+                "prefix": "posthog-events/",
+            },
+        }
+
+        new_batch_export_data = {
+            "name": "my-production-s3-bucket-destination",
+            "destination": new_destination_data,
+        }
+
+        response = patch_batch_export(client, team.pk, batch_export.id, new_batch_export_data)
+        assert response.status_code == status.HTTP_200_OK, response.json()
+
+        # get the batch export and validate e.g. that bucket_name and interval
+        # has been preserved.
+        batch_export = get_batch_export_ok(client, team.pk, batch_export.id)
+        assert batch_export["interval"] == interval
+        assert batch_export["destination"]["config"]["bucket_name"] == "my-new-production-s3-bucket"
+
+        # validate the underlying temporal schedule has been updated
+        codec = EncryptionCodec(settings=settings)
+        new_schedule = describe_schedule(temporal, batch_export["id"])
+        decoded_payload = async_to_sync(codec.decode)(new_schedule.schedule.action.args)
+        args = json.loads(decoded_payload[0].data)
+        assert args["bucket_name"] == "my-new-production-s3-bucket"
+        assert args.get("invalid_key", None) is None
