@@ -1,0 +1,11 @@
+FILENAME:MEMORYPEAK:EXECUTIONTIME
+PythonTestScripts/cache.py:10.189:360.222ms
+PythonTestScripts/conversion.py:10.190:494.718ms
+PythonTestScripts/django.py:10.189:519.975ms
+PythonTestScripts/dynamic_arrays.py:10.189:546.067ms
+PythonTestScripts/finder.py:10.189:455.207ms
+PythonTestScripts/flow_analysis.py:10.189:497.626ms
+PythonTestScripts/generics.py:10.189:592.037ms
+PythonTestScripts/namespace.py:10.189:480.997ms
+PythonTestScripts/recursion.py:10.189:508.009ms
+PythonTestScripts/stub_value.py:10.189:405.223ms

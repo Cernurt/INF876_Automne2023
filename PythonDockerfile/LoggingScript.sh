@@ -2,7 +2,6 @@
 
 python_program="$1"
 rm Result.txt
-rm GoodResult.txt
 touch Result.txt
 touch error.txt
 touch temp.txt
@@ -10,10 +9,8 @@ touch GoodResult.txt
 
 echo "FILENAME:MEMORYPEAK:EXECUTIONTIME" >> GoodResult.txt
 
-for filename in Pythontest2/*;
-
+for filename in PythonTestScripts/*;
 	do scalene ${filename} > temp.txt 2>error.txt;
-
 	temporary=$(cat error.txt)
 
 	if [[ $temporary == "" ]]
@@ -23,13 +20,7 @@ for filename in Pythontest2/*;
 		echo $filename
 
 		temptemp=$(grep ' MB,' temp.txt | awk -F'[[:space:](]+' '{print $6}')
-		temptemptemp=$(grep '% (' temp.txt | awk -F'[(]|[)]' '{print $2}')
-
-		if [[ $temptemptemp == "" ]]
-		then
-			temptemptemp=$(grep ' out of' temp.txt | awk -F'[(]|[)]' '{print $2}')
-		fi
-
+		temptemptemp=$(grep 'time:' temp.txt | awk -F'[[:space:](]+' '{print $3}')
 
 		if [[ $temptemp == "" ]]
 		then
