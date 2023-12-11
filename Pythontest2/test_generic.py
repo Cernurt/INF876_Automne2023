@@ -1,200 +1,92 @@
-# coding=utf-8
-# Copyright 2019-present, the HuggingFace Inc. team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+from datetime import datetime
 
-import unittest
+from django.contrib.sitemaps import GenericSitemap
+from django.test import override_settings
 
-import numpy as np
-
-from transformers.testing_utils import require_flax, require_tf, require_torch
-from transformers.utils import (
-    expand_dims,
-    flatten_dict,
-    is_flax_available,
-    is_tf_available,
-    is_torch_available,
-    reshape,
-    squeeze,
-    transpose,
-)
+from .base import SitemapTestsBase
+from .models import TestModel
 
 
-if is_flax_available():
-    import jax.numpy as jnp
+@override_settings(ABSOLUTE_URL_OVERRIDES={})
+class GenericViewsSitemapTests(SitemapTestsBase):
+    def test_generic_sitemap_attributes(self):
+        datetime_value = datetime.now()
+        queryset = TestModel.objects.all()
+        generic_sitemap = GenericSitemap(
+            info_dict={
+                "queryset": queryset,
+                "date_field": datetime_value,
+            },
+            priority=0.6,
+            changefreq="monthly",
+            protocol="https",
+        )
+        attr_values = (
+            ("date_field", datetime_value),
+            ("priority", 0.6),
+            ("changefreq", "monthly"),
+            ("protocol", "https"),
+        )
+        for attr_name, expected_value in attr_values:
+            with self.subTest(attr_name=attr_name):
+                self.assertEqual(getattr(generic_sitemap, attr_name), expected_value)
+        self.assertCountEqual(generic_sitemap.queryset, queryset)
 
-if is_tf_available():
-    import tensorflow as tf
+    def test_generic_sitemap(self):
+        "A minimal generic sitemap can be rendered"
+        response = self.client.get("/generic/sitemap.xml")
+        expected = ""
+        for pk in TestModel.objects.values_list("id", flat=True):
+            expected += "<url><loc>%s/testmodel/%s/</loc></url>" % (self.base_url, pk)
+        expected_content = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" '
+            'xmlns:xhtml="http://www.w3.org/1999/xhtml">\n'
+            "%s\n"
+            "</urlset>"
+        ) % expected
+        self.assertXMLEqual(response.content.decode(), expected_content)
 
-if is_torch_available():
-    import torch
+    def test_generic_sitemap_lastmod(self):
+        test_model = TestModel.objects.first()
+        TestModel.objects.update(lastmod=datetime(2013, 3, 13, 10, 0, 0))
+        response = self.client.get("/generic-lastmod/sitemap.xml")
+        expected_content = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" '
+            'xmlns:xhtml="http://www.w3.org/1999/xhtml">\n'
+            "<url><loc>%s/testmodel/%s/</loc><lastmod>2013-03-13</lastmod></url>\n"
+            "</urlset>"
+        ) % (
+            self.base_url,
+            test_model.pk,
+        )
+        self.assertXMLEqual(response.content.decode(), expected_content)
+        self.assertEqual(
+            response.headers["Last-Modified"], "Wed, 13 Mar 2013 10:00:00 GMT"
+        )
 
+    def test_get_protocol_defined_in_constructor(self):
+        for protocol in ["http", "https"]:
+            with self.subTest(protocol=protocol):
+                sitemap = GenericSitemap({"queryset": None}, protocol=protocol)
+                self.assertEqual(sitemap.get_protocol(), protocol)
 
-class GenericTester(unittest.TestCase):
-    def test_flatten_dict(self):
-        input_dict = {
-            "task_specific_params": {
-                "summarization": {"length_penalty": 1.0, "max_length": 128, "min_length": 12, "num_beams": 4},
-                "summarization_cnn": {"length_penalty": 2.0, "max_length": 142, "min_length": 56, "num_beams": 4},
-                "summarization_xsum": {"length_penalty": 1.0, "max_length": 62, "min_length": 11, "num_beams": 6},
-            }
-        }
-        expected_dict = {
-            "task_specific_params.summarization.length_penalty": 1.0,
-            "task_specific_params.summarization.max_length": 128,
-            "task_specific_params.summarization.min_length": 12,
-            "task_specific_params.summarization.num_beams": 4,
-            "task_specific_params.summarization_cnn.length_penalty": 2.0,
-            "task_specific_params.summarization_cnn.max_length": 142,
-            "task_specific_params.summarization_cnn.min_length": 56,
-            "task_specific_params.summarization_cnn.num_beams": 4,
-            "task_specific_params.summarization_xsum.length_penalty": 1.0,
-            "task_specific_params.summarization_xsum.max_length": 62,
-            "task_specific_params.summarization_xsum.min_length": 11,
-            "task_specific_params.summarization_xsum.num_beams": 6,
-        }
+    def test_get_protocol_passed_as_argument(self):
+        sitemap = GenericSitemap({"queryset": None})
+        for protocol in ["http", "https"]:
+            with self.subTest(protocol=protocol):
+                self.assertEqual(sitemap.get_protocol(protocol), protocol)
 
-        self.assertEqual(flatten_dict(input_dict), expected_dict)
+    def test_get_protocol_default(self):
+        sitemap = GenericSitemap({"queryset": None})
+        self.assertEqual(sitemap.get_protocol(), "https")
 
-    def test_transpose_numpy(self):
-        x = np.random.randn(3, 4)
-        self.assertTrue(np.allclose(transpose(x), x.transpose()))
-
-        x = np.random.randn(3, 4, 5)
-        self.assertTrue(np.allclose(transpose(x, axes=(1, 2, 0)), x.transpose((1, 2, 0))))
-
-    @require_torch
-    def test_transpose_torch(self):
-        x = np.random.randn(3, 4)
-        t = torch.tensor(x)
-        self.assertTrue(np.allclose(transpose(x), transpose(t).numpy()))
-
-        x = np.random.randn(3, 4, 5)
-        t = torch.tensor(x)
-        self.assertTrue(np.allclose(transpose(x, axes=(1, 2, 0)), transpose(t, axes=(1, 2, 0)).numpy()))
-
-    @require_tf
-    def test_transpose_tf(self):
-        x = np.random.randn(3, 4)
-        t = tf.constant(x)
-        self.assertTrue(np.allclose(transpose(x), transpose(t).numpy()))
-
-        x = np.random.randn(3, 4, 5)
-        t = tf.constant(x)
-        self.assertTrue(np.allclose(transpose(x, axes=(1, 2, 0)), transpose(t, axes=(1, 2, 0)).numpy()))
-
-    @require_flax
-    def test_transpose_flax(self):
-        x = np.random.randn(3, 4)
-        t = jnp.array(x)
-        self.assertTrue(np.allclose(transpose(x), np.asarray(transpose(t))))
-
-        x = np.random.randn(3, 4, 5)
-        t = jnp.array(x)
-        self.assertTrue(np.allclose(transpose(x, axes=(1, 2, 0)), np.asarray(transpose(t, axes=(1, 2, 0)))))
-
-    def test_reshape_numpy(self):
-        x = np.random.randn(3, 4)
-        self.assertTrue(np.allclose(reshape(x, (4, 3)), np.reshape(x, (4, 3))))
-
-        x = np.random.randn(3, 4, 5)
-        self.assertTrue(np.allclose(reshape(x, (12, 5)), np.reshape(x, (12, 5))))
-
-    @require_torch
-    def test_reshape_torch(self):
-        x = np.random.randn(3, 4)
-        t = torch.tensor(x)
-        self.assertTrue(np.allclose(reshape(x, (4, 3)), reshape(t, (4, 3)).numpy()))
-
-        x = np.random.randn(3, 4, 5)
-        t = torch.tensor(x)
-        self.assertTrue(np.allclose(reshape(x, (12, 5)), reshape(t, (12, 5)).numpy()))
-
-    @require_tf
-    def test_reshape_tf(self):
-        x = np.random.randn(3, 4)
-        t = tf.constant(x)
-        self.assertTrue(np.allclose(reshape(x, (4, 3)), reshape(t, (4, 3)).numpy()))
-
-        x = np.random.randn(3, 4, 5)
-        t = tf.constant(x)
-        self.assertTrue(np.allclose(reshape(x, (12, 5)), reshape(t, (12, 5)).numpy()))
-
-    @require_flax
-    def test_reshape_flax(self):
-        x = np.random.randn(3, 4)
-        t = jnp.array(x)
-        self.assertTrue(np.allclose(reshape(x, (4, 3)), np.asarray(reshape(t, (4, 3)))))
-
-        x = np.random.randn(3, 4, 5)
-        t = jnp.array(x)
-        self.assertTrue(np.allclose(reshape(x, (12, 5)), np.asarray(reshape(t, (12, 5)))))
-
-    def test_squeeze_numpy(self):
-        x = np.random.randn(1, 3, 4)
-        self.assertTrue(np.allclose(squeeze(x), np.squeeze(x)))
-
-        x = np.random.randn(1, 4, 1, 5)
-        self.assertTrue(np.allclose(squeeze(x, axis=2), np.squeeze(x, axis=2)))
-
-    @require_torch
-    def test_squeeze_torch(self):
-        x = np.random.randn(1, 3, 4)
-        t = torch.tensor(x)
-        self.assertTrue(np.allclose(squeeze(x), squeeze(t).numpy()))
-
-        x = np.random.randn(1, 4, 1, 5)
-        t = torch.tensor(x)
-        self.assertTrue(np.allclose(squeeze(x, axis=2), squeeze(t, axis=2).numpy()))
-
-    @require_tf
-    def test_squeeze_tf(self):
-        x = np.random.randn(1, 3, 4)
-        t = tf.constant(x)
-        self.assertTrue(np.allclose(squeeze(x), squeeze(t).numpy()))
-
-        x = np.random.randn(1, 4, 1, 5)
-        t = tf.constant(x)
-        self.assertTrue(np.allclose(squeeze(x, axis=2), squeeze(t, axis=2).numpy()))
-
-    @require_flax
-    def test_squeeze_flax(self):
-        x = np.random.randn(1, 3, 4)
-        t = jnp.array(x)
-        self.assertTrue(np.allclose(squeeze(x), np.asarray(squeeze(t))))
-
-        x = np.random.randn(1, 4, 1, 5)
-        t = jnp.array(x)
-        self.assertTrue(np.allclose(squeeze(x, axis=2), np.asarray(squeeze(t, axis=2))))
-
-    def test_expand_dims_numpy(self):
-        x = np.random.randn(3, 4)
-        self.assertTrue(np.allclose(expand_dims(x, axis=1), np.expand_dims(x, axis=1)))
-
-    @require_torch
-    def test_expand_dims_torch(self):
-        x = np.random.randn(3, 4)
-        t = torch.tensor(x)
-        self.assertTrue(np.allclose(expand_dims(x, axis=1), expand_dims(t, axis=1).numpy()))
-
-    @require_tf
-    def test_expand_dims_tf(self):
-        x = np.random.randn(3, 4)
-        t = tf.constant(x)
-        self.assertTrue(np.allclose(expand_dims(x, axis=1), expand_dims(t, axis=1).numpy()))
-
-    @require_flax
-    def test_expand_dims_flax(self):
-        x = np.random.randn(3, 4)
-        t = jnp.array(x)
-        self.assertTrue(np.allclose(expand_dims(x, axis=1), np.asarray(expand_dims(t, axis=1))))
+    def test_generic_sitemap_index(self):
+        TestModel.objects.update(lastmod=datetime(2013, 3, 13, 10, 0, 0))
+        response = self.client.get("/generic-lastmod/index.xml")
+        expected_content = """<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<sitemap><loc>http://example.com/simple/sitemap-generic.xml</loc><lastmod>2013-03-13T10:00:00</lastmod></sitemap>
+</sitemapindex>"""
+        self.assertXMLEqual(response.content.decode("utf-8"), expected_content)

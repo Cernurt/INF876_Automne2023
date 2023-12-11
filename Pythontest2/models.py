@@ -1,143 +1,140 @@
-import datetime
-import uuid
-from decimal import Decimal
-
-from django.db import models
-from django.utils import timezone
-
-try:
-    from PIL import Image
-except ImportError:
-    Image = None
+from django.contrib.gis import gdal
 
 
-class Country(models.Model):
-    name = models.CharField(max_length=255)
-    iso_two_letter = models.CharField(max_length=2)
-    description = models.TextField()
+class SpatialRefSysMixin:
+    """
+    The SpatialRefSysMixin is a class used by the database-dependent
+    SpatialRefSys objects to reduce redundant code.
+    """
 
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(
-                fields=["iso_two_letter", "name"],
-                name="country_name_iso_unique",
-            ),
-        ]
+    @property
+    def srs(self):
+        """
+        Return a GDAL SpatialReference object.
+        """
+        # TODO: Is caching really necessary here?  Is complexity worth it?
+        if hasattr(self, "_srs"):
+            # Returning a clone of the cached SpatialReference object.
+            return self._srs.clone()
+        else:
+            # Attempting to cache a SpatialReference object.
 
+            # Trying to get from WKT first.
+            try:
+                self._srs = gdal.SpatialReference(self.wkt)
+                return self.srs
+            except Exception as e:
+                msg = e
 
-class ProxyCountry(Country):
-    class Meta:
-        proxy = True
+            try:
+                self._srs = gdal.SpatialReference(self.proj4text)
+                return self.srs
+            except Exception as e:
+                msg = e
 
+            raise Exception(
+                "Could not get OSR SpatialReference from WKT: %s\nError:\n%s"
+                % (self.wkt, msg)
+            )
 
-class ProxyProxyCountry(ProxyCountry):
-    class Meta:
-        proxy = True
+    @property
+    def ellipsoid(self):
+        """
+        Return a tuple of the ellipsoid parameters:
+        (semimajor axis, semiminor axis, and inverse flattening).
+        """
+        return self.srs.ellipsoid
 
+    @property
+    def name(self):
+        "Return the projection name."
+        return self.srs.name
 
-class ProxyMultiCountry(ProxyCountry):
-    pass
+    @property
+    def spheroid(self):
+        "Return the spheroid name for this spatial reference."
+        return self.srs["spheroid"]
 
+    @property
+    def datum(self):
+        "Return the datum for this spatial reference."
+        return self.srs["datum"]
 
-class ProxyMultiProxyCountry(ProxyMultiCountry):
-    class Meta:
-        proxy = True
+    @property
+    def projected(self):
+        "Is this Spatial Reference projected?"
+        return self.srs.projected
 
+    @property
+    def local(self):
+        "Is this Spatial Reference local?"
+        return self.srs.local
 
-class Place(models.Model):
-    name = models.CharField(max_length=100)
+    @property
+    def geographic(self):
+        "Is this Spatial Reference geographic?"
+        return self.srs.geographic
 
-    class Meta:
-        abstract = True
+    @property
+    def linear_name(self):
+        "Return the linear units name."
+        return self.srs.linear_name
 
+    @property
+    def linear_units(self):
+        "Return the linear units."
+        return self.srs.linear_units
 
-class Restaurant(Place):
-    pass
+    @property
+    def angular_name(self):
+        "Return the name of the angular units."
+        return self.srs.angular_name
 
+    @property
+    def angular_units(self):
+        "Return the angular units."
+        return self.srs.angular_units
 
-class Pizzeria(Restaurant):
-    pass
+    @property
+    def units(self):
+        "Return a tuple of the units and the name."
+        if self.projected or self.local:
+            return (self.linear_units, self.linear_name)
+        elif self.geographic:
+            return (self.angular_units, self.angular_name)
+        else:
+            return (None, None)
 
+    @classmethod
+    def get_units(cls, wkt):
+        """
+        Return a tuple of (unit_value, unit_name) for the given WKT without
+        using any of the database fields.
+        """
+        return gdal.SpatialReference(wkt).units
 
-class State(models.Model):
-    two_letter_code = models.CharField(max_length=2, primary_key=True)
+    @classmethod
+    def get_spheroid(cls, wkt, string=True):
+        """
+        Class method used by GeometryField on initialization to
+        retrieve the `SPHEROID[..]` parameters from the given WKT.
+        """
+        srs = gdal.SpatialReference(wkt)
+        sphere_params = srs.ellipsoid
+        sphere_name = srs["spheroid"]
 
+        if not string:
+            return sphere_name, sphere_params
+        else:
+            # `string` parameter used to place in format acceptable by PostGIS
+            if len(sphere_params) == 3:
+                radius, flattening = sphere_params[0], sphere_params[2]
+            else:
+                radius, flattening = sphere_params
+            return 'SPHEROID["%s",%s,%s]' % (sphere_name, radius, flattening)
 
-class TwoFields(models.Model):
-    f1 = models.IntegerField(unique=True)
-    f2 = models.IntegerField(unique=True)
-    name = models.CharField(max_length=15, null=True)
-
-
-class FieldsWithDbColumns(models.Model):
-    rank = models.IntegerField(unique=True, db_column="rAnK")
-    name = models.CharField(max_length=15, null=True, db_column="oTheRNaMe")
-
-
-class UpsertConflict(models.Model):
-    number = models.IntegerField(unique=True)
-    rank = models.IntegerField()
-    name = models.CharField(max_length=15)
-
-
-class NoFields(models.Model):
-    pass
-
-
-class SmallAutoFieldModel(models.Model):
-    id = models.SmallAutoField(primary_key=True)
-
-
-class BigAutoFieldModel(models.Model):
-    id = models.BigAutoField(primary_key=True)
-
-
-class NullableFields(models.Model):
-    # Fields in db.backends.oracle.BulkInsertMapper
-    big_int_filed = models.BigIntegerField(null=True, default=1)
-    binary_field = models.BinaryField(null=True, default=b"data")
-    date_field = models.DateField(null=True, default=timezone.now)
-    datetime_field = models.DateTimeField(null=True, default=timezone.now)
-    decimal_field = models.DecimalField(
-        null=True, max_digits=2, decimal_places=1, default=Decimal("1.1")
-    )
-    duration_field = models.DurationField(null=True, default=datetime.timedelta(1))
-    float_field = models.FloatField(null=True, default=3.2)
-    integer_field = models.IntegerField(null=True, default=2)
-    null_boolean_field = models.BooleanField(null=True, default=False)
-    positive_big_integer_field = models.PositiveBigIntegerField(
-        null=True, default=2**63 - 1
-    )
-    positive_integer_field = models.PositiveIntegerField(null=True, default=3)
-    positive_small_integer_field = models.PositiveSmallIntegerField(
-        null=True, default=4
-    )
-    small_integer_field = models.SmallIntegerField(null=True, default=5)
-    time_field = models.TimeField(null=True, default=timezone.now)
-    auto_field = models.ForeignKey(NoFields, on_delete=models.CASCADE, null=True)
-    small_auto_field = models.ForeignKey(
-        SmallAutoFieldModel, on_delete=models.CASCADE, null=True
-    )
-    big_auto_field = models.ForeignKey(
-        BigAutoFieldModel, on_delete=models.CASCADE, null=True
-    )
-    # Fields not required in BulkInsertMapper
-    char_field = models.CharField(null=True, max_length=4, default="char")
-    email_field = models.EmailField(null=True, default="user@example.com")
-    file_field = models.FileField(null=True, default="file.txt")
-    file_path_field = models.FilePathField(path="/tmp", null=True, default="file.txt")
-    generic_ip_address_field = models.GenericIPAddressField(
-        null=True, default="127.0.0.1"
-    )
-    if Image:
-        image_field = models.ImageField(null=True, default="image.jpg")
-    slug_field = models.SlugField(null=True, default="slug")
-    text_field = models.TextField(null=True, default="text")
-    url_field = models.URLField(null=True, default="/")
-    uuid_field = models.UUIDField(null=True, default=uuid.uuid4)
-
-
-class RelatedModel(models.Model):
-    name = models.CharField(max_length=15, null=True)
-    country = models.OneToOneField(Country, models.CASCADE, primary_key=True)
-    big_auto_fields = models.ManyToManyField(BigAutoFieldModel)
+    def __str__(self):
+        """
+        Return the string representation, a 'pretty' OGC WKT.
+        """
+        return str(self.srs)

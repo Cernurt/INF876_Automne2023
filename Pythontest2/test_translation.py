@@ -1,86 +1,126 @@
-# coding=utf-8
-# Copyright 2023 HuggingFace Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-import unittest
-
-from transformers import load_tool
-from transformers.tools.agent_types import AGENT_TYPE_MAPPING
-
-from .test_tools_common import ToolTesterMixin, output_types
+from django.core.checks import Error
+from django.core.checks.translation import (
+    check_language_settings_consistent,
+    check_setting_language_code,
+    check_setting_languages,
+    check_setting_languages_bidi,
+)
+from django.test import SimpleTestCase, override_settings
 
 
-class TranslationToolTester(unittest.TestCase, ToolTesterMixin):
+class TranslationCheckTests(SimpleTestCase):
     def setUp(self):
-        self.tool = load_tool("translation")
-        self.tool.setup()
-        self.remote_tool = load_tool("translation", remote=True)
+        self.valid_tags = (
+            "en",  # language
+            "mas",  # language
+            "sgn-ase",  # language+extlang
+            "fr-CA",  # language+region
+            "es-419",  # language+region
+            "zh-Hans",  # language+script
+            "ca-ES-valencia",  # language+region+variant
+            # FIXME: The following should be invalid:
+            "sr@latin",  # language+script
+        )
+        self.invalid_tags = (
+            None,  # invalid type: None.
+            123,  # invalid type: int.
+            b"en",  # invalid type: bytes.
+            "eü",  # non-latin characters.
+            "en_US",  # locale format.
+            "en--us",  # empty subtag.
+            "-en",  # leading separator.
+            "en-",  # trailing separator.
+            "en-US.UTF-8",  # language tag w/ locale encoding.
+            "en_US.UTF-8",  # locale format - language w/ region and encoding.
+            "ca_ES@valencia",  # locale format - language w/ region and variant.
+            # FIXME: The following should be invalid:
+            # 'sr@latin',      # locale instead of language tag.
+        )
 
-    def test_exact_match_arg(self):
-        result = self.tool("Hey, what's up?", src_lang="English", tgt_lang="French")
-        self.assertEqual(result, "- Hé, comment ça va?")
+    def test_valid_language_code(self):
+        for tag in self.valid_tags:
+            with self.subTest(tag), self.settings(LANGUAGE_CODE=tag):
+                self.assertEqual(check_setting_language_code(None), [])
 
-    def test_exact_match_arg_remote(self):
-        result = self.remote_tool("Hey, what's up?", src_lang="English", tgt_lang="French")
-        self.assertEqual(result, "- Hé, comment ça va?")
+    def test_invalid_language_code(self):
+        msg = "You have provided an invalid value for the LANGUAGE_CODE setting: %r."
+        for tag in self.invalid_tags:
+            with self.subTest(tag), self.settings(LANGUAGE_CODE=tag):
+                self.assertEqual(
+                    check_setting_language_code(None),
+                    [
+                        Error(msg % tag, id="translation.E001"),
+                    ],
+                )
 
-    def test_exact_match_kwarg(self):
-        result = self.tool(text="Hey, what's up?", src_lang="English", tgt_lang="French")
-        self.assertEqual(result, "- Hé, comment ça va?")
+    def test_valid_languages(self):
+        for tag in self.valid_tags:
+            with self.subTest(tag), self.settings(LANGUAGES=[(tag, tag)]):
+                self.assertEqual(check_setting_languages(None), [])
 
-    def test_exact_match_kwarg_remote(self):
-        result = self.remote_tool(text="Hey, what's up?", src_lang="English", tgt_lang="French")
-        self.assertEqual(result, "- Hé, comment ça va?")
+    def test_invalid_languages(self):
+        msg = "You have provided an invalid language code in the LANGUAGES setting: %r."
+        for tag in self.invalid_tags:
+            with self.subTest(tag), self.settings(LANGUAGES=[(tag, tag)]):
+                self.assertEqual(
+                    check_setting_languages(None),
+                    [
+                        Error(msg % tag, id="translation.E002"),
+                    ],
+                )
 
-    def test_call(self):
-        inputs = ["Hey, what's up?", "English", "Spanish"]
-        outputs = self.tool(*inputs)
+    def test_valid_languages_bidi(self):
+        for tag in self.valid_tags:
+            with self.subTest(tag), self.settings(LANGUAGES_BIDI=[tag]):
+                self.assertEqual(check_setting_languages_bidi(None), [])
 
-        # There is a single output
-        if len(self.tool.outputs) == 1:
-            outputs = [outputs]
+    def test_invalid_languages_bidi(self):
+        msg = (
+            "You have provided an invalid language code in the LANGUAGES_BIDI setting: "
+            "%r."
+        )
+        for tag in self.invalid_tags:
+            with self.subTest(tag), self.settings(LANGUAGES_BIDI=[tag]):
+                self.assertEqual(
+                    check_setting_languages_bidi(None),
+                    [
+                        Error(msg % tag, id="translation.E003"),
+                    ],
+                )
 
-        self.assertListEqual(output_types(outputs), self.tool.outputs)
+    @override_settings(USE_I18N=True, LANGUAGES=[("en", "English")])
+    def test_inconsistent_language_settings(self):
+        msg = (
+            "You have provided a value for the LANGUAGE_CODE setting that is "
+            "not in the LANGUAGES setting."
+        )
+        for tag in ["fr", "fr-CA", "fr-357"]:
+            with self.subTest(tag), self.settings(LANGUAGE_CODE=tag):
+                self.assertEqual(
+                    check_language_settings_consistent(None),
+                    [
+                        Error(msg, id="translation.E004"),
+                    ],
+                )
 
-    def test_agent_types_outputs(self):
-        inputs = ["Hey, what's up?", "English", "Spanish"]
-        outputs = self.tool(*inputs)
-
-        if not isinstance(outputs, list):
-            outputs = [outputs]
-
-        self.assertEqual(len(outputs), len(self.tool.outputs))
-
-        for output, output_type in zip(outputs, self.tool.outputs):
-            agent_type = AGENT_TYPE_MAPPING[output_type]
-            self.assertTrue(isinstance(output, agent_type))
-
-    def test_agent_types_inputs(self):
-        inputs = ["Hey, what's up?", "English", "Spanish"]
-
-        _inputs = []
-
-        for _input, input_type in zip(inputs, self.tool.inputs):
-            if isinstance(input_type, list):
-                _inputs.append([AGENT_TYPE_MAPPING[_input_type](_input) for _input_type in input_type])
-            else:
-                _inputs.append(AGENT_TYPE_MAPPING[input_type](_input))
-
-        # Should not raise an error
-        outputs = self.tool(*inputs)
-
-        if not isinstance(outputs, list):
-            outputs = [outputs]
-
-        self.assertEqual(len(outputs), len(self.tool.outputs))
+    @override_settings(
+        USE_I18N=True,
+        LANGUAGES=[
+            ("de", "German"),
+            ("es", "Spanish"),
+            ("fr", "French"),
+            ("ca", "Catalan"),
+        ],
+    )
+    def test_valid_variant_consistent_language_settings(self):
+        tests = [
+            # language + region.
+            "fr-CA",
+            "es-419",
+            "de-at",
+            # language + region + variant.
+            "ca-ES-valencia",
+        ]
+        for tag in tests:
+            with self.subTest(tag), self.settings(LANGUAGE_CODE=tag):
+                self.assertEqual(check_language_settings_consistent(None), [])

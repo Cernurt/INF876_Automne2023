@@ -1,347 +1,166 @@
-from django.contrib.auth.checks import check_models_permissions, check_user_model
-from django.contrib.auth.models import AbstractBaseUser
-from django.core import checks
-from django.db import models
-from django.db.models import Q, UniqueConstraint
-from django.test import SimpleTestCase, override_settings, override_system_checks
-from django.test.utils import isolate_apps
+from pathlib import Path
+from unittest import mock
 
-from .models import CustomUserNonUniqueUsername
+from django.conf import DEFAULT_STORAGE_ALIAS, STATICFILES_STORAGE_ALIAS, settings
+from django.contrib.staticfiles.checks import E005, check_finders, check_storages
+from django.contrib.staticfiles.finders import BaseFinder, get_finder
+from django.core.checks import Error, Warning
+from django.test import SimpleTestCase, override_settings
+
+from .cases import CollectionTestCase
+from .settings import TEST_ROOT
 
 
-@isolate_apps("auth_tests", attr_name="apps")
-@override_system_checks([check_user_model])
-class UserModelChecksTests(SimpleTestCase):
-    @override_settings(AUTH_USER_MODEL="auth_tests.CustomUserNonListRequiredFields")
-    def test_required_fields_is_list(self):
-        """REQUIRED_FIELDS should be a list."""
+class FindersCheckTests(CollectionTestCase):
+    run_collectstatic_in_setUp = False
 
-        class CustomUserNonListRequiredFields(AbstractBaseUser):
-            username = models.CharField(max_length=30, unique=True)
-            date_of_birth = models.DateField()
-
-            USERNAME_FIELD = "username"
-            REQUIRED_FIELDS = "date_of_birth"
-
-        errors = checks.run_checks(app_configs=self.apps.get_app_configs())
-        self.assertEqual(
-            errors,
-            [
-                checks.Error(
-                    "'REQUIRED_FIELDS' must be a list or tuple.",
-                    obj=CustomUserNonListRequiredFields,
-                    id="auth.E001",
-                ),
-            ],
+    def test_base_finder_check_not_implemented(self):
+        finder = BaseFinder()
+        msg = (
+            "subclasses may provide a check() method to verify the finder is "
+            "configured correctly."
         )
+        with self.assertRaisesMessage(NotImplementedError, msg):
+            finder.check()
 
-    @override_settings(AUTH_USER_MODEL="auth_tests.CustomUserBadRequiredFields")
-    def test_username_not_in_required_fields(self):
-        """USERNAME_FIELD should not appear in REQUIRED_FIELDS."""
+    def test_check_finders(self):
+        """check_finders() concatenates all errors."""
+        error1 = Error("1")
+        error2 = Error("2")
+        error3 = Error("3")
 
-        class CustomUserBadRequiredFields(AbstractBaseUser):
-            username = models.CharField(max_length=30, unique=True)
-            date_of_birth = models.DateField()
+        def get_finders():
+            class Finder1(BaseFinder):
+                def check(self, **kwargs):
+                    return [error1]
 
-            USERNAME_FIELD = "username"
-            REQUIRED_FIELDS = ["username", "date_of_birth"]
+            class Finder2(BaseFinder):
+                def check(self, **kwargs):
+                    return []
 
-        errors = checks.run_checks(self.apps.get_app_configs())
+            class Finder3(BaseFinder):
+                def check(self, **kwargs):
+                    return [error2, error3]
+
+            class Finder4(BaseFinder):
+                pass
+
+            return [Finder1(), Finder2(), Finder3(), Finder4()]
+
+        with mock.patch("django.contrib.staticfiles.checks.get_finders", get_finders):
+            errors = check_finders(None)
+            self.assertEqual(errors, [error1, error2, error3])
+
+    def test_no_errors_with_test_settings(self):
+        self.assertEqual(check_finders(None), [])
+
+    @override_settings(STATICFILES_DIRS="a string")
+    def test_dirs_not_tuple_or_list(self):
         self.assertEqual(
-            errors,
+            check_finders(None),
             [
-                checks.Error(
-                    "The field named as the 'USERNAME_FIELD' for a custom user model "
-                    "must not be included in 'REQUIRED_FIELDS'.",
-                    hint=(
-                        "The 'USERNAME_FIELD' is currently set to 'username', you "
-                        "should remove 'username' from the 'REQUIRED_FIELDS'."
-                    ),
-                    obj=CustomUserBadRequiredFields,
-                    id="auth.E002",
-                ),
-            ],
-        )
-
-    @override_settings(AUTH_USER_MODEL="auth_tests.CustomUserNonUniqueUsername")
-    def test_username_non_unique(self):
-        """
-        A non-unique USERNAME_FIELD raises an error only if the default
-        authentication backend is used. Otherwise, a warning is raised.
-        """
-        errors = checks.run_checks()
-        self.assertEqual(
-            errors,
-            [
-                checks.Error(
-                    "'CustomUserNonUniqueUsername.username' must be "
-                    "unique because it is named as the 'USERNAME_FIELD'.",
-                    obj=CustomUserNonUniqueUsername,
-                    id="auth.E003",
-                ),
-            ],
-        )
-        with self.settings(AUTHENTICATION_BACKENDS=["my.custom.backend"]):
-            errors = checks.run_checks()
-            self.assertEqual(
-                errors,
-                [
-                    checks.Warning(
-                        "'CustomUserNonUniqueUsername.username' is named as "
-                        "the 'USERNAME_FIELD', but it is not unique.",
-                        hint=(
-                            "Ensure that your authentication backend(s) can handle "
-                            "non-unique usernames."
-                        ),
-                        obj=CustomUserNonUniqueUsername,
-                        id="auth.W004",
-                    ),
-                ],
-            )
-
-    @override_settings(AUTH_USER_MODEL="auth_tests.CustomUserPartiallyUnique")
-    def test_username_partially_unique(self):
-        class CustomUserPartiallyUnique(AbstractBaseUser):
-            username = models.CharField(max_length=30)
-            USERNAME_FIELD = "username"
-
-            class Meta:
-                constraints = [
-                    UniqueConstraint(
-                        fields=["username"],
-                        name="partial_username_unique",
-                        condition=Q(password__isnull=False),
-                    ),
-                ]
-
-        errors = checks.run_checks(app_configs=self.apps.get_app_configs())
-        self.assertEqual(
-            errors,
-            [
-                checks.Error(
-                    "'CustomUserPartiallyUnique.username' must be unique because "
-                    "it is named as the 'USERNAME_FIELD'.",
-                    obj=CustomUserPartiallyUnique,
-                    id="auth.E003",
-                ),
-            ],
-        )
-        with self.settings(AUTHENTICATION_BACKENDS=["my.custom.backend"]):
-            errors = checks.run_checks(app_configs=self.apps.get_app_configs())
-            self.assertEqual(
-                errors,
-                [
-                    checks.Warning(
-                        "'CustomUserPartiallyUnique.username' is named as the "
-                        "'USERNAME_FIELD', but it is not unique.",
-                        hint=(
-                            "Ensure that your authentication backend(s) can "
-                            "handle non-unique usernames."
-                        ),
-                        obj=CustomUserPartiallyUnique,
-                        id="auth.W004",
-                    ),
-                ],
-            )
-
-    @override_settings(AUTH_USER_MODEL="auth_tests.CustomUserUniqueConstraint")
-    def test_username_unique_with_model_constraint(self):
-        class CustomUserUniqueConstraint(AbstractBaseUser):
-            username = models.CharField(max_length=30)
-            USERNAME_FIELD = "username"
-
-            class Meta:
-                constraints = [
-                    UniqueConstraint(fields=["username"], name="username_unique"),
-                ]
-
-        self.assertEqual(checks.run_checks(app_configs=self.apps.get_app_configs()), [])
-        with self.settings(AUTHENTICATION_BACKENDS=["my.custom.backend"]):
-            errors = checks.run_checks(app_configs=self.apps.get_app_configs())
-            self.assertEqual(errors, [])
-
-    @override_settings(AUTH_USER_MODEL="auth_tests.BadUser")
-    def test_is_anonymous_authenticated_methods(self):
-        """
-        <User Model>.is_anonymous/is_authenticated must not be methods.
-        """
-
-        class BadUser(AbstractBaseUser):
-            username = models.CharField(max_length=30, unique=True)
-            USERNAME_FIELD = "username"
-
-            def is_anonymous(self):
-                return True
-
-            def is_authenticated(self):
-                return True
-
-        errors = checks.run_checks(app_configs=self.apps.get_app_configs())
-        self.assertEqual(
-            errors,
-            [
-                checks.Critical(
-                    "%s.is_anonymous must be an attribute or property rather than "
-                    "a method. Ignoring this is a security issue as anonymous "
-                    "users will be treated as authenticated!" % BadUser,
-                    obj=BadUser,
-                    id="auth.C009",
-                ),
-                checks.Critical(
-                    "%s.is_authenticated must be an attribute or property rather "
-                    "than a method. Ignoring this is a security issue as anonymous "
-                    "users will be treated as authenticated!" % BadUser,
-                    obj=BadUser,
-                    id="auth.C010",
-                ),
-            ],
-        )
-
-
-@isolate_apps("auth_tests", attr_name="apps")
-@override_system_checks([check_models_permissions])
-class ModelsPermissionsChecksTests(SimpleTestCase):
-    def test_clashing_default_permissions(self):
-        class Checked(models.Model):
-            class Meta:
-                permissions = [("change_checked", "Can edit permission (duplicate)")]
-
-        errors = checks.run_checks(self.apps.get_app_configs())
-        self.assertEqual(
-            errors,
-            [
-                checks.Error(
-                    "The permission codenamed 'change_checked' clashes with a builtin "
-                    "permission for model 'auth_tests.Checked'.",
-                    obj=Checked,
-                    id="auth.E005",
-                ),
-            ],
-        )
-
-    def test_non_clashing_custom_permissions(self):
-        class Checked(models.Model):
-            class Meta:
-                permissions = [
-                    ("my_custom_permission", "Some permission"),
-                    ("other_one", "Some other permission"),
-                ]
-
-        errors = checks.run_checks(self.apps.get_app_configs())
-        self.assertEqual(errors, [])
-
-    def test_clashing_custom_permissions(self):
-        class Checked(models.Model):
-            class Meta:
-                permissions = [
-                    ("my_custom_permission", "Some permission"),
-                    ("other_one", "Some other permission"),
-                    (
-                        "my_custom_permission",
-                        "Some permission with duplicate permission code",
-                    ),
-                ]
-
-        errors = checks.run_checks(self.apps.get_app_configs())
-        self.assertEqual(
-            errors,
-            [
-                checks.Error(
-                    "The permission codenamed 'my_custom_permission' is duplicated for "
-                    "model 'auth_tests.Checked'.",
-                    obj=Checked,
-                    id="auth.E006",
-                ),
-            ],
-        )
-
-    def test_verbose_name_max_length(self):
-        class Checked(models.Model):
-            class Meta:
-                verbose_name = (
-                    "some ridiculously long verbose name that is out of control" * 5
+                Error(
+                    "The STATICFILES_DIRS setting is not a tuple or list.",
+                    hint="Perhaps you forgot a trailing comma?",
+                    id="staticfiles.E001",
                 )
-
-        errors = checks.run_checks(self.apps.get_app_configs())
-        self.assertEqual(
-            errors,
-            [
-                checks.Error(
-                    "The verbose_name of model 'auth_tests.Checked' must be at most "
-                    "244 characters for its builtin permission names to be at most 255 "
-                    "characters.",
-                    obj=Checked,
-                    id="auth.E007",
-                ),
             ],
         )
 
-    def test_model_name_max_length(self):
-        model_name = "X" * 94
-        model = type(model_name, (models.Model,), {"__module__": self.__module__})
-        errors = checks.run_checks(self.apps.get_app_configs())
-        self.assertEqual(
-            errors,
-            [
-                checks.Error(
-                    "The name of model 'auth_tests.%s' must be at most 93 "
-                    "characters for its builtin permission codenames to be at "
-                    "most 100 characters." % model_name,
-                    obj=model,
-                    id="auth.E011",
-                ),
-            ],
-        )
+    def test_dirs_contains_static_root(self):
+        with self.settings(STATICFILES_DIRS=[settings.STATIC_ROOT]):
+            self.assertEqual(
+                check_finders(None),
+                [
+                    Error(
+                        "The STATICFILES_DIRS setting should not contain the "
+                        "STATIC_ROOT setting.",
+                        id="staticfiles.E002",
+                    )
+                ],
+            )
 
-    def test_custom_permission_name_max_length(self):
-        custom_permission_name = (
-            "some ridiculously long verbose name that is out of control" * 5
-        )
+    def test_dirs_contains_static_root_in_tuple(self):
+        with self.settings(STATICFILES_DIRS=[("prefix", settings.STATIC_ROOT)]):
+            self.assertEqual(
+                check_finders(None),
+                [
+                    Error(
+                        "The STATICFILES_DIRS setting should not contain the "
+                        "STATIC_ROOT setting.",
+                        id="staticfiles.E002",
+                    )
+                ],
+            )
 
-        class Checked(models.Model):
-            class Meta:
-                permissions = [
-                    ("my_custom_permission", custom_permission_name),
-                ]
+    def test_prefix_contains_trailing_slash(self):
+        static_dir = Path(TEST_ROOT) / "project" / "documents"
+        with self.settings(STATICFILES_DIRS=[("prefix/", static_dir)]):
+            self.assertEqual(
+                check_finders(None),
+                [
+                    Error(
+                        "The prefix 'prefix/' in the STATICFILES_DIRS setting must "
+                        "not end with a slash.",
+                        id="staticfiles.E003",
+                    ),
+                ],
+            )
 
-        errors = checks.run_checks(self.apps.get_app_configs())
-        self.assertEqual(
-            errors,
-            [
-                checks.Error(
-                    "The permission named '%s' of model 'auth_tests.Checked' is longer "
-                    "than 255 characters." % custom_permission_name,
-                    obj=Checked,
-                    id="auth.E008",
-                ),
-            ],
-        )
+    def test_nonexistent_directories(self):
+        with self.settings(
+            STATICFILES_DIRS=[
+                "/fake/path",
+                ("prefix", "/fake/prefixed/path"),
+            ]
+        ):
+            self.assertEqual(
+                check_finders(None),
+                [
+                    Warning(
+                        "The directory '/fake/path' in the STATICFILES_DIRS "
+                        "setting does not exist.",
+                        id="staticfiles.W004",
+                    ),
+                    Warning(
+                        "The directory '/fake/prefixed/path' in the "
+                        "STATICFILES_DIRS setting does not exist.",
+                        id="staticfiles.W004",
+                    ),
+                ],
+            )
+            # Nonexistent directories are skipped.
+            finder = get_finder("django.contrib.staticfiles.finders.FileSystemFinder")
+            self.assertEqual(list(finder.list(None)), [])
 
-    def test_custom_permission_codename_max_length(self):
-        custom_permission_codename = "x" * 101
 
-        class Checked(models.Model):
-            class Meta:
-                permissions = [
-                    (custom_permission_codename, "Custom permission"),
-                ]
+class StoragesCheckTests(SimpleTestCase):
+    @override_settings(STORAGES={})
+    def test_error_empty_storages(self):
+        errors = check_storages(None)
+        self.assertEqual(errors, [E005])
 
-        errors = checks.run_checks(self.apps.get_app_configs())
-        self.assertEqual(
-            errors,
-            [
-                checks.Error(
-                    "The permission codenamed '%s' of model 'auth_tests.Checked' "
-                    "is longer than 100 characters." % custom_permission_codename,
-                    obj=Checked,
-                    id="auth.E012",
-                ),
-            ],
-        )
+    @override_settings(
+        STORAGES={
+            DEFAULT_STORAGE_ALIAS: {
+                "BACKEND": "django.core.files.storage.FileSystemStorage",
+            },
+            "example": {
+                "BACKEND": "ignore.me",
+            },
+        }
+    )
+    def test_error_missing_staticfiles(self):
+        errors = check_storages(None)
+        self.assertEqual(errors, [E005])
 
-    def test_empty_default_permissions(self):
-        class Checked(models.Model):
-            class Meta:
-                default_permissions = ()
-
-        self.assertEqual(checks.run_checks(self.apps.get_app_configs()), [])
+    @override_settings(
+        STORAGES={
+            STATICFILES_STORAGE_ALIAS: {
+                "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+            },
+        }
+    )
+    def test_staticfiles_no_errors(self):
+        errors = check_storages(None)
+        self.assertEqual(errors, [])

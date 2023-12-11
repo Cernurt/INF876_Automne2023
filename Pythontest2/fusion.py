@@ -1,84 +1,138 @@
-from __future__ import unicode_literals
+from __future__ import annotations
 
-from .common import InfoExtractor
-from ..utils import (
-    determine_ext,
-    int_or_none,
-    mimetype2ext,
-    parse_iso8601,
-)
+import copy
+from typing import Optional, Tuple, TypeVar
 
+import torch
 
-class FusionIE(InfoExtractor):
-    _VALID_URL = r'https?://(?:www\.)?fusion\.(?:net|tv)/(?:video/|show/.+?\bvideo=)(?P<id>\d+)'
-    _TESTS = [{
-        'url': 'http://fusion.tv/video/201781/u-s-and-panamanian-forces-work-together-to-stop-a-vessel-smuggling-drugs/',
-        'info_dict': {
-            'id': '3145868',
-            'ext': 'mp4',
-            'title': 'U.S. and Panamanian forces work together to stop a vessel smuggling drugs',
-            'description': 'md5:0cc84a9943c064c0f46b128b41b1b0d7',
-            'duration': 140.0,
-            'timestamp': 1442589635,
-            'uploader': 'UNIVISON',
-            'upload_date': '20150918',
-        },
-        'params': {
-            'skip_download': True,
-        },
-        'add_ie': ['Anvato'],
-    }, {
-        'url': 'http://fusion.tv/video/201781',
-        'only_matching': True,
-    }, {
-        'url': 'https://fusion.tv/show/food-exposed-with-nelufar-hedayat/?ancla=full-episodes&video=588644',
-        'only_matching': True,
-    }]
+__all__ = ['fuse_conv_bn_eval', 'fuse_conv_bn_weights', 'fuse_linear_bn_eval', 'fuse_linear_bn_weights']
 
-    def _real_extract(self, url):
-        video_id = self._match_id(url)
-        video = self._download_json(
-            'https://platform.fusion.net/wp-json/fusiondotnet/v1/video/' + video_id, video_id)
+ConvT = TypeVar("ConvT", bound="torch.nn.modules.conv._ConvNd")
+LinearT = TypeVar("LinearT", bound="torch.nn.Linear")
 
-        info = {
-            'id': video_id,
-            'title': video['title'],
-            'description': video.get('excerpt'),
-            'timestamp': parse_iso8601(video.get('published')),
-            'series': video.get('show'),
-        }
+def fuse_conv_bn_eval(conv: ConvT, bn: torch.nn.modules.batchnorm._BatchNorm, transpose: bool = False) -> ConvT:
+    r"""Fuse a convolutional module and a BatchNorm module into a single, new convolutional module.
 
-        formats = []
-        src = video.get('src') or {}
-        for f_id, f in src.items():
-            for q_id, q in f.items():
-                q_url = q.get('url')
-                if not q_url:
-                    continue
-                ext = determine_ext(q_url, mimetype2ext(q.get('type')))
-                if ext == 'smil':
-                    formats.extend(self._extract_smil_formats(q_url, video_id, fatal=False))
-                elif f_id == 'm3u8-variant' or (ext == 'm3u8' and q_id == 'Variant'):
-                    formats.extend(self._extract_m3u8_formats(
-                        q_url, video_id, 'mp4', 'm3u8_native', m3u8_id='hls', fatal=False))
-                else:
-                    formats.append({
-                        'format_id': '-'.join([f_id, q_id]),
-                        'url': q_url,
-                        'width': int_or_none(q.get('width')),
-                        'height': int_or_none(q.get('height')),
-                        'tbr': int_or_none(self._search_regex(r'_(\d+)\.m(?:p4|3u8)', q_url, 'bitrate')),
-                        'ext': 'mp4' if ext == 'm3u8' else ext,
-                        'protocol': 'm3u8_native' if ext == 'm3u8' else 'https',
-                    })
-        if formats:
-            self._sort_formats(formats)
-            info['formats'] = formats
-        else:
-            info.update({
-                '_type': 'url',
-                'url': 'anvato:uni:' + video['video_ids']['anvato'],
-                'ie_key': 'Anvato',
-            })
+    Args:
+        conv (torch.nn.modules.conv._ConvNd): A convolutional module.
+        bn (torch.nn.modules.batchnorm._BatchNorm): A BatchNorm module.
+        transpose (bool, optional): If True, transpose the convolutional weight. Defaults to False.
 
-        return info
+    Returns:
+        torch.nn.modules.conv._ConvNd: The fused convolutional module.
+
+    .. note::
+        Both ``conv`` and ``bn`` must be in eval mode, and ``bn`` must have its running buffers computed.
+    """
+    assert not (conv.training or bn.training), "Fusion only for eval!"
+    fused_conv = copy.deepcopy(conv)
+
+    assert bn.running_mean is not None and bn.running_var is not None
+    fused_conv.weight, fused_conv.bias = fuse_conv_bn_weights(
+        fused_conv.weight, fused_conv.bias,
+        bn.running_mean, bn.running_var, bn.eps, bn.weight, bn.bias, transpose)
+
+    return fused_conv
+
+def fuse_conv_bn_weights(
+    conv_w: torch.Tensor,
+    conv_b: Optional[torch.Tensor],
+    bn_rm: torch.Tensor,
+    bn_rv: torch.Tensor,
+    bn_eps: float,
+    bn_w: Optional[torch.Tensor],
+    bn_b: Optional[torch.Tensor],
+    transpose: bool = False
+) -> Tuple[torch.nn.Parameter, torch.nn.Parameter]:
+    r"""Fuse convolutional module parameters and BatchNorm module parameters into new convolutional module parameters.
+
+    Args:
+        conv_w (torch.Tensor): Convolutional weight.
+        conv_b (Optional[torch.Tensor]): Convolutional bias.
+        bn_rm (torch.Tensor): BatchNorm running mean.
+        bn_rv (torch.Tensor): BatchNorm running variance.
+        bn_eps (float): BatchNorm epsilon.
+        bn_w (Optional[torch.Tensor]): BatchNorm weight.
+        bn_b (Optional[torch.Tensor]): BatchNorm bias.
+        transpose (bool, optional): If True, transpose the conv weight. Defaults to False.
+
+    Returns:
+        Tuple[torch.nn.Parameter, torch.nn.Parameter]: Fused convolutional weight and bias.
+    """
+    conv_weight_dtype = conv_w.dtype
+    conv_bias_dtype = conv_b.dtype if conv_b is not None else conv_weight_dtype
+    if conv_b is None:
+        conv_b = torch.zeros_like(bn_rm)
+    if bn_w is None:
+        bn_w = torch.ones_like(bn_rm)
+    if bn_b is None:
+        bn_b = torch.zeros_like(bn_rm)
+    bn_var_rsqrt = torch.rsqrt(bn_rv + bn_eps)
+
+    if transpose:
+        shape = [1, -1] + [1] * (len(conv_w.shape) - 2)
+    else:
+        shape = [-1, 1] + [1] * (len(conv_w.shape) - 2)
+
+    fused_conv_w = (conv_w * (bn_w * bn_var_rsqrt).reshape(shape)).to(dtype=conv_weight_dtype)
+    fused_conv_b = ((conv_b - bn_rm) * bn_var_rsqrt * bn_w + bn_b).to(dtype=conv_bias_dtype)
+
+    return (
+        torch.nn.Parameter(fused_conv_w, conv_w.requires_grad), torch.nn.Parameter(fused_conv_b, conv_b.requires_grad)
+    )
+
+def fuse_linear_bn_eval(linear: LinearT, bn: torch.nn.modules.batchnorm._BatchNorm) -> LinearT:
+    r"""Fuse a linear module and a BatchNorm module into a single, new linear module.
+
+    Args:
+        linear (torch.nn.Linear): A Linear module.
+        bn (torch.nn.modules.batchnorm._BatchNorm): A BatchNorm module.
+
+    Returns:
+        torch.nn.Linear: The fused linear module.
+
+    .. note::
+        Both ``linear`` and ``bn`` must be in eval mode, and ``bn`` must have its running buffers computed.
+    """
+    assert not (linear.training or bn.training), "Fusion only for eval!"
+    fused_linear = copy.deepcopy(linear)
+
+    assert bn.running_mean is not None and bn.running_var is not None
+    fused_linear.weight, fused_linear.bias = fuse_linear_bn_weights(
+        fused_linear.weight, fused_linear.bias,
+        bn.running_mean, bn.running_var, bn.eps, bn.weight, bn.bias)
+
+    return fused_linear
+
+def fuse_linear_bn_weights(
+    linear_w: torch.Tensor,
+    linear_b: Optional[torch.Tensor],
+    bn_rm: torch.Tensor,
+    bn_rv: torch.Tensor,
+    bn_eps: float,
+    bn_w: torch.Tensor,
+    bn_b: torch.Tensor,
+) -> Tuple[torch.nn.Parameter, torch.nn.Parameter]:
+    r"""Fuse linear module parameters and BatchNorm module parameters into new linear module parameters.
+
+    Args:
+        linear_w (torch.Tensor): Linear weight.
+        linear_b (Optional[torch.Tensor]): Linear bias.
+        bn_rm (torch.Tensor): BatchNorm running mean.
+        bn_rv (torch.Tensor): BatchNorm running variance.
+        bn_eps (float): BatchNorm epsilon.
+        bn_w (torch.Tensor): BatchNorm weight.
+        bn_b (torch.Tensor): BatchNorm bias.
+        transpose (bool, optional): If True, transpose the conv weight. Defaults to False.
+
+    Returns:
+        Tuple[torch.nn.Parameter, torch.nn.Parameter]: Fused linear weight and bias.
+    """
+    if linear_b is None:
+        linear_b = torch.zeros_like(bn_rm)
+    bn_scale = bn_w * torch.rsqrt(bn_rv + bn_eps)
+
+    fused_w = linear_w * bn_scale.unsqueeze(-1)
+    fused_b = (linear_b - bn_rm) * bn_scale + bn_b
+
+    return torch.nn.Parameter(fused_w, linear_w.requires_grad), torch.nn.Parameter(fused_b, linear_b.requires_grad)

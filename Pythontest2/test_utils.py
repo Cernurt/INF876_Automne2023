@@ -1,139 +1,193 @@
-"""Tests for django.db.backends.utils"""
-from decimal import Decimal, Rounded
+# Owner(s): ["oncall: quantization"]
 
-from django.db import NotSupportedError, connection
-from django.db.backends.utils import (
-    format_number,
-    split_identifier,
-    split_tzname_delta,
-    truncate_name,
-)
-from django.test import (
-    SimpleTestCase,
-    TransactionTestCase,
-    skipIfDBFeature,
-    skipUnlessDBFeature,
-)
+import torch
+from torch.testing._internal.common_utils import TestCase
+from torch.ao.quantization.utils import get_fqn_to_example_inputs
+from torch.ao.nn.quantized.modules.utils import _quantize_weight
+from torch.ao.quantization import MovingAverageMinMaxObserver, MovingAveragePerChannelMinMaxObserver
 
 
-class TestUtils(SimpleTestCase):
-    def test_truncate_name(self):
-        self.assertEqual(truncate_name("some_table", 10), "some_table")
-        self.assertEqual(truncate_name("some_long_table", 10), "some_la38a")
-        self.assertEqual(truncate_name("some_long_table", 10, 3), "some_loa38")
-        self.assertEqual(truncate_name("some_long_table"), "some_long_table")
-        # "user"."table" syntax
-        self.assertEqual(
-            truncate_name('username"."some_table', 10), 'username"."some_table'
+class TestUtils(TestCase):
+    def _test_get_fqn_to_example_inputs(self, M, example_inputs, expected_fqn_to_dim):
+        m = M().eval()
+        fqn_to_example_inputs = get_fqn_to_example_inputs(m, example_inputs)
+        for fqn, expected_dims in expected_fqn_to_dim.items():
+            assert fqn in expected_fqn_to_dim
+            example_inputs = fqn_to_example_inputs[fqn]
+            for example_input, expected_dim in zip(example_inputs, expected_dims):
+                assert example_input.dim() == expected_dim
+
+    def test_get_fqn_to_example_inputs_simple(self):
+        class Sub(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = torch.nn.Linear(5, 5)
+                self.linear2 = torch.nn.Linear(5, 5)
+
+            def forward(self, x):
+                x = self.linear1(x)
+                x = self.linear2(x)
+                return x
+
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = torch.nn.Linear(5, 5)
+                self.linear2 = torch.nn.Linear(5, 5)
+                self.sub = Sub()
+
+            def forward(self, x):
+                x = self.linear1(x)
+                x = self.linear2(x)
+                x = self.sub(x)
+                return x
+
+        expected_fqn_to_dim = {
+            "": (2,),
+            "linear1": (2,),
+            "linear2": (2,),
+            "sub": (2,),
+            "sub.linear1": (2,),
+            "sub.linear2": (2,)
+        }
+        example_inputs = (torch.rand(1, 5),)
+        self._test_get_fqn_to_example_inputs(M, example_inputs, expected_fqn_to_dim)
+
+    def test_get_fqn_to_example_inputs_default_kwargs(self):
+        """ Test that we can get example inputs for functions with default keyword arguments
+        """
+        class Sub(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = torch.nn.Linear(5, 5)
+                self.linear2 = torch.nn.Linear(5, 5)
+
+            def forward(self, x, key1=torch.rand(1), key2=torch.rand(1)):
+                x = self.linear1(x)
+                x = self.linear2(x)
+                return x
+
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = torch.nn.Linear(5, 5)
+                self.linear2 = torch.nn.Linear(5, 5)
+                self.sub = Sub()
+
+            def forward(self, x):
+                x = self.linear1(x)
+                x = self.linear2(x)
+                # only override `key2`, `key1` will use default
+                x = self.sub(x, key2=torch.rand(1, 2))
+                return x
+
+        expected_fqn_to_dim = {
+            "": (2,),
+            "linear1": (2,),
+            "linear2": (2,),
+            # second arg is `key1`, which is using default argument
+            # third arg is `key2`, override by callsite
+            "sub": (2, 1, 2),
+            "sub.linear1": (2,),
+            "sub.linear2": (2,)
+        }
+        example_inputs = (torch.rand(1, 5),)
+        self._test_get_fqn_to_example_inputs(M, example_inputs, expected_fqn_to_dim)
+
+    def test_get_fqn_to_example_inputs_complex_args(self):
+        """ Test that we can record complex example inputs such as lists and dicts
+        """
+        class Sub(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = torch.nn.Linear(5, 5)
+                self.linear2 = torch.nn.Linear(5, 5)
+
+            def forward(self, x, list_arg, dict_arg):
+                x = self.linear1(x)
+                x = self.linear2(x)
+                return x
+
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = torch.nn.Linear(5, 5)
+                self.linear2 = torch.nn.Linear(5, 5)
+                self.sub = Sub()
+
+            def forward(self, x):
+                x = self.linear1(x)
+                x = self.linear2(x)
+                x = self.sub(x, [x], {"3": x})
+                return x
+
+        example_inputs = (torch.rand(1, 5),)
+        m = M().eval()
+        fqn_to_example_inputs = get_fqn_to_example_inputs(m, example_inputs)
+        assert "sub" in fqn_to_example_inputs
+        assert isinstance(fqn_to_example_inputs["sub"][1], list)
+        assert isinstance(fqn_to_example_inputs["sub"][2], dict) and \
+            "3" in fqn_to_example_inputs["sub"][2]
+
+    def test_quantize_weight_clamping_per_tensor(self):
+        """ Test quant_{min, max} from per tensor observer is honored by `_quantize_weight` method
+        """
+        fp_min, fp_max = -1000.0, 1000.0
+        q8_min, q8_max = -10, 10
+
+        float_tensor = torch.tensor([fp_min, fp_max])
+
+        observer = MovingAverageMinMaxObserver(
+            averaging_constant=1.0,
+            dtype=torch.qint8,
+            quant_min=q8_min,
+            quant_max=q8_max,
+            qscheme=torch.per_tensor_symmetric,
         )
-        self.assertEqual(
-            truncate_name('username"."some_long_table', 10), 'username"."some_la38a'
-        )
-        self.assertEqual(
-            truncate_name('username"."some_long_table', 10, 3), 'username"."some_loa38'
-        )
 
-    def test_split_identifier(self):
-        self.assertEqual(split_identifier("some_table"), ("", "some_table"))
-        self.assertEqual(split_identifier('"some_table"'), ("", "some_table"))
-        self.assertEqual(
-            split_identifier('namespace"."some_table'), ("namespace", "some_table")
-        )
-        self.assertEqual(
-            split_identifier('"namespace"."some_table"'), ("namespace", "some_table")
-        )
+        observer(float_tensor)
+        assert observer.min_val == fp_min
+        assert observer.max_val == fp_max
 
-    def test_format_number(self):
-        def equal(value, max_d, places, result):
-            self.assertEqual(format_number(Decimal(value), max_d, places), result)
+        quantized_tensor = _quantize_weight(float_tensor, observer)
+        assert quantized_tensor.int_repr().max().item() == q8_max
+        assert quantized_tensor.int_repr().min().item() == q8_min
 
-        equal("0", 12, 3, "0.000")
-        equal("0", 12, 8, "0.00000000")
-        equal("1", 12, 9, "1.000000000")
-        equal("0.00000000", 12, 8, "0.00000000")
-        equal("0.000000004", 12, 8, "0.00000000")
-        equal("0.000000008", 12, 8, "0.00000001")
-        equal("0.000000000000000000999", 10, 8, "0.00000000")
-        equal("0.1234567890", 12, 10, "0.1234567890")
-        equal("0.1234567890", 12, 9, "0.123456789")
-        equal("0.1234567890", 12, 8, "0.12345679")
-        equal("0.1234567890", 12, 5, "0.12346")
-        equal("0.1234567890", 12, 3, "0.123")
-        equal("0.1234567890", 12, 1, "0.1")
-        equal("0.1234567890", 12, 0, "0")
-        equal("0.1234567890", None, 0, "0")
-        equal("1234567890.1234567890", None, 0, "1234567890")
-        equal("1234567890.1234567890", None, 2, "1234567890.12")
-        equal("0.1234", 5, None, "0.1234")
-        equal("123.12", 5, None, "123.12")
+        # Actual weight values can be outside than observer [min_val, max_val] for the moving average observer
+        float_tensor *= 1.2
 
-        with self.assertRaises(Rounded):
-            equal("0.1234567890", 5, None, "0.12346")
-        with self.assertRaises(Rounded):
-            equal("1234567890.1234", 5, None, "1234600000")
+        quantized_tensor = _quantize_weight(float_tensor, observer)
+        assert quantized_tensor.int_repr().max().item() == q8_max
+        assert quantized_tensor.int_repr().min().item() == q8_min
 
-    def test_split_tzname_delta(self):
-        tests = [
-            ("Asia/Ust+Nera", ("Asia/Ust+Nera", None, None)),
-            ("Asia/Ust-Nera", ("Asia/Ust-Nera", None, None)),
-            ("Asia/Ust+Nera-02:00", ("Asia/Ust+Nera", "-", "02:00")),
-            ("Asia/Ust-Nera+05:00", ("Asia/Ust-Nera", "+", "05:00")),
-            ("America/Coral_Harbour-01:00", ("America/Coral_Harbour", "-", "01:00")),
-            ("America/Coral_Harbour+02:30", ("America/Coral_Harbour", "+", "02:30")),
-            ("UTC+15:00", ("UTC", "+", "15:00")),
-            ("UTC-04:43", ("UTC", "-", "04:43")),
-            ("UTC", ("UTC", None, None)),
-            ("UTC+1", ("UTC+1", None, None)),
-        ]
-        for tzname, expected in tests:
-            with self.subTest(tzname=tzname):
-                self.assertEqual(split_tzname_delta(tzname), expected)
+    def test_quantize_weight_clamping_per_channel(self):
+        """ Test quant_{min, max} from per channel observer is honored by `_quantize_weight` method
+        """
+        fp_min, fp_max = -1000.0, 1000.0
+        q8_min, q8_max = -10, 10
 
+        float_tensor = torch.tensor([[fp_min, fp_max]])
 
-class CursorWrapperTests(TransactionTestCase):
-    available_apps = []
-
-    def _test_procedure(self, procedure_sql, params, param_types, kparams=None):
-        with connection.cursor() as cursor:
-            cursor.execute(procedure_sql)
-        # Use a new cursor because in MySQL a procedure can't be used in the
-        # same cursor in which it was created.
-        with connection.cursor() as cursor:
-            cursor.callproc("test_procedure", params, kparams)
-        with connection.schema_editor() as editor:
-            editor.remove_procedure("test_procedure", param_types)
-
-    @skipUnlessDBFeature("create_test_procedure_without_params_sql")
-    def test_callproc_without_params(self):
-        self._test_procedure(
-            connection.features.create_test_procedure_without_params_sql, [], []
+        observer = MovingAveragePerChannelMinMaxObserver(
+            averaging_constant=1.0,
+            dtype=torch.qint8,
+            quant_min=q8_min,
+            quant_max=q8_max,
+            qscheme=torch.per_channel_symmetric,
+            ch_axis=0,
         )
 
-    @skipUnlessDBFeature("create_test_procedure_with_int_param_sql")
-    def test_callproc_with_int_params(self):
-        self._test_procedure(
-            connection.features.create_test_procedure_with_int_param_sql,
-            [1],
-            ["INTEGER"],
-        )
+        observer(float_tensor)
+        assert observer.min_val == fp_min
+        assert observer.max_val == fp_max
 
-    @skipUnlessDBFeature(
-        "create_test_procedure_with_int_param_sql", "supports_callproc_kwargs"
-    )
-    def test_callproc_kparams(self):
-        self._test_procedure(
-            connection.features.create_test_procedure_with_int_param_sql,
-            [],
-            ["INTEGER"],
-            {"P_I": 1},
-        )
+        quantized_tensor = _quantize_weight(float_tensor, observer)
+        assert quantized_tensor.int_repr().max().item() == q8_max
+        assert quantized_tensor.int_repr().min().item() == q8_min
 
-    @skipIfDBFeature("supports_callproc_kwargs")
-    def test_unsupported_callproc_kparams_raises_error(self):
-        msg = (
-            "Keyword parameters for callproc are not supported on this database "
-            "backend."
-        )
-        with self.assertRaisesMessage(NotSupportedError, msg):
-            with connection.cursor() as cursor:
-                cursor.callproc("test_procedure", [], {"P_I": 1})
+        # Actual weight values can be outside than observer [min_val, max_val] for the moving average observer
+        float_tensor *= 1.2
+
+        quantized_tensor = _quantize_weight(float_tensor, observer)
+        assert quantized_tensor.int_repr().max().item() == q8_max
+        assert quantized_tensor.int_repr().min().item() == q8_min

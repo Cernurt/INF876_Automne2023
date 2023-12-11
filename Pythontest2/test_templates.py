@@ -1,126 +1,222 @@
-from datetime import date
+from copy import copy, deepcopy
 
-from django.contrib.auth import authenticate
-from django.contrib.auth.models import User
-from django.contrib.auth.tokens import PasswordResetTokenGenerator
-from django.contrib.auth.views import (
-    PasswordChangeDoneView,
-    PasswordChangeView,
-    PasswordResetCompleteView,
-    PasswordResetDoneView,
-    PasswordResetView,
+from django.core.checks import Warning
+from django.core.checks.templates import (
+    E001,
+    E002,
+    W003,
+    check_for_template_tags_with_the_same_name,
+    check_setting_app_dirs_loaders,
+    check_string_if_invalid_is_string,
 )
-from django.test import RequestFactory, TestCase, override_settings
-from django.urls import reverse
-from django.utils.http import urlsafe_base64_encode
-
-from .client import PasswordResetConfirmClient
-from .models import CustomUser
+from django.test import SimpleTestCase
+from django.test.utils import override_settings
 
 
-@override_settings(ROOT_URLCONF="auth_tests.urls")
-class AuthTemplateTests(TestCase):
-    request_factory = RequestFactory()
+class CheckTemplateSettingsAppDirsTest(SimpleTestCase):
+    TEMPLATES_APP_DIRS_AND_LOADERS = [
+        {
+            "BACKEND": "django.template.backends.django.DjangoTemplates",
+            "APP_DIRS": True,
+            "OPTIONS": {
+                "loaders": ["django.template.loaders.filesystem.Loader"],
+            },
+        },
+    ]
+
+    @override_settings(TEMPLATES=TEMPLATES_APP_DIRS_AND_LOADERS)
+    def test_app_dirs_and_loaders(self):
+        """
+        Error if template loaders are specified and APP_DIRS is True.
+        """
+        self.assertEqual(check_setting_app_dirs_loaders(None), [E001])
+
+    def test_app_dirs_removed(self):
+        TEMPLATES = deepcopy(self.TEMPLATES_APP_DIRS_AND_LOADERS)
+        del TEMPLATES[0]["APP_DIRS"]
+        with self.settings(TEMPLATES=TEMPLATES):
+            self.assertEqual(check_setting_app_dirs_loaders(None), [])
+
+    def test_loaders_removed(self):
+        TEMPLATES = deepcopy(self.TEMPLATES_APP_DIRS_AND_LOADERS)
+        del TEMPLATES[0]["OPTIONS"]["loaders"]
+        with self.settings(TEMPLATES=TEMPLATES):
+            self.assertEqual(check_setting_app_dirs_loaders(None), [])
+
+
+class CheckTemplateStringIfInvalidTest(SimpleTestCase):
+    TEMPLATES_STRING_IF_INVALID = [
+        {
+            "BACKEND": "django.template.backends.django.DjangoTemplates",
+            "OPTIONS": {
+                "string_if_invalid": False,
+            },
+        },
+        {
+            "BACKEND": "django.template.backends.django.DjangoTemplates",
+            "OPTIONS": {
+                "string_if_invalid": 42,
+            },
+        },
+    ]
 
     @classmethod
-    def setUpTestData(cls):
-        user = User.objects.create_user("jsmith", "jsmith@example.com", "pass")
-        user = authenticate(username=user.username, password="pass")
-        request = cls.request_factory.get("/somepath/")
-        request.user = user
-        cls.user, cls.request = user, request
-
-    def test_password_reset_view(self):
-        response = PasswordResetView.as_view(success_url="dummy/")(self.request)
-        self.assertContains(
-            response, "<title>Password reset | Django site admin</title>"
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.error1 = copy(E002)
+        cls.error2 = copy(E002)
+        string_if_invalid1 = cls.TEMPLATES_STRING_IF_INVALID[0]["OPTIONS"][
+            "string_if_invalid"
+        ]
+        string_if_invalid2 = cls.TEMPLATES_STRING_IF_INVALID[1]["OPTIONS"][
+            "string_if_invalid"
+        ]
+        cls.error1.msg = cls.error1.msg.format(
+            string_if_invalid1, type(string_if_invalid1).__name__
         )
-        self.assertContains(response, "<h1>Password reset</h1>")
-
-    def test_password_reset_done_view(self):
-        response = PasswordResetDoneView.as_view()(self.request)
-        self.assertContains(
-            response, "<title>Password reset sent | Django site admin</title>"
-        )
-        self.assertContains(response, "<h1>Password reset sent</h1>")
-
-    def test_password_reset_confirm_view_invalid_token(self):
-        # PasswordResetConfirmView invalid token
-        client = PasswordResetConfirmClient()
-        url = reverse(
-            "password_reset_confirm", kwargs={"uidb64": "Bad", "token": "Bad-Token"}
-        )
-        response = client.get(url)
-        self.assertContains(
-            response, "<title>Password reset unsuccessful | Django site admin</title>"
-        )
-        self.assertContains(response, "<h1>Password reset unsuccessful</h1>")
-
-    def test_password_reset_confirm_view_valid_token(self):
-        # PasswordResetConfirmView valid token
-        client = PasswordResetConfirmClient()
-        default_token_generator = PasswordResetTokenGenerator()
-        token = default_token_generator.make_token(self.user)
-        uidb64 = urlsafe_base64_encode(str(self.user.pk).encode())
-        url = reverse(
-            "password_reset_confirm", kwargs={"uidb64": uidb64, "token": token}
-        )
-        response = client.get(url)
-        self.assertContains(
-            response, "<title>Enter new password | Django site admin</title>"
-        )
-        self.assertContains(response, "<h1>Enter new password</h1>")
-        # The username is added to the password reset confirmation form to help
-        # browser's password managers.
-        self.assertContains(
-            response,
-            '<input class="hidden" autocomplete="username" value="jsmith">',
+        cls.error2.msg = cls.error2.msg.format(
+            string_if_invalid2, type(string_if_invalid2).__name__
         )
 
-    @override_settings(AUTH_USER_MODEL="auth_tests.CustomUser")
-    def test_password_reset_confirm_view_custom_username_hint(self):
-        custom_user = CustomUser.custom_objects.create_user(
-            email="joe@example.com",
-            date_of_birth=date(1986, 11, 11),
-            first_name="Joe",
-        )
-        client = PasswordResetConfirmClient()
-        default_token_generator = PasswordResetTokenGenerator()
-        token = default_token_generator.make_token(custom_user)
-        uidb64 = urlsafe_base64_encode(str(custom_user.pk).encode())
-        url = reverse(
-            "password_reset_confirm", kwargs={"uidb64": uidb64, "token": token}
-        )
-        response = client.get(url)
-        self.assertContains(
-            response,
-            "<title>Enter new password | Django site admin</title>",
-        )
-        self.assertContains(response, "<h1>Enter new password</h1>")
-        # The username field is added to the password reset confirmation form
-        # to help browser's password managers.
-        self.assertContains(
-            response,
-            '<input class="hidden" autocomplete="username" value="joe@example.com">',
+    @override_settings(TEMPLATES=TEMPLATES_STRING_IF_INVALID)
+    def test_string_if_invalid_not_string(self):
+        self.assertEqual(
+            check_string_if_invalid_is_string(None), [self.error1, self.error2]
         )
 
-    def test_password_reset_complete_view(self):
-        response = PasswordResetCompleteView.as_view()(self.request)
-        self.assertContains(
-            response, "<title>Password reset complete | Django site admin</title>"
-        )
-        self.assertContains(response, "<h1>Password reset complete</h1>")
+    def test_string_if_invalid_first_is_string(self):
+        TEMPLATES = deepcopy(self.TEMPLATES_STRING_IF_INVALID)
+        TEMPLATES[0]["OPTIONS"]["string_if_invalid"] = "test"
+        with self.settings(TEMPLATES=TEMPLATES):
+            self.assertEqual(check_string_if_invalid_is_string(None), [self.error2])
 
-    def test_password_reset_change_view(self):
-        response = PasswordChangeView.as_view(success_url="dummy/")(self.request)
-        self.assertContains(
-            response, "<title>Password change | Django site admin</title>"
-        )
-        self.assertContains(response, "<h1>Password change</h1>")
+    def test_string_if_invalid_both_are_strings(self):
+        TEMPLATES = deepcopy(self.TEMPLATES_STRING_IF_INVALID)
+        TEMPLATES[0]["OPTIONS"]["string_if_invalid"] = "test"
+        TEMPLATES[1]["OPTIONS"]["string_if_invalid"] = "test"
+        with self.settings(TEMPLATES=TEMPLATES):
+            self.assertEqual(check_string_if_invalid_is_string(None), [])
 
-    def test_password_change_done_view(self):
-        response = PasswordChangeDoneView.as_view()(self.request)
-        self.assertContains(
-            response, "<title>Password change successful | Django site admin</title>"
+    def test_string_if_invalid_not_specified(self):
+        TEMPLATES = deepcopy(self.TEMPLATES_STRING_IF_INVALID)
+        del TEMPLATES[1]["OPTIONS"]["string_if_invalid"]
+        with self.settings(TEMPLATES=TEMPLATES):
+            self.assertEqual(check_string_if_invalid_is_string(None), [self.error1])
+
+
+class CheckTemplateTagLibrariesWithSameName(SimpleTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.warning_same_tags = Warning(
+            W003.msg.format(
+                "'same_tags'",
+                "'check_framework.template_test_apps.same_tags_app_1."
+                "templatetags.same_tags', "
+                "'check_framework.template_test_apps.same_tags_app_2."
+                "templatetags.same_tags'",
+            ),
+            id=W003.id,
         )
-        self.assertContains(response, "<h1>Password change successful</h1>")
+
+    @staticmethod
+    def get_settings(module_name, module_path):
+        return {
+            "BACKEND": "django.template.backends.django.DjangoTemplates",
+            "OPTIONS": {
+                "libraries": {
+                    module_name: f"check_framework.template_test_apps.{module_path}",
+                },
+            },
+        }
+
+    @override_settings(
+        INSTALLED_APPS=[
+            "check_framework.template_test_apps.same_tags_app_1",
+            "check_framework.template_test_apps.same_tags_app_2",
+        ]
+    )
+    def test_template_tags_with_same_name(self):
+        self.assertEqual(
+            check_for_template_tags_with_the_same_name(None),
+            [self.warning_same_tags],
+        )
+
+    def test_template_tags_with_same_library_name(self):
+        with self.settings(
+            TEMPLATES=[
+                self.get_settings(
+                    "same_tags", "same_tags_app_1.templatetags.same_tags"
+                ),
+                self.get_settings(
+                    "same_tags", "same_tags_app_2.templatetags.same_tags"
+                ),
+            ]
+        ):
+            self.assertEqual(
+                check_for_template_tags_with_the_same_name(None),
+                [self.warning_same_tags],
+            )
+
+    @override_settings(
+        INSTALLED_APPS=["check_framework.template_test_apps.same_tags_app_1"]
+    )
+    def test_template_tags_same_library_in_installed_apps_libraries(self):
+        with self.settings(
+            TEMPLATES=[
+                self.get_settings(
+                    "same_tags", "same_tags_app_1.templatetags.same_tags"
+                ),
+            ]
+        ):
+            self.assertEqual(check_for_template_tags_with_the_same_name(None), [])
+
+    @override_settings(
+        INSTALLED_APPS=["check_framework.template_test_apps.same_tags_app_1"]
+    )
+    def test_template_tags_with_same_library_name_and_module_name(self):
+        with self.settings(
+            TEMPLATES=[
+                self.get_settings(
+                    "same_tags",
+                    "different_tags_app.templatetags.different_tags",
+                ),
+            ]
+        ):
+            self.assertEqual(
+                check_for_template_tags_with_the_same_name(None),
+                [
+                    Warning(
+                        W003.msg.format(
+                            "'same_tags'",
+                            "'check_framework.template_test_apps.different_tags_app."
+                            "templatetags.different_tags', "
+                            "'check_framework.template_test_apps.same_tags_app_1."
+                            "templatetags.same_tags'",
+                        ),
+                        id=W003.id,
+                    )
+                ],
+            )
+
+    def test_template_tags_with_different_library_name(self):
+        with self.settings(
+            TEMPLATES=[
+                self.get_settings(
+                    "same_tags", "same_tags_app_1.templatetags.same_tags"
+                ),
+                self.get_settings(
+                    "not_same_tags", "same_tags_app_2.templatetags.same_tags"
+                ),
+            ]
+        ):
+            self.assertEqual(check_for_template_tags_with_the_same_name(None), [])
+
+    @override_settings(
+        INSTALLED_APPS=[
+            "check_framework.template_test_apps.same_tags_app_1",
+            "check_framework.template_test_apps.different_tags_app",
+        ]
+    )
+    def test_template_tags_with_different_name(self):
+        self.assertEqual(check_for_template_tags_with_the_same_name(None), [])

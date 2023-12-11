@@ -1,167 +1,249 @@
-# coding=utf-8
-# Copyright 2020 The Hugging Face Team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Owner(s): ["module: dynamo"]
+import dataclasses
+import unittest.mock
 
-import unittest
-from dataclasses import dataclass
-from typing import Optional
+import torch
 
-from transformers.testing_utils import require_torch
-from transformers.utils import ModelOutput
+import torch._dynamo.test_case
+import torch._dynamo.testing
+from torch._dynamo.testing import same
 
-
-@dataclass
-class ModelOutputTest(ModelOutput):
-    a: float
-    b: Optional[float] = None
-    c: Optional[float] = None
+try:
+    from transformers import modeling_outputs
+    from transformers.configuration_utils import PretrainedConfig
+    from transformers.file_utils import ModelOutput
+    from transformers.modeling_outputs import (
+        BaseModelOutput,
+        BaseModelOutputWithPastAndCrossAttentions,
+        BaseModelOutputWithPoolingAndCrossAttentions,
+    )
+except ImportError:
+    modeling_outputs = None
 
 
-class ModelOutputTester(unittest.TestCase):
-    def test_get_attributes(self):
-        x = ModelOutputTest(a=30)
-        self.assertEqual(x.a, 30)
-        self.assertIsNone(x.b)
-        self.assertIsNone(x.c)
-        with self.assertRaises(AttributeError):
-            _ = x.d
+def maybe_skip(fn):
+    if modeling_outputs is None:
+        return unittest.skip("requires HuggingFace")(fn)
+    return fn
 
-    def test_index_with_ints_and_slices(self):
-        x = ModelOutputTest(a=30, b=10)
-        self.assertEqual(x[0], 30)
-        self.assertEqual(x[1], 10)
-        self.assertEqual(x[:2], (30, 10))
-        self.assertEqual(x[:], (30, 10))
 
-        x = ModelOutputTest(a=30, c=10)
-        self.assertEqual(x[0], 30)
-        self.assertEqual(x[1], 10)
-        self.assertEqual(x[:2], (30, 10))
-        self.assertEqual(x[:], (30, 10))
+class TestHFPretrained(torch._dynamo.test_case.TestCase):
+    @maybe_skip
+    def test_pretrained(self):
+        def fn(a, tmp):
+            if hasattr(tmp, "somekey"):
+                a = a + 1
+            if tmp.return_dict:
+                return a + torch.ones(2) * tmp.max_length
+            return a
 
-    def test_index_with_strings(self):
-        x = ModelOutputTest(a=30, b=10)
-        self.assertEqual(x["a"], 30)
-        self.assertEqual(x["b"], 10)
-        with self.assertRaises(KeyError):
-            _ = x["c"]
+        x = torch.randn(2)
+        tmp = PretrainedConfig(return_dict=True, max_length=20)
+        ref = fn(x, tmp)
+        opt_fn = torch._dynamo.optimize("eager", nopython=True)(fn)
+        res = opt_fn(x, tmp)
+        self.assertTrue(same(ref, res))
 
-        x = ModelOutputTest(a=30, c=10)
-        self.assertEqual(x["a"], 30)
-        self.assertEqual(x["c"], 10)
-        with self.assertRaises(KeyError):
-            _ = x["b"]
 
-    def test_dict_like_properties(self):
-        x = ModelOutputTest(a=30)
-        self.assertEqual(list(x.keys()), ["a"])
-        self.assertEqual(list(x.values()), [30])
-        self.assertEqual(list(x.items()), [("a", 30)])
-        self.assertEqual(list(x), ["a"])
+class TestModelOutput(torch._dynamo.test_case.TestCase):
+    @maybe_skip
+    def test_mo_create(self):
+        def fn(a, b):
+            tmp = BaseModelOutput(a + 1, attentions=b + 3)
+            return tmp
 
-        x = ModelOutputTest(a=30, b=10)
-        self.assertEqual(list(x.keys()), ["a", "b"])
-        self.assertEqual(list(x.values()), [30, 10])
-        self.assertEqual(list(x.items()), [("a", 30), ("b", 10)])
-        self.assertEqual(list(x), ["a", "b"])
+        torch._dynamo.testing.standard_test(self, fn=fn, nargs=2, expected_ops=2)
 
-        x = ModelOutputTest(a=30, c=10)
-        self.assertEqual(list(x.keys()), ["a", "c"])
-        self.assertEqual(list(x.values()), [30, 10])
-        self.assertEqual(list(x.items()), [("a", 30), ("c", 10)])
-        self.assertEqual(list(x), ["a", "c"])
+    @maybe_skip
+    def test_mo_assign(self):
+        def fn(a, b):
+            tmp = BaseModelOutput(last_hidden_state=b + 3)
+            tmp.hidden_states = a + 7
+            tmp["attentions"] = a + b + 6
+            return tmp
 
-        with self.assertRaises(Exception):
-            x = x.update({"d": 20})
-        with self.assertRaises(Exception):
-            del x["a"]
-        with self.assertRaises(Exception):
-            _ = x.pop("a")
-        with self.assertRaises(Exception):
-            _ = x.setdefault("d", 32)
+        args = [torch.randn(10), torch.randn(10)]
+        obj1 = fn(*args)
 
-    def test_set_attributes(self):
-        x = ModelOutputTest(a=30)
-        x.a = 10
-        self.assertEqual(x.a, 10)
-        self.assertEqual(x["a"], 10)
+        cnts = torch._dynamo.testing.CompileCounter()
+        opt_fn = torch._dynamo.optimize_assert(cnts)(fn)
+        obj2 = opt_fn(*args)
+        self.assertTrue(same(obj1.last_hidden_state, obj2.last_hidden_state))
+        self.assertTrue(same(obj1.hidden_states, obj2.hidden_states))
+        self.assertTrue(same(obj1.attentions, obj2.attentions))
+        self.assertEqual(cnts.frame_count, 1)
+        self.assertEqual(cnts.op_count, 4)
 
-    def test_set_keys(self):
-        x = ModelOutputTest(a=30)
-        x["a"] = 10
-        self.assertEqual(x.a, 10)
-        self.assertEqual(x["a"], 10)
+    def _common(self, fn, op_count):
+        args = [
+            BaseModelOutput(
+                last_hidden_state=torch.randn(10), attentions=torch.randn(10)
+            )
+        ]
+        obj1 = fn(*args)
+        cnts = torch._dynamo.testing.CompileCounter()
+        opt_fn = torch._dynamo.optimize_assert(cnts)(fn)
+        obj2 = opt_fn(*args)
+        self.assertTrue(same(obj1, obj2))
+        self.assertEqual(cnts.frame_count, 1)
+        self.assertEqual(cnts.op_count, op_count)
 
-    def test_instantiate_from_dict(self):
-        x = ModelOutputTest({"a": 30, "b": 10})
-        self.assertEqual(list(x.keys()), ["a", "b"])
-        self.assertEqual(x.a, 30)
-        self.assertEqual(x.b, 10)
+    @maybe_skip
+    def test_mo_getattr(self):
+        def fn(obj: BaseModelOutput):
+            x = obj.last_hidden_state * 10
+            if obj.hidden_states is not None:
+                x += obj.hidden_states
+            if obj.attentions is not None:
+                x += obj.attentions
+            return x
 
-    def test_instantiate_from_iterator(self):
-        x = ModelOutputTest([("a", 30), ("b", 10)])
-        self.assertEqual(list(x.keys()), ["a", "b"])
-        self.assertEqual(x.a, 30)
-        self.assertEqual(x.b, 10)
+        self._common(fn, 2)
 
-        with self.assertRaises(ValueError):
-            _ = ModelOutputTest([("a", 30), (10, 10)])
+    @maybe_skip
+    def test_mo_getitem(self):
+        def fn(obj: BaseModelOutput):
+            x = obj["last_hidden_state"] * 10
+            if "hidden_stats" in obj:
+                x += obj["hidden_states"]
+            if "attentions" in obj:
+                x += obj["attentions"]
+            return x
 
-        x = ModelOutputTest(a=(30, 30))
-        self.assertEqual(list(x.keys()), ["a"])
-        self.assertEqual(x.a, (30, 30))
+        self._common(fn, 2)
 
-    @require_torch
-    def test_torch_pytree(self):
-        # ensure torch.utils._pytree treats ModelOutput subclasses as nodes (and not leaves)
-        # this is important for DistributedDataParallel gradient synchronization with static_graph=True
-        import torch.utils._pytree as pytree
+    @maybe_skip
+    def test_mo_tuple(self):
+        def fn(obj: BaseModelOutput):
+            a, b = obj.to_tuple()
+            return a + b * 10
 
-        x = ModelOutput({"a": 1.0, "c": 2.0})
-        self.assertFalse(pytree._is_leaf(x))
+        self._common(fn, 2)
 
-        x = ModelOutputTest(a=1.0, c=2.0)
-        self.assertFalse(pytree._is_leaf(x))
+    @maybe_skip
+    def test_mo_index(self):
+        def fn(obj: BaseModelOutput):
+            return obj[0] * 10 + obj[1]
 
-        expected_flat_outs = [1.0, 2.0]
-        expected_tree_spec = pytree.TreeSpec(
-            ModelOutputTest, (ModelOutputTest, ["a", "c"]), [pytree.LeafSpec(), pytree.LeafSpec()]
+        self._common(fn, 2)
+
+    @maybe_skip
+    def test_mo_init(self):
+        @dataclasses.dataclass
+        class MyDataClass(ModelOutput):
+            a: torch.Tensor
+            b: torch.Tensor = None
+            c: torch.Tensor = None
+            d: torch.Tensor = None
+            e: torch.Tensor = None
+
+        def fn(obj):
+            class_fields = dataclasses.fields(obj)
+            assert len(class_fields)
+            assert all(field.default is None for field in class_fields[1:])
+            other_fields_are_none = all(
+                getattr(obj, field.name) is None for field in class_fields[1:]
+            )
+            assert not other_fields_are_none
+
+            total = getattr(obj, class_fields[0].name)
+            for field in class_fields[1:]:
+                v = getattr(obj, field.name)
+                if v is not None:
+                    total += v
+
+            return total
+
+        tensors = [torch.randn(10), torch.randn(10), torch.randn(10)]
+        obj1 = MyDataClass(*tensors)
+        correct1 = fn(obj1)
+
+        obj2 = MyDataClass(*tensors)
+        cnts = torch._dynamo.testing.CompileCounter()
+        opt_fn = torch._dynamo.optimize(cnts)(fn)
+        self.assertTrue(same(opt_fn(obj2), correct1))
+        self.assertEqual(cnts.frame_count, 1)
+        self.assertEqual(cnts.op_count, 2)
+
+    @maybe_skip
+    def test_HF_bert_model_output(self):
+        class BertPooler(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.dense = torch.nn.Linear(768, 768).to("cuda")
+                self.activation = torch.nn.Tanh()
+
+            def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+                # We "pool" the model by simply taking the hidden state corresponding
+                # to the first token.
+                first_token_tensor = hidden_states[:, 0]
+                pooled_output = self.dense(first_token_tensor)
+                pooled_output = self.activation(pooled_output)
+                return pooled_output
+
+        class BertEncoder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
+            def forward(
+                self,
+                hidden_states: torch.Tensor,
+            ) -> BaseModelOutputWithPastAndCrossAttentions:
+                return BaseModelOutputWithPastAndCrossAttentions(
+                    last_hidden_state=hidden_states,
+                    past_key_values=None,
+                    hidden_states=None,
+                    attentions=None,
+                    cross_attentions=None,
+                )
+
+        class BertModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.encoder = BertEncoder()
+                self.pooler = BertPooler()
+
+            def forward(
+                self,
+                sequence_output: torch.Tensor,
+            ) -> BaseModelOutputWithPoolingAndCrossAttentions:
+                encoder_outputs = self.encoder(sequence_output)
+                # test __getitem__ and to_tuple
+                sequence_output = encoder_outputs[0]
+                pooled_output = (
+                    self.pooler(sequence_output) if self.pooler is not None else None
+                )
+                # test CustomDictVariable.create
+                result = BaseModelOutputWithPoolingAndCrossAttentions(
+                    last_hidden_state=sequence_output,
+                    pooler_output=pooled_output,
+                    past_key_values=encoder_outputs.past_key_values,
+                    hidden_states=encoder_outputs.hidden_states,
+                    attentions=encoder_outputs.attentions,
+                    cross_attentions=encoder_outputs.cross_attentions,
+                )
+                # test __setattr__
+                result.pooler_output = pooled_output
+                # test __setitem__
+                result["pooler_output"] = pooled_output
+                return result
+
+        sequence_output = torch.rand(1, 12, 768).to("cuda")
+        model = BertModel()
+        orig_result = model(sequence_output)
+        compiled_model = torch.compile(model, backend="eager")
+        compiled_result = compiled_model(sequence_output)
+        self.assertTrue(
+            torch.allclose(
+                orig_result.last_hidden_state, compiled_result.last_hidden_state
+            )
+        )
+        self.assertTrue(
+            torch.allclose(orig_result.pooler_output, compiled_result.pooler_output)
         )
 
-        actual_flat_outs, actual_tree_spec = pytree.tree_flatten(x)
-        self.assertEqual(expected_flat_outs, actual_flat_outs)
-        self.assertEqual(expected_tree_spec, actual_tree_spec)
 
-        unflattened_x = pytree.tree_unflatten(actual_flat_outs, actual_tree_spec)
-        self.assertEqual(x, unflattened_x)
+if __name__ == "__main__":
+    from torch._dynamo.test_case import run_tests
 
-
-class ModelOutputTestNoDataclass(ModelOutput):
-    """Invalid test subclass of ModelOutput where @dataclass decorator is not used"""
-
-    a: float
-    b: Optional[float] = None
-    c: Optional[float] = None
-
-
-class ModelOutputSubclassTester(unittest.TestCase):
-    def test_direct_model_output(self):
-        # Check that direct usage of ModelOutput instantiates without errors
-        ModelOutput({"a": 1.1})
-
-    def test_subclass_no_dataclass(self):
-        # Check that a subclass of ModelOutput without @dataclass is invalid
-        # A valid subclass is inherently tested other unit tests above.
-        with self.assertRaises(TypeError):
-            ModelOutputTestNoDataclass(a=1.1, b=2.2, c=3.3)
+    run_tests()

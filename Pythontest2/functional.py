@@ -1,451 +1,440 @@
-import copy
-import itertools
-import operator
-from functools import wraps
+import torch
+import torch.distributed as dist
+from torch.autograd import Function
+# The two imports below are not always available depending on the
+# USE_DISTRIBUTED compile flag. Make sure they raise import error
+# if we're trying to use them.
+from torch.distributed import group, ReduceOp
 
-
-class cached_property:
+def broadcast(tensor, src, group=group.WORLD):
     """
-    Decorator that converts a method with a single self argument into a
-    property cached on the instance.
+    Broadcasts the tensor to the whole group.
 
-    A cached property can be made out of an existing method:
-    (e.g. ``url = cached_property(get_absolute_url)``).
+    ``tensor`` must have the same number of elements in all processes
+    participating in the collective.
+
+    Arguments:
+        tensor (Tensor): Data to be sent if ``src`` is the rank of current
+            process.
+        src (int): Source rank.
+        group (ProcessGroup, optional): The process group to work on.
+
+    Returns:
+        Tensor: Received tensor from the broadcast op.
+
     """
+    return _Broadcast.apply(src, group, tensor)
 
-    name = None
+
+def gather(tensor, dst=0, group=group.WORLD):
+    """
+    Gathers a list of tensors in a single process.
+
+    Arguments:
+        tensor (Tensor): Input tensor.
+        dst (int, optional): Destination rank (default is 0).
+        group (ProcessGroup, optional): The process group to work on.
+
+    Returns:
+        tuple[Tensor]: List of appropriately-sized tensors with the gathered data.
+    """
+    return _Gather.apply(dst, group, tensor)
+
+
+def scatter(tensors, src=0, group=group.WORLD):
+    """
+    Scatters a list of tensors to all processes in a group.
+
+    Each process will receive exactly one tensor and store its data in the
+    ``tensor`` argument.
+
+    Arguments:
+        tensors (list[Tensor]): List of tensors to scatter on the source rank.
+            Receivers must pass ``None`.
+        src (int, optional): Source rank (default is 0).
+        group (ProcessGroup, optional): The process group to work on.
+
+    Returns:
+        Tensor: Output tensor from the scatter operation.
+
+    """
+    return _Scatter.apply(src, group, *tensors)
+
+
+def reduce(tensor, dst, op=ReduceOp.SUM, group=group.WORLD):
+    """
+    Reduces the tensor data across all machines.
+
+    Only the process with rank ``dst`` is going to receive the final result.
+
+    Arguments:
+        tensor (Tensor): Input of the collective.
+        dst (int): Destination rank.
+        op (optional): One of the values from
+            ``torch.distributed.ReduceOp``
+            enum.  Specifies an operation used for element-wise reductions.
+        group (ProcessGroup, optional): The process group to work on.
+
+    Returns:
+        Tensor: Output of the collective.
+
+    """
+    return _Reduce.apply(dst, op, group, tensor)
+
+
+def reduce_scatter(output, input_list, op=ReduceOp.SUM, group=group.WORLD):
+    """
+    Reduces, then scatters a list of tensors to all processes in a group.
+
+    Arguments:
+        output (Tensor): Output tensor.
+        input_list (list[Tensor]): List of tensors to reduce and scatter.
+        op (optional): One of the values from
+            ``torch.distributed.ReduceOp``
+            enum.  Specifies an operation used for element-wise reductions.
+        group (ProcessGroup, optional): The process group to work on.
+
+    Returns:
+        Tensor: Output of the collective.
+
+    """
+    return _Reduce_Scatter.apply(op, group, output, *input_list)
+
+
+def all_gather(tensor, group=group.WORLD):
+    """
+    Gathers tensors from the whole group in a list.
+
+    Arguments:
+        tensor (Tensor): Tensor to be broadcast from current process.
+        group (ProcessGroup, optional): The process group to work on.
+
+    Returns:
+        tuple([Tensor]): Output of the collective.
+
+    """
+    return _AllGather.apply(group, tensor)
+
+def _all_gather_base(output_tensor, input_tensor, group=group.WORLD):
+    """
+    Single tensor all gather. Gathers a single tensor from all ranks, and puts them in a single output tensor.
+
+    Args:
+        output_tensor (Tensor): Output tensor. It should contain
+            correctly-sized tensors to be used for output of the collective.
+        input_tensor (Tensor): Tensor to be broadcast from current process.
+        group (ProcessGroup, optional): The process group to work on. If None,
+            the default process group will be used.
+
+    Examples:
+        >>> # All tensors below are of torch.int64 dtype.
+        >>> # We have 2 process groups, 2 ranks.
+        >>> # xdoctest: +SKIP("incorrect want text")
+        >>> output_tensor = torch.zeros(2, dtype=torch.int64)
+        >>> output_tensor
+        [tensor([0, 0])] # Rank 0 and 1
+        >>> tensor = torch.arange(1, dtype=torch.int64) + 1 + rank
+        >>> tensor
+        tensor([1]) # Rank 0
+        tensor([2]) # Rank 1
+        >>> dist.all_gather_base(output_tensor, tensor)
+        >>> output_tensor
+        tensor([1,2]) # Rank 0
+        tensor([1,2]) # Rank 1
+
+    .. warning::
+        `_all_gather_base` is experimental and subject to change.
+        It is the caller's responsibility to ensure the output_tensor
+        is correctly sized.
+
+    """
+    return _AllGatherBase.apply(output_tensor, input_tensor, group)
+
+
+def all_to_all(output_tensor_list, input_tensor_list, group=group.WORLD):
+    """
+    Each process scatters list of input tensors to all processes in a group and return gathered list of tensors in output list.
+
+    Arguments:
+        output_tensor_list (list[Tensor]): list of tensors to gather one per rank.
+        input_tensor_list (list[Tensor]): List of tensors to scatter one per rank.
+        group (ProcessGroup, optional): The process group to work on.
+
+    Returns:
+        tuple([Tensor]): Output of the collective.
+
+    """
+    return _AlltoAll.apply(group, output_tensor_list, *input_tensor_list)
+
+
+def all_to_all_single(
+    output,
+    input,
+    output_split_sizes=None,
+    input_split_sizes=None,
+    group=group.WORLD,
+):
+    """
+    Each process splits input tensor and then scatters the split list to all processes in a group.
+
+    Then concatenate the received tensors from all the processes in the group and return single output tensor.
+
+    Arguments:
+        output (Tensor): Gathered concatenated output tensor.
+        input (Tensor): Input tensor to scatter.
+        output_split_sizes: (list[Int], optional): Output split sizes for dim 0
+            if specified None or empty, dim 0 of ``output`` tensor must divide
+            equally by ``world_size``.
+        input_split_sizes: (list[Int], optional): Input split sizes for dim 0
+            if specified None or empty, dim 0 of ``input`` tensor must divide
+            equally by ``world_size``.
+
+    Returns:
+        Tensor: Output of the collective.
+
+    """
+    return _AlltoAllSingle.apply(
+        group, output, output_split_sizes, input_split_sizes, input
+    )
+
+
+def all_reduce(tensor, op=ReduceOp.SUM, group=group.WORLD):
+    """
+    Reduces the tensor data across all machines in such a way that all get the final result.
+
+    After the call the returned tensor is going to be bitwise
+    identical in all processes.
+
+    Arguments:
+        tensor (Tensor): Input of the collective.
+        op (optional): One of the values from
+            ``torch.distributed.ReduceOp``
+            enum.  Specifies an operation used for element-wise reductions.
+        group (ProcessGroup, optional): The process group to work on.
+
+    Returns:
+        Tensor: Output of the collective
+
+    """
+    return _AllReduce.apply(op, group, tensor)
+
+
+class _Broadcast(Function):
+    @staticmethod
+    def forward(ctx, src, group, tensor):
+        ctx.src = src
+        ctx.group = group
+        ctx.rank = dist.get_rank()
+        # torch.distributed makes all the calls in place
+        # we allocate new tensors to avoid this
+        tensor = tensor.clone()
+        dist.broadcast(tensor, src, group=group)
+        return tensor
 
     @staticmethod
-    def func(instance):
-        raise TypeError(
-            "Cannot use cached_property instance without calling "
-            "__set_name__() on it."
+    def backward(ctx, grad_output):
+        gx = _Reduce.apply(ctx.src, ReduceOp.SUM, ctx.group, grad_output)
+        if ctx.src != ctx.rank:
+            gx.zero_()
+        return (None, None, gx)
+
+
+class _Gather(Function):
+    @staticmethod
+    def forward(ctx, dst, group, tensor):
+        ctx.dst = dst
+        ctx.group = group
+        # Need to create a list of tensors here to do the
+        # aggregation, get it from the group size
+        # tensor should be correctly sized for the method
+        # gathering
+        tensor_list = [
+            torch.zeros_like(tensor) for i in range(dist.get_world_size(group=group))
+        ]
+
+        tensor = tensor.contiguous()
+        if dist.get_rank(group=group) == dst:
+            dist.gather(tensor, tensor_list, dst, group=group)
+        else:
+            dist.gather(tensor, None, dst, group=group)
+        return tuple(tensor_list)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        return (None, None) + (_Scatter.apply(ctx.dst, ctx.group, *grad_outputs),)
+
+
+class _Scatter(Function):
+    @staticmethod
+    def forward(ctx, src, group, *tensors):
+        ctx.src = src
+        ctx.group = group
+        assert all(t.size() == tensors[0].size() for t in tensors)
+        output = torch.zeros_like(tensors[0])
+        if dist.get_rank(group=group) == src:
+            dist.scatter(output, list(tensors), src, group=group)
+        else:
+            dist.scatter(output, None, src, group=group)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return (None, None) + _Gather.apply(ctx.src, ctx.group, grad_output)
+
+
+class _Reduce(Function):
+    @staticmethod
+    def forward(ctx, src, op, group, tensor):
+        ctx.src = src
+        ctx.group = group
+        tensor = tensor.clone()
+        dist.reduce(tensor, src, op=op, group=group)
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return (None, None, None) + (_Broadcast.apply(ctx.src, ctx.group, grad_output),)
+
+
+class _Reduce_Scatter(Function):
+    @staticmethod
+    def forward(ctx, op, group, tensor, *input_tensor_list):
+        ctx.group = group
+        # Need contiguous tensors for collectives.
+        tensor = tensor.contiguous()
+        input_tensor_list = tuple(t.contiguous() for t in input_tensor_list)
+        dist.reduce_scatter(tensor, list(input_tensor_list), op=op, group=group)
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return (None, None, None) + _AllGather.apply(ctx.group, grad_output)
+
+
+class _AllGather(Function):
+    @staticmethod
+    def forward(ctx, group, tensor):
+        # Need contiguous tensors for collectives.
+        tensor = tensor.contiguous()
+
+        ctx.group = group
+        out_tensor_list = [
+            torch.empty_like(tensor) for _ in range(dist.get_world_size(group=group))
+        ]
+
+        dist.all_gather(out_tensor_list, tensor, group=group)
+        return tuple(out_tensor_list)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        if dist.get_backend(group=ctx.group) is dist.Backend.NCCL:
+            rank = dist.get_rank()
+            gx = torch.empty_like(grad_outputs[rank])
+            _Reduce_Scatter.apply(ReduceOp.SUM, ctx.group, gx, *grad_outputs)
+        else:
+            # As many backends doesn't support ReduceScatter, we use AlltoAll with .sum()
+            # to emulate the ReduceScatter behavior
+            tensor_list = [torch.empty_like(tensor) for tensor in grad_outputs]
+            gxs = _AlltoAll.apply(ctx.group, tensor_list, *grad_outputs)
+            gx = torch.sum(torch.stack(gxs), dim=0)
+        return (None, gx)
+
+class _AllGatherBase(Function):
+    @staticmethod
+    def forward(ctx, output_tensor, input_tensor, group):
+        ctx.group = group
+        dist._all_gather_base(output_tensor, input_tensor.contiguous(), group=group)
+        return output_tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if dist.get_backend(group=ctx.group) is dist.Backend.NCCL:
+            world_size = dist.get_world_size(group=ctx.group)
+            out_size = list(grad_output.size())
+            if out_size[0] % world_size != 0:
+                raise RuntimeError(
+                    f'Tensor with dimensions: {out_size} does '
+                    f'not have first dimension divisible by world_size: {world_size}'
+                )
+            out_size[0] = out_size[0] // dist.get_world_size(group=ctx.group)
+            gx = torch.empty(out_size, device=grad_output.device, dtype=grad_output.dtype)
+            dist._reduce_scatter_base(gx, grad_output, ReduceOp.SUM, ctx.group)
+        else:
+            raise RuntimeError("Backend not supported!")
+        return (None, gx, None)
+
+class _AlltoAll(Function):
+    @staticmethod
+    def forward(ctx, group, out_tensor_list, *tensors):
+        ctx.group = group
+        ctx.input_tensor_size_list = [
+            tensors[i].size() for i in range(dist.get_world_size(group=group))
+        ]
+        my_rank = dist.get_rank(group=group)
+        tensors = tuple(t.contiguous() for t in tensors)
+        # Implement it on means of scatter/gather, send/recv async operations have issues
+        if dist.get_backend(group=group) is dist.Backend.GLOO:
+            for i in range(dist.get_world_size(group=group)):
+                to_send = None
+                if i == my_rank:
+                    to_send = list(tensors)
+                dist.scatter(out_tensor_list[i], to_send, i, group=group)
+        else:
+            dist.all_to_all(
+                out_tensor_list,
+                list(tensors),
+                group=group,
+            )
+        return tuple(out_tensor_list)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        tensor_list = [
+            torch.empty(size, device=grad_outputs[0].device, dtype=grad_outputs[0].dtype)
+            for size in ctx.input_tensor_size_list
+        ]
+        return (None, None) + _AlltoAll.apply(ctx.group, tensor_list, *grad_outputs)
+
+
+class _AlltoAllSingle(Function):
+    @staticmethod
+    def forward(ctx, group, output, output_split_sizes, input_split_sizes, input):
+        ctx.group = group
+        ctx.input_size = input.size()
+        ctx.output_split_sizes = input_split_sizes
+        ctx.input_split_sizes = output_split_sizes
+        dist.all_to_all_single(
+            output,
+            input,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=group,
+        )
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        tensor = torch.empty(ctx.input_size, device=grad_output.device, dtype=grad_output.dtype)
+        return (None, None, None, None) + (
+            _AlltoAllSingle.apply(
+                ctx.group,
+                tensor,
+                ctx.output_split_sizes,
+                ctx.input_split_sizes,
+                grad_output.contiguous(),
+            ),
         )
 
-    def __init__(self, func):
-        self.real_func = func
-        self.__doc__ = getattr(func, "__doc__")
 
-    def __set_name__(self, owner, name):
-        if self.name is None:
-            self.name = name
-            self.func = self.real_func
-        elif name != self.name:
-            raise TypeError(
-                "Cannot assign the same cached_property to two different names "
-                "(%r and %r)." % (self.name, name)
-            )
-
-    def __get__(self, instance, cls=None):
-        """
-        Call the function and put the return value in instance.__dict__ so that
-        subsequent attribute access on the instance returns the cached value
-        instead of calling cached_property.__get__().
-        """
-        if instance is None:
-            return self
-        res = instance.__dict__[self.name] = self.func(instance)
-        return res
-
-
-class classproperty:
-    """
-    Decorator that converts a method with a single cls argument into a property
-    that can be accessed directly from the class.
-    """
-
-    def __init__(self, method=None):
-        self.fget = method
-
-    def __get__(self, instance, cls=None):
-        return self.fget(cls)
-
-    def getter(self, method):
-        self.fget = method
-        return self
-
-
-class Promise:
-    """
-    Base class for the proxy class created in the closure of the lazy function.
-    It's used to recognize promises in code.
-    """
-
-    pass
-
-
-def lazy(func, *resultclasses):
-    """
-    Turn any callable into a lazy evaluated callable. result classes or types
-    is required -- at least one is needed so that the automatic forcing of
-    the lazy evaluation code is triggered. Results are not memoized; the
-    function is evaluated on every access.
-    """
-
-    class __proxy__(Promise):
-        """
-        Encapsulate a function call and act as a proxy for methods that are
-        called on the result of that function. The function is not evaluated
-        until one of the methods on the result is called.
-        """
-
-        def __init__(self, args, kw):
-            self._args = args
-            self._kw = kw
-
-        def __reduce__(self):
-            return (
-                _lazy_proxy_unpickle,
-                (func, self._args, self._kw) + resultclasses,
-            )
-
-        def __deepcopy__(self, memo):
-            # Instances of this class are effectively immutable. It's just a
-            # collection of functions. So we don't need to do anything
-            # complicated for copying.
-            memo[id(self)] = self
-            return self
-
-        def __cast(self):
-            return func(*self._args, **self._kw)
-
-        # Explicitly wrap methods which are defined on object and hence would
-        # not have been overloaded by the loop over resultclasses below.
-
-        def __repr__(self):
-            return repr(self.__cast())
-
-        def __str__(self):
-            return str(self.__cast())
-
-        def __eq__(self, other):
-            if isinstance(other, Promise):
-                other = other.__cast()
-            return self.__cast() == other
-
-        def __ne__(self, other):
-            if isinstance(other, Promise):
-                other = other.__cast()
-            return self.__cast() != other
-
-        def __lt__(self, other):
-            if isinstance(other, Promise):
-                other = other.__cast()
-            return self.__cast() < other
-
-        def __le__(self, other):
-            if isinstance(other, Promise):
-                other = other.__cast()
-            return self.__cast() <= other
-
-        def __gt__(self, other):
-            if isinstance(other, Promise):
-                other = other.__cast()
-            return self.__cast() > other
-
-        def __ge__(self, other):
-            if isinstance(other, Promise):
-                other = other.__cast()
-            return self.__cast() >= other
-
-        def __hash__(self):
-            return hash(self.__cast())
-
-        def __format__(self, format_spec):
-            return format(self.__cast(), format_spec)
-
-        # Explicitly wrap methods which are required for certain operations on
-        # int/str objects to function correctly.
-
-        def __add__(self, other):
-            return self.__cast() + other
-
-        def __radd__(self, other):
-            return other + self.__cast()
-
-        def __mod__(self, other):
-            return self.__cast() % other
-
-        def __mul__(self, other):
-            return self.__cast() * other
-
-    # Add wrappers for all methods from resultclasses which haven't been
-    # wrapped explicitly above.
-    for resultclass in resultclasses:
-        for type_ in resultclass.mro():
-            for method_name in type_.__dict__:
-                # All __promise__ return the same wrapper method, they look up
-                # the correct implementation when called.
-                if hasattr(__proxy__, method_name):
-                    continue
-
-                # Builds a wrapper around some method. Pass method_name to
-                # avoid issues due to late binding.
-                def __wrapper__(self, *args, __method_name=method_name, **kw):
-                    # Automatically triggers the evaluation of a lazy value and
-                    # applies the given method of the result type.
-                    result = func(*self._args, **self._kw)
-                    return getattr(result, __method_name)(*args, **kw)
-
-                setattr(__proxy__, method_name, __wrapper__)
-
-    @wraps(func)
-    def __wrapper__(*args, **kw):
-        # Creates the proxy object, instead of the actual value.
-        return __proxy__(args, kw)
-
-    return __wrapper__
-
-
-def _lazy_proxy_unpickle(func, args, kwargs, *resultclasses):
-    return lazy(func, *resultclasses)(*args, **kwargs)
-
-
-def lazystr(text):
-    """
-    Shortcut for the common case of a lazy callable that returns str.
-    """
-    return lazy(str, str)(text)
-
-
-def keep_lazy(*resultclasses):
-    """
-    A decorator that allows a function to be called with one or more lazy
-    arguments. If none of the args are lazy, the function is evaluated
-    immediately, otherwise a __proxy__ is returned that will evaluate the
-    function when needed.
-    """
-    if not resultclasses:
-        raise TypeError("You must pass at least one argument to keep_lazy().")
-
-    def decorator(func):
-        lazy_func = lazy(func, *resultclasses)
-
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            if any(
-                isinstance(arg, Promise)
-                for arg in itertools.chain(args, kwargs.values())
-            ):
-                return lazy_func(*args, **kwargs)
-            return func(*args, **kwargs)
-
-        return wrapper
-
-    return decorator
-
-
-def keep_lazy_text(func):
-    """
-    A decorator for functions that accept lazy arguments and return text.
-    """
-    return keep_lazy(str)(func)
-
-
-empty = object()
-
-
-def new_method_proxy(func):
-    def inner(self, *args):
-        if (_wrapped := self._wrapped) is empty:
-            self._setup()
-            _wrapped = self._wrapped
-        return func(_wrapped, *args)
-
-    inner._mask_wrapped = False
-    return inner
-
-
-class LazyObject:
-    """
-    A wrapper for another class that can be used to delay instantiation of the
-    wrapped class.
-
-    By subclassing, you have the opportunity to intercept and alter the
-    instantiation. If you don't need to do that, use SimpleLazyObject.
-    """
-
-    # Avoid infinite recursion when tracing __init__ (#19456).
-    _wrapped = None
-
-    def __init__(self):
-        # Note: if a subclass overrides __init__(), it will likely need to
-        # override __copy__() and __deepcopy__() as well.
-        self._wrapped = empty
-
-    def __getattribute__(self, name):
-        if name == "_wrapped":
-            # Avoid recursion when getting wrapped object.
-            return super().__getattribute__(name)
-        value = super().__getattribute__(name)
-        # If attribute is a proxy method, raise an AttributeError to call
-        # __getattr__() and use the wrapped object method.
-        if not getattr(value, "_mask_wrapped", True):
-            raise AttributeError
-        return value
-
-    __getattr__ = new_method_proxy(getattr)
-
-    def __setattr__(self, name, value):
-        if name == "_wrapped":
-            # Assign to __dict__ to avoid infinite __setattr__ loops.
-            self.__dict__["_wrapped"] = value
-        else:
-            if self._wrapped is empty:
-                self._setup()
-            setattr(self._wrapped, name, value)
-
-    def __delattr__(self, name):
-        if name == "_wrapped":
-            raise TypeError("can't delete _wrapped.")
-        if self._wrapped is empty:
-            self._setup()
-        delattr(self._wrapped, name)
-
-    def _setup(self):
-        """
-        Must be implemented by subclasses to initialize the wrapped object.
-        """
-        raise NotImplementedError(
-            "subclasses of LazyObject must provide a _setup() method"
-        )
-
-    # Because we have messed with __class__ below, we confuse pickle as to what
-    # class we are pickling. We're going to have to initialize the wrapped
-    # object to successfully pickle it, so we might as well just pickle the
-    # wrapped object since they're supposed to act the same way.
-    #
-    # Unfortunately, if we try to simply act like the wrapped object, the ruse
-    # will break down when pickle gets our id(). Thus we end up with pickle
-    # thinking, in effect, that we are a distinct object from the wrapped
-    # object, but with the same __dict__. This can cause problems (see #25389).
-    #
-    # So instead, we define our own __reduce__ method and custom unpickler. We
-    # pickle the wrapped object as the unpickler's argument, so that pickle
-    # will pickle it normally, and then the unpickler simply returns its
-    # argument.
-    def __reduce__(self):
-        if self._wrapped is empty:
-            self._setup()
-        return (unpickle_lazyobject, (self._wrapped,))
-
-    def __copy__(self):
-        if self._wrapped is empty:
-            # If uninitialized, copy the wrapper. Use type(self), not
-            # self.__class__, because the latter is proxied.
-            return type(self)()
-        else:
-            # If initialized, return a copy of the wrapped object.
-            return copy.copy(self._wrapped)
-
-    def __deepcopy__(self, memo):
-        if self._wrapped is empty:
-            # We have to use type(self), not self.__class__, because the
-            # latter is proxied.
-            result = type(self)()
-            memo[id(self)] = result
-            return result
-        return copy.deepcopy(self._wrapped, memo)
-
-    __bytes__ = new_method_proxy(bytes)
-    __str__ = new_method_proxy(str)
-    __bool__ = new_method_proxy(bool)
-
-    # Introspection support
-    __dir__ = new_method_proxy(dir)
-
-    # Need to pretend to be the wrapped class, for the sake of objects that
-    # care about this (especially in equality tests)
-    __class__ = property(new_method_proxy(operator.attrgetter("__class__")))
-    __eq__ = new_method_proxy(operator.eq)
-    __lt__ = new_method_proxy(operator.lt)
-    __gt__ = new_method_proxy(operator.gt)
-    __ne__ = new_method_proxy(operator.ne)
-    __hash__ = new_method_proxy(hash)
-
-    # List/Tuple/Dictionary methods support
-    __getitem__ = new_method_proxy(operator.getitem)
-    __setitem__ = new_method_proxy(operator.setitem)
-    __delitem__ = new_method_proxy(operator.delitem)
-    __iter__ = new_method_proxy(iter)
-    __len__ = new_method_proxy(len)
-    __contains__ = new_method_proxy(operator.contains)
-
-
-def unpickle_lazyobject(wrapped):
-    """
-    Used to unpickle lazy objects. Just return its argument, which will be the
-    wrapped object.
-    """
-    return wrapped
-
-
-class SimpleLazyObject(LazyObject):
-    """
-    A lazy object initialized from any function.
-
-    Designed for compound objects of unknown type. For builtins or objects of
-    known type, use django.utils.functional.lazy.
-    """
-
-    def __init__(self, func):
-        """
-        Pass in a callable that returns the object to be wrapped.
-
-        If copies are made of the resulting SimpleLazyObject, which can happen
-        in various circumstances within Django, then you must ensure that the
-        callable can be safely run more than once and will return the same
-        value.
-        """
-        self.__dict__["_setupfunc"] = func
-        super().__init__()
-
-    def _setup(self):
-        self._wrapped = self._setupfunc()
-
-    # Return a meaningful representation of the lazy object for debugging
-    # without evaluating the wrapped object.
-    def __repr__(self):
-        if self._wrapped is empty:
-            repr_attr = self._setupfunc
-        else:
-            repr_attr = self._wrapped
-        return "<%s: %r>" % (type(self).__name__, repr_attr)
-
-    def __copy__(self):
-        if self._wrapped is empty:
-            # If uninitialized, copy the wrapper. Use SimpleLazyObject, not
-            # self.__class__, because the latter is proxied.
-            return SimpleLazyObject(self._setupfunc)
-        else:
-            # If initialized, return a copy of the wrapped object.
-            return copy.copy(self._wrapped)
-
-    def __deepcopy__(self, memo):
-        if self._wrapped is empty:
-            # We have to use SimpleLazyObject, not self.__class__, because the
-            # latter is proxied.
-            result = SimpleLazyObject(self._setupfunc)
-            memo[id(self)] = result
-            return result
-        return copy.deepcopy(self._wrapped, memo)
-
-    __add__ = new_method_proxy(operator.add)
-
-    @new_method_proxy
-    def __radd__(self, other):
-        return other + self
-
-
-def partition(predicate, values):
-    """
-    Split the values into two sets, based on the return value of the function
-    (True/False). e.g.:
-
-        >>> partition(lambda x: x > 3, range(5))
-        [0, 1, 2, 3], [4]
-    """
-    results = ([], [])
-    for item in values:
-        results[predicate(item)].append(item)
-    return results
+class _AllReduce(Function):
+    @staticmethod
+    def forward(ctx, op, group, tensor):
+        ctx.group = group
+        ctx.op = op
+        tensor = tensor.clone()
+        dist.all_reduce(tensor, op=op, group=group)
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return (None, None) + (_AllReduce.apply(ctx.op, ctx.group, grad_output),)
