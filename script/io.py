@@ -1,341 +1,369 @@
-import os
-from collections import defaultdict
-from datetime import datetime
-from pathlib import Path
+import threading
+from ctypes import POINTER, Structure, byref, c_byte, c_char_p, c_int, c_size_t
 
-from prompt_toolkit.completion import Completer, Completion
-from prompt_toolkit.history import FileHistory
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.lexers import PygmentsLexer
-from prompt_toolkit.shortcuts import CompleteStyle, PromptSession, prompt
-from prompt_toolkit.styles import Style
-from pygments.lexers import MarkdownLexer, guess_lexer_for_filename
-from pygments.token import Token
-from pygments.util import ClassNotFound
-from rich.console import Console
-from rich.text import Text
+from django.contrib.gis.geos.base import GEOSBase
+from django.contrib.gis.geos.libgeos import (
+    GEOM_PTR,
+    GEOSFuncFactory,
+    geos_version_tuple,
+)
+from django.contrib.gis.geos.prototypes.errcheck import (
+    check_geom,
+    check_sized_string,
+    check_string,
+)
+from django.contrib.gis.geos.prototypes.geom import c_uchar_p, geos_char_p
+from django.utils.encoding import force_bytes
+from django.utils.functional import SimpleLazyObject
 
-from .dump import dump  # noqa: F401
+
+# ### The WKB/WKT Reader/Writer structures and pointers ###
+class WKTReader_st(Structure):
+    pass
 
 
-class AutoCompleter(Completer):
-    def __init__(self, root, rel_fnames, addable_rel_fnames, commands, encoding):
-        self.commands = commands
-        self.addable_rel_fnames = addable_rel_fnames
-        self.rel_fnames = rel_fnames
-        self.encoding = encoding
+class WKTWriter_st(Structure):
+    pass
 
-        fname_to_rel_fnames = defaultdict(list)
-        for rel_fname in addable_rel_fnames:
-            fname = os.path.basename(rel_fname)
-            if fname != rel_fname:
-                fname_to_rel_fnames[fname].append(rel_fname)
-        self.fname_to_rel_fnames = fname_to_rel_fnames
 
-        self.words = set()
+class WKBReader_st(Structure):
+    pass
 
-        for rel_fname in addable_rel_fnames:
-            self.words.add(rel_fname)
 
-        for rel_fname in rel_fnames:
-            self.words.add(rel_fname)
+class WKBWriter_st(Structure):
+    pass
 
-            fname = Path(root) / rel_fname
-            try:
-                with open(fname, "r", encoding=self.encoding) as f:
-                    content = f.read()
-            except (FileNotFoundError, UnicodeDecodeError):
-                continue
-            try:
-                lexer = guess_lexer_for_filename(fname, content)
-            except ClassNotFound:
-                continue
-            tokens = list(lexer.get_tokens(content))
-            self.words.update(token[1] for token in tokens if token[0] in Token.Name)
 
-    def get_completions(self, document, complete_event):
-        text = document.text_before_cursor
-        words = text.split()
-        if not words:
-            return
+WKT_READ_PTR = POINTER(WKTReader_st)
+WKT_WRITE_PTR = POINTER(WKTWriter_st)
+WKB_READ_PTR = POINTER(WKBReader_st)
+WKB_WRITE_PTR = POINTER(WKBReader_st)
 
-        if text[0] == "/":
-            if len(words) == 1 and not text[-1].isspace():
-                candidates = self.commands.get_commands()
-                candidates = [(cmd, cmd) for cmd in candidates]
-            else:
-                for completion in self.commands.get_command_completions(words[0][1:], words[-1]):
-                    yield completion
-                return
+# WKTReader routines
+wkt_reader_create = GEOSFuncFactory("GEOSWKTReader_create", restype=WKT_READ_PTR)
+wkt_reader_destroy = GEOSFuncFactory("GEOSWKTReader_destroy", argtypes=[WKT_READ_PTR])
+
+wkt_reader_read = GEOSFuncFactory(
+    "GEOSWKTReader_read",
+    argtypes=[WKT_READ_PTR, c_char_p],
+    restype=GEOM_PTR,
+    errcheck=check_geom,
+)
+# WKTWriter routines
+wkt_writer_create = GEOSFuncFactory("GEOSWKTWriter_create", restype=WKT_WRITE_PTR)
+wkt_writer_destroy = GEOSFuncFactory("GEOSWKTWriter_destroy", argtypes=[WKT_WRITE_PTR])
+
+wkt_writer_write = GEOSFuncFactory(
+    "GEOSWKTWriter_write",
+    argtypes=[WKT_WRITE_PTR, GEOM_PTR],
+    restype=geos_char_p,
+    errcheck=check_string,
+)
+
+wkt_writer_get_outdim = GEOSFuncFactory(
+    "GEOSWKTWriter_getOutputDimension", argtypes=[WKT_WRITE_PTR], restype=c_int
+)
+wkt_writer_set_outdim = GEOSFuncFactory(
+    "GEOSWKTWriter_setOutputDimension", argtypes=[WKT_WRITE_PTR, c_int]
+)
+
+wkt_writer_set_trim = GEOSFuncFactory(
+    "GEOSWKTWriter_setTrim", argtypes=[WKT_WRITE_PTR, c_byte]
+)
+wkt_writer_set_precision = GEOSFuncFactory(
+    "GEOSWKTWriter_setRoundingPrecision", argtypes=[WKT_WRITE_PTR, c_int]
+)
+
+# WKBReader routines
+wkb_reader_create = GEOSFuncFactory("GEOSWKBReader_create", restype=WKB_READ_PTR)
+wkb_reader_destroy = GEOSFuncFactory("GEOSWKBReader_destroy", argtypes=[WKB_READ_PTR])
+
+
+class WKBReadFunc(GEOSFuncFactory):
+    # Although the function definitions take `const unsigned char *`
+    # as their parameter, we use c_char_p here so the function may
+    # take Python strings directly as parameters.  Inside Python there
+    # is not a difference between signed and unsigned characters, so
+    # it is not a problem.
+    argtypes = [WKB_READ_PTR, c_char_p, c_size_t]
+    restype = GEOM_PTR
+    errcheck = staticmethod(check_geom)
+
+
+wkb_reader_read = WKBReadFunc("GEOSWKBReader_read")
+wkb_reader_read_hex = WKBReadFunc("GEOSWKBReader_readHEX")
+
+# WKBWriter routines
+wkb_writer_create = GEOSFuncFactory("GEOSWKBWriter_create", restype=WKB_WRITE_PTR)
+wkb_writer_destroy = GEOSFuncFactory("GEOSWKBWriter_destroy", argtypes=[WKB_WRITE_PTR])
+
+
+# WKB Writing prototypes.
+class WKBWriteFunc(GEOSFuncFactory):
+    argtypes = [WKB_WRITE_PTR, GEOM_PTR, POINTER(c_size_t)]
+    restype = c_uchar_p
+    errcheck = staticmethod(check_sized_string)
+
+
+wkb_writer_write = WKBWriteFunc("GEOSWKBWriter_write")
+wkb_writer_write_hex = WKBWriteFunc("GEOSWKBWriter_writeHEX")
+
+
+# WKBWriter property getter/setter prototypes.
+class WKBWriterGet(GEOSFuncFactory):
+    argtypes = [WKB_WRITE_PTR]
+    restype = c_int
+
+
+class WKBWriterSet(GEOSFuncFactory):
+    argtypes = [WKB_WRITE_PTR, c_int]
+
+
+wkb_writer_get_byteorder = WKBWriterGet("GEOSWKBWriter_getByteOrder")
+wkb_writer_set_byteorder = WKBWriterSet("GEOSWKBWriter_setByteOrder")
+wkb_writer_get_outdim = WKBWriterGet("GEOSWKBWriter_getOutputDimension")
+wkb_writer_set_outdim = WKBWriterSet("GEOSWKBWriter_setOutputDimension")
+wkb_writer_get_include_srid = WKBWriterGet(
+    "GEOSWKBWriter_getIncludeSRID", restype=c_byte
+)
+wkb_writer_set_include_srid = WKBWriterSet(
+    "GEOSWKBWriter_setIncludeSRID", argtypes=[WKB_WRITE_PTR, c_byte]
+)
+
+
+# ### Base I/O Class ###
+class IOBase(GEOSBase):
+    "Base class for GEOS I/O objects."
+
+    def __init__(self):
+        # Getting the pointer with the constructor.
+        self.ptr = self._constructor()
+        # Loading the real destructor function at this point as doing it in
+        # __del__ is too late (import error).
+        self.destructor.func
+
+
+# ### Base WKB/WKT Reading and Writing objects ###
+
+
+# Non-public WKB/WKT reader classes for internal use because
+# their `read` methods return _pointers_ instead of GEOSGeometry
+# objects.
+class _WKTReader(IOBase):
+    _constructor = wkt_reader_create
+    ptr_type = WKT_READ_PTR
+    destructor = wkt_reader_destroy
+
+    def read(self, wkt):
+        if not isinstance(wkt, (bytes, str)):
+            raise TypeError
+        return wkt_reader_read(self.ptr, force_bytes(wkt))
+
+
+class _WKBReader(IOBase):
+    _constructor = wkb_reader_create
+    ptr_type = WKB_READ_PTR
+    destructor = wkb_reader_destroy
+
+    def read(self, wkb):
+        "Return a _pointer_ to C GEOS Geometry object from the given WKB."
+        if isinstance(wkb, memoryview):
+            wkb_s = bytes(wkb)
+            return wkb_reader_read(self.ptr, wkb_s, len(wkb_s))
+        elif isinstance(wkb, bytes):
+            return wkb_reader_read_hex(self.ptr, wkb, len(wkb))
+        elif isinstance(wkb, str):
+            wkb_s = wkb.encode()
+            return wkb_reader_read_hex(self.ptr, wkb_s, len(wkb_s))
         else:
-            candidates = self.words
-            candidates.update(set(self.fname_to_rel_fnames))
-            candidates = [(word, f"`{word}`") for word in candidates]
-
-        last_word = words[-1]
-        for word_match, word_insert in candidates:
-            if word_match.lower().startswith(last_word.lower()):
-                rel_fnames = self.fname_to_rel_fnames.get(word_match, [])
-                if rel_fnames:
-                    for rel_fname in rel_fnames:
-                        yield Completion(
-                            f"`{rel_fname}`", start_position=-len(last_word), display=rel_fname
-                        )
-                else:
-                    yield Completion(
-                        word_insert, start_position=-len(last_word), display=word_match
-                    )
+            raise TypeError
 
 
-class InputOutput:
-    num_error_outputs = 0
-    num_user_asks = 0
+def default_trim_value():
+    """
+    GEOS changed the default value in 3.12.0. Can be replaced by True when
+    3.12.0 becomes the minimum supported version.
+    """
+    return geos_version_tuple() >= (3, 12)
 
-    def __init__(
-        self,
-        pretty=True,
-        yes=False,
-        input_history_file=None,
-        chat_history_file=None,
-        input=None,
-        output=None,
-        user_input_color="blue",
-        tool_output_color=None,
-        tool_error_color="red",
-        encoding="utf-8",
-        dry_run=False,
-    ):
-        no_color = os.environ.get("NO_COLOR")
-        if no_color is not None and no_color != "":
-            pretty = False
 
-        self.user_input_color = user_input_color if pretty else None
-        self.tool_output_color = tool_output_color if pretty else None
-        self.tool_error_color = tool_error_color if pretty else None
+DEFAULT_TRIM_VALUE = SimpleLazyObject(default_trim_value)
 
-        self.input = input
-        self.output = output
 
-        self.pretty = pretty
-        if self.output:
-            self.pretty = False
+# ### WKB/WKT Writer Classes ###
+class WKTWriter(IOBase):
+    _constructor = wkt_writer_create
+    ptr_type = WKT_WRITE_PTR
+    destructor = wkt_writer_destroy
+    _precision = None
 
-        self.yes = yes
+    def __init__(self, dim=2, trim=False, precision=None):
+        super().__init__()
+        self._trim = DEFAULT_TRIM_VALUE
+        self.trim = trim
+        if precision is not None:
+            self.precision = precision
+        self.outdim = dim
 
-        self.input_history_file = input_history_file
-        if chat_history_file is not None:
-            self.chat_history_file = Path(chat_history_file)
-        else:
-            self.chat_history_file = None
+    def write(self, geom):
+        "Return the WKT representation of the given geometry."
+        return wkt_writer_write(self.ptr, geom.ptr)
 
-        self.encoding = encoding
-        self.dry_run = dry_run
+    @property
+    def outdim(self):
+        return wkt_writer_get_outdim(self.ptr)
 
-        if pretty:
-            self.console = Console()
-        else:
-            self.console = Console(force_terminal=False, no_color=True)
+    @outdim.setter
+    def outdim(self, new_dim):
+        if new_dim not in (2, 3):
+            raise ValueError("WKT output dimension must be 2 or 3")
+        wkt_writer_set_outdim(self.ptr, new_dim)
 
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.append_chat_history(f"\n# aider chat started at {current_time}\n\n")
+    @property
+    def trim(self):
+        return self._trim
 
-    def read_text(self, filename):
-        try:
-            with open(str(filename), "r", encoding=self.encoding) as f:
-                return f.read()
-        except FileNotFoundError:
-            self.tool_error(f"{filename}: file not found error")
-            return
-        except IsADirectoryError:
-            self.tool_error(f"{filename}: is a directory")
-            return
-        except UnicodeError as e:
-            self.tool_error(f"{filename}: {e}")
-            self.tool_error("Use --encoding to set the unicode encoding.")
-            return
+    @trim.setter
+    def trim(self, flag):
+        if bool(flag) != self._trim:
+            self._trim = bool(flag)
+            wkt_writer_set_trim(self.ptr, self._trim)
 
-    def write_text(self, filename, content):
-        if self.dry_run:
-            return
-        with open(str(filename), "w", encoding=self.encoding) as f:
-            f.write(content)
+    @property
+    def precision(self):
+        return self._precision
 
-    def get_input(self, root, rel_fnames, addable_rel_fnames, commands):
-        if self.pretty:
-            style = dict(style=self.user_input_color) if self.user_input_color else dict()
-            self.console.rule(**style)
-        else:
-            print()
-
-        rel_fnames = list(rel_fnames)
-        show = " ".join(rel_fnames)
-        if len(show) > 10:
-            show += "\n"
-        show += "> "
-
-        inp = ""
-        multiline_input = False
-
-        if self.user_input_color:
-            style = Style.from_dict(
-                {
-                    "": self.user_input_color,
-                    "pygments.literal.string": f"bold italic {self.user_input_color}",
-                }
+    @precision.setter
+    def precision(self, precision):
+        if (not isinstance(precision, int) or precision < 0) and precision is not None:
+            raise AttributeError(
+                "WKT output rounding precision must be non-negative integer or None."
             )
-        else:
-            style = None
+        if precision != self._precision:
+            self._precision = precision
+            wkt_writer_set_precision(self.ptr, -1 if precision is None else precision)
 
-        while True:
-            completer_instance = AutoCompleter(
-                root, rel_fnames, addable_rel_fnames, commands, self.encoding
-            )
-            if multiline_input:
-                show = ". "
 
-            session_kwargs = {
-                "message": show,
-                "completer": completer_instance,
-                "reserve_space_for_menu": 4,
-                "complete_style": CompleteStyle.MULTI_COLUMN,
-                "input": self.input,
-                "output": self.output,
-                "lexer": PygmentsLexer(MarkdownLexer),
-            }
-            if style:
-                session_kwargs["style"] = style
+class WKBWriter(IOBase):
+    _constructor = wkb_writer_create
+    ptr_type = WKB_WRITE_PTR
+    destructor = wkb_writer_destroy
+    geos_version = geos_version_tuple()
 
-            if self.input_history_file is not None:
-                session_kwargs["history"] = FileHistory(self.input_history_file)
+    def __init__(self, dim=2):
+        super().__init__()
+        self.outdim = dim
 
-            kb = KeyBindings()
+    def _handle_empty_point(self, geom):
+        from django.contrib.gis.geos import Point
 
-            @kb.add("escape", "c-m", eager=True)
-            def _(event):
-                event.current_buffer.insert_text("\n")
-
-            session = PromptSession(key_bindings=kb, **session_kwargs)
-            line = session.prompt()
-
-            if line and line[0] == "{" and not multiline_input:
-                multiline_input = True
-                inp += line[1:] + "\n"
-                continue
-            elif line and line[-1] == "}" and multiline_input:
-                inp += line[:-1] + "\n"
-                break
-            elif multiline_input:
-                inp += line + "\n"
+        if isinstance(geom, Point) and geom.empty:
+            if self.srid:
+                # PostGIS uses POINT(NaN NaN) for WKB representation of empty
+                # points. Use it for EWKB as it's a PostGIS specific format.
+                # https://trac.osgeo.org/postgis/ticket/3181
+                geom = Point(float("NaN"), float("NaN"), srid=geom.srid)
             else:
-                inp = line
-                break
+                raise ValueError("Empty point is not representable in WKB.")
+        return geom
 
-        print()
-        self.user_input(inp)
-        return inp
+    def write(self, geom):
+        "Return the WKB representation of the given geometry."
+        geom = self._handle_empty_point(geom)
+        wkb = wkb_writer_write(self.ptr, geom.ptr, byref(c_size_t()))
+        return memoryview(wkb)
 
-    def add_to_input_history(self, inp):
-        if not self.input_history_file:
-            return
-        FileHistory(self.input_history_file).append_string(inp)
+    def write_hex(self, geom):
+        "Return the HEXEWKB representation of the given geometry."
+        geom = self._handle_empty_point(geom)
+        wkb = wkb_writer_write_hex(self.ptr, geom.ptr, byref(c_size_t()))
+        return wkb
 
-    def get_input_history(self):
-        if not self.input_history_file:
-            return []
+    # ### WKBWriter Properties ###
 
-        fh = FileHistory(self.input_history_file)
-        return fh.load_history_strings()
+    # Property for getting/setting the byteorder.
+    def _get_byteorder(self):
+        return wkb_writer_get_byteorder(self.ptr)
 
-    def user_input(self, inp, log_only=True):
-        if not log_only:
-            style = dict(style=self.user_input_color) if self.user_input_color else dict()
-            self.console.print(inp, **style)
+    def _set_byteorder(self, order):
+        if order not in (0, 1):
+            raise ValueError(
+                "Byte order parameter must be 0 (Big Endian) or 1 (Little Endian)."
+            )
+        wkb_writer_set_byteorder(self.ptr, order)
 
-        prefix = "####"
-        if inp:
-            hist = inp.splitlines()
-        else:
-            hist = ["<blank>"]
+    byteorder = property(_get_byteorder, _set_byteorder)
 
-        hist = f"  \n{prefix} ".join(hist)
+    # Property for getting/setting the output dimension.
+    @property
+    def outdim(self):
+        return wkb_writer_get_outdim(self.ptr)
 
-        hist = f"""
-{prefix} {hist}"""
-        self.append_chat_history(hist, linebreak=True)
+    @outdim.setter
+    def outdim(self, new_dim):
+        if new_dim not in (2, 3):
+            raise ValueError("WKB output dimension must be 2 or 3")
+        wkb_writer_set_outdim(self.ptr, new_dim)
 
-    # OUTPUT
+    # Property for getting/setting the include srid flag.
+    @property
+    def srid(self):
+        return bool(wkb_writer_get_include_srid(self.ptr))
 
-    def ai_output(self, content):
-        hist = "\n" + content.strip() + "\n\n"
-        self.append_chat_history(hist)
+    @srid.setter
+    def srid(self, include):
+        wkb_writer_set_include_srid(self.ptr, bool(include))
 
-    def confirm_ask(self, question, default="y"):
-        self.num_user_asks += 1
 
-        if self.yes is True:
-            res = "yes"
-        elif self.yes is False:
-            res = "no"
-        else:
-            res = prompt(question + " ", default=default)
+# `ThreadLocalIO` object holds instances of the WKT and WKB reader/writer
+# objects that are local to the thread.  The `GEOSGeometry` internals
+# access these instances by calling the module-level functions, defined
+# below.
+class ThreadLocalIO(threading.local):
+    wkt_r = None
+    wkt_w = None
+    wkb_r = None
+    wkb_w = None
+    ewkb_w = None
 
-        hist = f"{question.strip()} {res.strip()}"
-        self.append_chat_history(hist, linebreak=True, blockquote=True)
-        if self.yes in (True, False):
-            self.tool_output(hist)
 
-        if not res or not res.strip():
-            return
-        return res.strip().lower().startswith("y")
+thread_context = ThreadLocalIO()
 
-    def prompt_ask(self, question, default=None):
-        self.num_user_asks += 1
 
-        if self.yes is True:
-            res = "yes"
-        elif self.yes is False:
-            res = "no"
-        else:
-            res = prompt(question + " ", default=default)
+# These module-level routines return the I/O object that is local to the
+# thread. If the I/O object does not exist yet it will be initialized.
+def wkt_r():
+    thread_context.wkt_r = thread_context.wkt_r or _WKTReader()
+    return thread_context.wkt_r
 
-        hist = f"{question.strip()} {res.strip()}"
-        self.append_chat_history(hist, linebreak=True, blockquote=True)
-        if self.yes in (True, False):
-            self.tool_output(hist)
 
-        return res
+def wkt_w(dim=2, trim=False, precision=None):
+    if not thread_context.wkt_w:
+        thread_context.wkt_w = WKTWriter(dim=dim, trim=trim, precision=precision)
+    else:
+        thread_context.wkt_w.outdim = dim
+        thread_context.wkt_w.trim = trim
+        thread_context.wkt_w.precision = precision
+    return thread_context.wkt_w
 
-    def tool_error(self, message):
-        self.num_error_outputs += 1
 
-        if message.strip():
-            hist = f"{message.strip()}"
-            self.append_chat_history(hist, linebreak=True, blockquote=True)
+def wkb_r():
+    thread_context.wkb_r = thread_context.wkb_r or _WKBReader()
+    return thread_context.wkb_r
 
-        message = Text(message)
-        style = dict(style=self.tool_error_color) if self.tool_error_color else dict()
-        self.console.print(message, **style)
 
-    def tool_output(self, *messages, log_only=False):
-        if messages:
-            hist = " ".join(messages)
-            hist = f"{hist.strip()}"
-            self.append_chat_history(hist, linebreak=True, blockquote=True)
+def wkb_w(dim=2):
+    if not thread_context.wkb_w:
+        thread_context.wkb_w = WKBWriter(dim=dim)
+    else:
+        thread_context.wkb_w.outdim = dim
+    return thread_context.wkb_w
 
-        if not log_only:
-            messages = list(map(Text, messages))
-            style = dict(style=self.tool_output_color) if self.tool_output_color else dict()
-            self.console.print(*messages, **style)
 
-    def append_chat_history(self, text, linebreak=False, blockquote=False):
-        if blockquote:
-            text = text.strip()
-            text = "> " + text
-        if linebreak:
-            text = text.rstrip()
-            text = text + "  \n"
-        if not text.endswith("\n"):
-            text += "\n"
-        if self.chat_history_file is not None:
-            with self.chat_history_file.open("a", encoding=self.encoding) as f:
-                f.write(text)
+def ewkb_w(dim=2):
+    if not thread_context.ewkb_w:
+        thread_context.ewkb_w = WKBWriter(dim=dim)
+        thread_context.ewkb_w.srid = True
+    else:
+        thread_context.ewkb_w.outdim = dim
+    return thread_context.ewkb_w

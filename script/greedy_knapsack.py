@@ -83,16 +83,17 @@ def calc_profit(profit: list, weight: list, max_weight: int) -> int:
         i += 1
     return gain
 
+import random
 
-if __name__ == "__main__":
-    print(
+print(
         "Input profits, weights, and then max_weight (all positive ints) separated by "
         "spaces."
-    )
+)
 
-    profit = [int(x) for x in input("Input profits separated by spaces: ").split()]
-    weight = [int(x) for x in input("Input weights separated by spaces: ").split()]
-    max_weight = int(input("Max weight allowed: "))
+profit = [int(x) for x in ("100 542 856 586 125 523 425 625 325 125 412 535 425 125 456 478 896 951 852 486").split()]
+weight = [int(x) for x in ("250 412 205 360 584 569 598 812 520 450 475 487 463 361 198 197 856 632 364 582").split()]
+max_weight = int(random.randint(1,250))
 
-    # Function Call
-    calc_profit(profit, weight, max_weight)
+# Function Call
+calc_profit(profit, weight, max_weight)
+ 

@@ -1,119 +1,140 @@
-# -*- coding: utf-8 -*-
-"""
-oauthlib.oauth2.rfc6749.grant_types
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-"""
-from __future__ import unicode_literals, absolute_import
+from typing import Optional
 
-import json
-import logging
+import graphene
+from django.core.exceptions import ValidationError
+from django.utils import timezone
 
-from .base import GrantTypeBase
-from .. import errors, utils
-from ..request_validator import RequestValidator
+from .....account.error_codes import AccountErrorCode
+from .....core.jwt import (
+    JWT_REFRESH_TOKEN_COOKIE_NAME,
+    JWT_REFRESH_TYPE,
+    create_access_token,
+)
+from ....core import ResolveInfo
+from ....core.doc_category import DOC_CATEGORY_AUTH
+from ....core.mutations import BaseMutation
+from ....core.types import AccountError
+from ...types import User
+from .utils import _does_token_match, get_payload, get_user
 
-log = logging.getLogger(__name__)
 
+class RefreshToken(BaseMutation):
+    """Mutation that refresh user token and returns token and user data."""
 
-class RefreshTokenGrant(GrantTypeBase):
+    token = graphene.String(description="JWT token, required to authenticate.")
+    user = graphene.Field(User, description="A user instance.")
 
-    """`Refresh token grant`_
+    class Arguments:
+        refresh_token = graphene.String(required=False, description="Refresh token.")
+        csrf_token = graphene.String(
+            required=False,
+            description=(
+                "CSRF token required to refresh token. This argument is "
+                "required when `refreshToken` is provided as a cookie."
+            ),
+        )
 
-    .. _`Refresh token grant`: http://tools.ietf.org/html/rfc6749#section-6
-    """
+    class Meta:
+        description = (
+            "Refresh JWT token. Mutation tries to take refreshToken from the input. "
+            "If it fails it will try to take `refreshToken` from the http-only cookie "
+            f"`{JWT_REFRESH_TOKEN_COOKIE_NAME}`. "
+            "`csrfToken` is required when `refreshToken` is provided as a cookie."
+        )
+        doc_category = DOC_CATEGORY_AUTH
+        error_type_class = AccountError
+        error_type_field = "account_errors"
 
-    @property
-    def issue_new_refresh_tokens(self):
-        return True
-
-    def __init__(self, request_validator=None, issue_new_refresh_tokens=True):
-        self.request_validator = request_validator or RequestValidator()
-
-    def create_token_response(self, request, token_handler):
-        """Create a new access token from a refresh_token.
-
-        If valid and authorized, the authorization server issues an access
-        token as described in `Section 5.1`_. If the request failed
-        verification or is invalid, the authorization server returns an error
-        response as described in `Section 5.2`_.
-
-        The authorization server MAY issue a new refresh token, in which case
-        the client MUST discard the old refresh token and replace it with the
-        new refresh token. The authorization server MAY revoke the old
-        refresh token after issuing a new refresh token to the client. If a
-        new refresh token is issued, the refresh token scope MUST be
-        identical to that of the refresh token included by the client in the
-        request.
-
-        .. _`Section 5.1`: http://tools.ietf.org/html/rfc6749#section-5.1
-        .. _`Section 5.2`: http://tools.ietf.org/html/rfc6749#section-5.2
-        """
-        headers = {
-            'Content-Type': 'application/json',
-            'Cache-Control': 'no-store',
-            'Pragma': 'no-cache',
-        }
+    @classmethod
+    def get_refresh_token_payload(cls, refresh_token):
         try:
-            log.debug('Validating refresh token request, %r.', request)
-            self.validate_token_request(request)
-        except errors.OAuth2Error as e:
-            return headers, e.json, e.status_code
+            payload = get_payload(refresh_token)
+        except ValidationError as e:
+            raise ValidationError({"refreshToken": e})
+        return payload
 
-        token = token_handler.create_token(request,
-                                           refresh_token=self.issue_new_refresh_tokens)
-        log.debug('Issuing new token to client id %r (%r), %r.',
-                  request.client_id, request.client, token)
-        return headers, json.dumps(token), 200
+    @classmethod
+    def get_refresh_token(
+        cls, info: ResolveInfo, refresh_token: Optional[str] = None
+    ) -> Optional[str]:
+        request = info.context
+        refresh_token = refresh_token or request.COOKIES.get(
+            JWT_REFRESH_TOKEN_COOKIE_NAME, None
+        )
+        return refresh_token
 
-    def validate_token_request(self, request):
-        # REQUIRED. Value MUST be set to "refresh_token".
-        if request.grant_type != 'refresh_token':
-            raise errors.UnsupportedGrantTypeError(request=request)
+    @classmethod
+    def clean_refresh_token(cls, refresh_token):
+        if not refresh_token:
+            raise ValidationError(
+                {
+                    "refresh_token": ValidationError(
+                        "Missing refreshToken",
+                        code=AccountErrorCode.JWT_MISSING_TOKEN.value,
+                    )
+                }
+            )
+        payload = cls.get_refresh_token_payload(refresh_token)
+        if payload["type"] != JWT_REFRESH_TYPE:
+            raise ValidationError(
+                {
+                    "refresh_token": ValidationError(
+                        "Incorrect refreshToken",
+                        code=AccountErrorCode.JWT_INVALID_TOKEN.value,
+                    )
+                }
+            )
+        return payload
 
-        if request.refresh_token is None:
-            raise errors.InvalidRequestError(
-                description='Missing refresh token parameter.',
-                request=request)
+    @classmethod
+    def clean_csrf_token(cls, csrf_token, payload):
+        if not csrf_token:
+            msg = "CSRF token is required when refreshToken is provided by the cookie"
+            raise ValidationError(
+                {
+                    "csrf_token": ValidationError(
+                        msg,
+                        code=AccountErrorCode.REQUIRED.value,
+                    )
+                }
+            )
+        is_valid = _does_token_match(csrf_token, payload["csrfToken"])
+        if not is_valid:
+            raise ValidationError(
+                {
+                    "csrf_token": ValidationError(
+                        "Invalid csrf token",
+                        code=AccountErrorCode.JWT_INVALID_CSRF_TOKEN.value,
+                    )
+                }
+            )
 
-        # Because refresh tokens are typically long-lasting credentials used to
-        # request additional access tokens, the refresh token is bound to the
-        # client to which it was issued.  If the client type is confidential or
-        # the client was issued client credentials (or assigned other
-        # authentication requirements), the client MUST authenticate with the
-        # authorization server as described in Section 3.2.1.
-        # http://tools.ietf.org/html/rfc6749#section-3.2.1
-        if self.request_validator.client_authentication_required(request):
-            log.debug('Authenticating client, %r.', request)
-            if not self.request_validator.authenticate_client(request):
-                log.debug('Invalid client (%r), denying access.', request)
-                raise errors.InvalidClientError(request=request)
-        elif not self.request_validator.authenticate_client_id(request.client_id, request):
-            log.debug('Client authentication failed, %r.', request)
-            raise errors.InvalidClientError(request=request)
+    @classmethod
+    def get_user(cls, payload):
+        try:
+            user = get_user(payload)
+        except ValidationError as e:
+            raise ValidationError({"refresh_token": e})
+        return user
 
-        # Ensure client is authorized use of this grant type
-        self.validate_grant_type(request)
+    @classmethod
+    def perform_mutation(
+        cls, _root, info: ResolveInfo, /, *, csrf_token=None, refresh_token=None
+    ):
+        need_csrf = refresh_token is None
+        refresh_token = cls.get_refresh_token(info, refresh_token)
+        payload = cls.clean_refresh_token(refresh_token)
 
-        # REQUIRED. The refresh token issued to the client.
-        log.debug('Validating refresh token %s for client %r.',
-                  request.refresh_token, request.client)
-        if not self.request_validator.validate_refresh_token(
-                request.refresh_token, request.client, request):
-            log.debug('Invalid refresh token, %s, for client %r.',
-                      request.refresh_token, request.client)
-            raise errors.InvalidGrantError(request=request)
+        # None when we got refresh_token from cookie.
+        if need_csrf:
+            cls.clean_csrf_token(csrf_token, payload)
 
-        original_scopes = utils.scope_to_list(
-            self.request_validator.get_original_scopes(
-                request.refresh_token, request))
-
-        if request.scope:
-            request.scopes = utils.scope_to_list(request.scope)
-            if (not all((s in original_scopes for s in request.scopes))
-                and not self.request_validator.is_within_original_scope(
-                    request.scopes, request.refresh_token, request)):
-                log.debug('Refresh token %s lack requested scopes, %r.',
-                          request.refresh_token, request.scopes)
-                raise errors.InvalidScopeError(request=request)
-        else:
-            request.scopes = original_scopes
+        user = get_user(payload)
+        additional_payload = {}
+        if audience := payload.get("aud"):
+            additional_payload["aud"] = audience
+        token = create_access_token(user, additional_payload=additional_payload)
+        if user and not user.is_anonymous:
+            user.last_login = timezone.now()
+            user.save(update_fields=["last_login", "updated_at"])
+        return cls(errors=[], user=user, token=token)

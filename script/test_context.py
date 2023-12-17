@@ -1,115 +1,305 @@
-import pytest
+from unittest import mock
 
-
-def _iter_hierarchy(context):
-    def iter(context):
-        while context is not None:
-            yield context
-            context = context.parent()
-
-    return reversed(list(iter(context)))
-
-
-func_code = '''\
-def func1(x, y):
-    pass
-
-def func2():
- what ?
-i = 3
-    
-def func3():
-    1'''
-cls_code = '''\
-class Foo:
-    def x():
-        def y():
-            pass
-'''
-cls_nested = '''\
-class C:
-    class D:
-        def f():
-            pass
-'''
-lambda_ = '''\
-def x():
-    (lambda x:
-     lambda: y
-    )
-'''
-comprehension = '''
-def f(x):
-    [x
-    for
-    x
-    in x
-    ]'''
-
-with_brackets = '''\
-def x():
-    [
-
-    ]
-'''
-
-
-@pytest.mark.parametrize(
-    'code, line, column, full_name, expected_parents', [
-        ('', None, None, 'myfile', []),
-        (' ', None, 0, 'myfile', []),
-
-        (func_code, 1, 0, 'myfile', []),
-        (func_code, 1, None, 'myfile.func1', ['func1']),
-        (func_code, 1, 1, 'myfile.func1', ['func1']),
-        (func_code, 1, 4, 'myfile.func1', ['func1']),
-        (func_code, 1, 10, 'myfile.func1', ['func1']),
-
-        (func_code, 3, 0, 'myfile', []),
-        (func_code, 5, None, 'myfile.func2', ['func2']),
-        (func_code, 6, None, 'myfile', []),
-        (func_code, 7, None, 'myfile', []),
-        (func_code, 9, None, 'myfile.func3', ['func3']),
-
-        (cls_code, None, None, 'myfile', []),
-        (cls_code + ' ', None, None, 'myfile.Foo', ['Foo']),
-        (cls_code + ' ' * 3, None, None, 'myfile.Foo', ['Foo']),
-        (cls_code + ' ' * 4, None, None, 'myfile.Foo', ['Foo']),
-        (cls_code + ' ' * 5, None, None, 'myfile.Foo.x', ['Foo', 'x']),
-        (cls_code + ' ' * 8, None, None, 'myfile.Foo.x', ['Foo', 'x']),
-        (cls_code + ' ' * 12, None, None, None, ['Foo', 'x', 'y']),
-
-        (cls_code, 4, 0, 'myfile', []),
-        (cls_code, 4, 3, 'myfile.Foo', ['Foo']),
-        (cls_code, 4, 4, 'myfile.Foo', ['Foo']),
-        (cls_code, 4, 5, 'myfile.Foo.x', ['Foo', 'x']),
-        (cls_code, 4, 8, 'myfile.Foo.x', ['Foo', 'x']),
-        (cls_code, 4, 12, None, ['Foo', 'x', 'y']),
-        (cls_code, 1, 1, 'myfile.Foo', ['Foo']),
-
-        (cls_nested, 4, None, 'myfile.C.D.f', ['C', 'D', 'f']),
-        (cls_nested, 4, 3, 'myfile.C', ['C']),
-
-        (lambda_, 2, 9, 'myfile.x', ['x']),  # the lambda keyword
-        (lambda_, 2, 13, 'myfile.x', ['x']),  # the lambda param
-        (lambda_, 3, 0, 'myfile', []),  # Within brackets, but they are ignored.
-        (lambda_, 3, 8, 'myfile.x', ['x']),
-        (lambda_, 3, None, 'myfile.x', ['x']),
-
-        (comprehension, 2, None, 'myfile.f', ['f']),
-        (comprehension, 3, None, 'myfile.f', ['f']),
-        (comprehension, 4, None, 'myfile.f', ['f']),
-        (comprehension, 5, None, 'myfile.f', ['f']),
-        (comprehension, 6, None, 'myfile.f', ['f']),
-
-        # Brackets are just ignored.
-        (with_brackets, 3, None, 'myfile', []),
-        (with_brackets, 4, 4, 'myfile.x', ['x']),
-        (with_brackets, 4, 5, 'myfile.x', ['x']),
-    ]
+from django.http import HttpRequest
+from django.template import (
+    Context,
+    Engine,
+    RequestContext,
+    Template,
+    Variable,
+    VariableDoesNotExist,
 )
-def test_context(Script, code, line, column, full_name, expected_parents):
-    context = Script(code, path='/foo/myfile.py').get_context(line, column)
-    assert context.full_name == full_name
-    parent_names = [d.name for d in _iter_hierarchy(context)]
-    assert parent_names == ['myfile'] + expected_parents
+from django.template.context import RenderContext
+from django.test import RequestFactory, SimpleTestCase, override_settings
+
+
+class ContextTests(SimpleTestCase):
+    def test_context(self):
+        c = Context({"a": 1, "b": "xyzzy"})
+        self.assertEqual(c["a"], 1)
+        self.assertEqual(c.push(), {})
+        c["a"] = 2
+        self.assertEqual(c["a"], 2)
+        self.assertEqual(c.get("a"), 2)
+        self.assertEqual(c.pop(), {"a": 2})
+        self.assertEqual(c["a"], 1)
+        self.assertEqual(c.get("foo", 42), 42)
+        self.assertEqual(c, mock.ANY)
+
+    def test_push_context_manager(self):
+        c = Context({"a": 1})
+        with c.push():
+            c["a"] = 2
+            self.assertEqual(c["a"], 2)
+        self.assertEqual(c["a"], 1)
+
+        with c.push(a=3):
+            self.assertEqual(c["a"], 3)
+        self.assertEqual(c["a"], 1)
+
+    def test_update_context_manager(self):
+        c = Context({"a": 1})
+        with c.update({}):
+            c["a"] = 2
+            self.assertEqual(c["a"], 2)
+        self.assertEqual(c["a"], 1)
+
+        with c.update({"a": 3}):
+            self.assertEqual(c["a"], 3)
+        self.assertEqual(c["a"], 1)
+
+    def test_push_context_manager_with_context_object(self):
+        c = Context({"a": 1})
+        with c.push(Context({"a": 3})):
+            self.assertEqual(c["a"], 3)
+        self.assertEqual(c["a"], 1)
+
+    def test_update_context_manager_with_context_object(self):
+        c = Context({"a": 1})
+        with c.update(Context({"a": 3})):
+            self.assertEqual(c["a"], 3)
+        self.assertEqual(c["a"], 1)
+
+    def test_push_proper_layering(self):
+        c = Context({"a": 1})
+        c.push(Context({"b": 2}))
+        c.push(Context({"c": 3, "d": {"z": "26"}}))
+        self.assertEqual(
+            c.dicts,
+            [
+                {"False": False, "None": None, "True": True},
+                {"a": 1},
+                {"b": 2},
+                {"c": 3, "d": {"z": "26"}},
+            ],
+        )
+
+    def test_update_proper_layering(self):
+        c = Context({"a": 1})
+        c.update(Context({"b": 2}))
+        c.update(Context({"c": 3, "d": {"z": "26"}}))
+        self.assertEqual(
+            c.dicts,
+            [
+                {"False": False, "None": None, "True": True},
+                {"a": 1},
+                {"b": 2},
+                {"c": 3, "d": {"z": "26"}},
+            ],
+        )
+
+    def test_setdefault(self):
+        c = Context()
+
+        x = c.setdefault("x", 42)
+        self.assertEqual(x, 42)
+        self.assertEqual(c["x"], 42)
+
+        x = c.setdefault("x", 100)
+        self.assertEqual(x, 42)
+        self.assertEqual(c["x"], 42)
+
+    def test_resolve_on_context_method(self):
+        """
+        #17778 -- Variable shouldn't resolve RequestContext methods
+        """
+        empty_context = Context()
+
+        with self.assertRaises(VariableDoesNotExist):
+            Variable("no_such_variable").resolve(empty_context)
+
+        with self.assertRaises(VariableDoesNotExist):
+            Variable("new").resolve(empty_context)
+
+        self.assertEqual(
+            Variable("new").resolve(Context({"new": "foo"})),
+            "foo",
+        )
+
+    def test_render_context(self):
+        test_context = RenderContext({"fruit": "papaya"})
+
+        # push() limits access to the topmost dict
+        test_context.push()
+
+        test_context["vegetable"] = "artichoke"
+        self.assertEqual(list(test_context), ["vegetable"])
+
+        self.assertNotIn("fruit", test_context)
+        with self.assertRaises(KeyError):
+            test_context["fruit"]
+        self.assertIsNone(test_context.get("fruit"))
+
+    def test_flatten_context(self):
+        a = Context()
+        a.update({"a": 2})
+        a.update({"b": 4})
+        a.update({"c": 8})
+
+        self.assertEqual(
+            a.flatten(),
+            {"False": False, "None": None, "True": True, "a": 2, "b": 4, "c": 8},
+        )
+
+    def test_flatten_context_with_context(self):
+        """
+        Context.push() with a Context argument should work.
+        """
+        a = Context({"a": 2})
+        a.push(Context({"z": "8"}))
+        self.assertEqual(
+            a.flatten(),
+            {
+                "False": False,
+                "None": None,
+                "True": True,
+                "a": 2,
+                "z": "8",
+            },
+        )
+
+    def test_context_comparable(self):
+        """
+        #21765 -- equality comparison should work
+        """
+
+        test_data = {"x": "y", "v": "z", "d": {"o": object, "a": "b"}}
+
+        self.assertEqual(Context(test_data), Context(test_data))
+
+        a = Context()
+        b = Context()
+        self.assertEqual(a, b)
+
+        # update only a
+        a.update({"a": 1})
+        self.assertNotEqual(a, b)
+
+        # update both to check regression
+        a.update({"c": 3})
+        b.update({"c": 3})
+        self.assertNotEqual(a, b)
+
+        # make contexts equals again
+        b.update({"a": 1})
+        self.assertEqual(a, b)
+
+    def test_copy_request_context_twice(self):
+        """
+        #24273 -- Copy twice shouldn't raise an exception
+        """
+        RequestContext(HttpRequest()).new().new()
+
+    def test_set_upward(self):
+        c = Context({"a": 1})
+        c.set_upward("a", 2)
+        self.assertEqual(c.get("a"), 2)
+
+    def test_set_upward_empty_context(self):
+        empty_context = Context()
+        empty_context.set_upward("a", 1)
+        self.assertEqual(empty_context.get("a"), 1)
+
+    def test_set_upward_with_push(self):
+        """
+        The highest context which has the given key is used.
+        """
+        c = Context({"a": 1})
+        c.push({"a": 2})
+        c.set_upward("a", 3)
+        self.assertEqual(c.get("a"), 3)
+        c.pop()
+        self.assertEqual(c.get("a"), 1)
+
+    def test_set_upward_with_push_no_match(self):
+        """
+        The highest context is used if the given key isn't found.
+        """
+        c = Context({"b": 1})
+        c.push({"b": 2})
+        c.set_upward("a", 2)
+        self.assertEqual(len(c.dicts), 3)
+        self.assertEqual(c.dicts[-1]["a"], 2)
+
+
+def context_process_returning_none(request):
+    return None
+
+
+class RequestContextTests(SimpleTestCase):
+    request_factory = RequestFactory()
+
+    def test_include_only(self):
+        """
+        #15721 -- ``{% include %}`` and ``RequestContext`` should work
+        together.
+        """
+        engine = Engine(
+            loaders=[
+                (
+                    "django.template.loaders.locmem.Loader",
+                    {
+                        "child": '{{ var|default:"none" }}',
+                    },
+                ),
+            ]
+        )
+        request = self.request_factory.get("/")
+        ctx = RequestContext(request, {"var": "parent"})
+        self.assertEqual(
+            engine.from_string('{% include "child" %}').render(ctx), "parent"
+        )
+        self.assertEqual(
+            engine.from_string('{% include "child" only %}').render(ctx), "none"
+        )
+
+    def test_stack_size(self):
+        """Optimized RequestContext construction (#7116)."""
+        request = self.request_factory.get("/")
+        ctx = RequestContext(request, {})
+        # The stack contains 4 items:
+        # [builtins, supplied context, context processor, empty dict]
+        self.assertEqual(len(ctx.dicts), 4)
+
+    def test_context_comparable(self):
+        # Create an engine without any context processors.
+        test_data = {"x": "y", "v": "z", "d": {"o": object, "a": "b"}}
+
+        # test comparing RequestContext to prevent problems if somebody
+        # adds __eq__ in the future
+        request = self.request_factory.get("/")
+
+        self.assertEqual(
+            RequestContext(request, dict_=test_data),
+            RequestContext(request, dict_=test_data),
+        )
+
+    def test_modify_context_and_render(self):
+        template = Template("{{ foo }}")
+        request = self.request_factory.get("/")
+        context = RequestContext(request, {})
+        context["foo"] = "foo"
+        self.assertEqual(template.render(context), "foo")
+
+    @override_settings(
+        TEMPLATES=[
+            {
+                "BACKEND": "django.template.backends.django.DjangoTemplates",
+                "OPTIONS": {
+                    "context_processors": [
+                        "django.template.context_processors.request",
+                        "template_tests.test_context.context_process_returning_none",
+                    ],
+                },
+            }
+        ],
+    )
+    def test_template_context_processor_returning_none(self):
+        request_context = RequestContext(HttpRequest())
+        msg = (
+            "Context processor context_process_returning_none didn't return a "
+            "dictionary."
+        )
+        with self.assertRaisesMessage(TypeError, msg):
+            with request_context.bind_template(Template("")):
+                pass

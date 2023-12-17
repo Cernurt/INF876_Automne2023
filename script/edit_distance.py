@@ -93,8 +93,8 @@ if __name__ == "__main__":
     print("****************** Testing Edit Distance DP Algorithm ******************")
     print()
 
-    S1 = input("Enter the first string: ").strip()
-    S2 = input("Enter the second string: ").strip()
+    S1 = ("anticonstitutionellement").strip()
+    S2 = ("mortellement").strip()
 
     print()
     print(f"The minimum edit distance is: {solver.min_dist_top_down(S1, S2)}")

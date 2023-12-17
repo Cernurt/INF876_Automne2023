@@ -152,12 +152,13 @@ def guess_the_number(lower: int, higher: int, to_guess: int) -> None:
 
 
 def main() -> None:
+    import random
     """
     starting point or function of script
     """
-    lower = int(input("Enter lower value : ").strip())
-    higher = int(input("Enter high value : ").strip())
-    guess = int(input("Enter value to guess : ").strip())
+    lower = int(random.uniform(0, 100).strip())
+    higher = int(random.uniform(101, 300).strip())
+    guess = int(random.uniform(0, 300).strip())
     guess_the_number(lower, higher, guess)
 
 

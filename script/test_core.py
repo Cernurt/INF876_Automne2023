@@ -1,149 +1,184 @@
-from __future__ import division
 import pytest
-import numpy as np
-from numpy.testing import assert_allclose
 
-from rl.memory import SequentialMemory
-from rl.core import Agent, Env, Processor
-
-
-class TestEnv(Env):
-    def __init__(self):
-        super(TestEnv, self).__init__()
-
-    def step(self, action):
-        self.state += 1
-        done = self.state >= 6
-        reward = float(self.state) / 10.
-        return np.array(self.state), reward, done, {}
-
-    def reset(self):
-        self.state = 1
-        return np.array(self.state)
-
-    def seed(self, seed=None):
-        pass
-
-    def configure(self, *args, **kwargs):
-        pass
+from mitmproxy import exceptions
+from mitmproxy.addons import core
+from mitmproxy.test import taddons
+from mitmproxy.test import tflow
 
 
-class TestAgent(Agent):
-    def __init__(self, memory, **kwargs):
-        super(TestAgent, self).__init__(**kwargs)
-        self.memory = memory
+def test_set():
+    sa = core.Core()
+    with taddons.context(loadcore=False) as tctx:
+        assert tctx.master.options.upstream_cert
+        tctx.command(sa.set, "upstream_cert", "false")
+        assert not tctx.master.options.upstream_cert
 
-    def forward(self, observation):
-        action = observation
-        self.recent_action = action
-        self.recent_observation = observation
-        return action
-
-    def backward(self, reward, terminal):
-        metrics = [np.nan for _ in self.metrics_names]
-        self.memory.append(self.recent_observation, self.recent_action, reward, terminal)
-        return metrics
-
-    def compile(self):
-        self.compiled = True
+        with pytest.raises(exceptions.CommandError):
+            tctx.command(sa.set, "nonexistent")
 
 
-def test_fit_observations():
-    memory = SequentialMemory(100, window_length=2, ignore_episode_boundaries=False)
-    agent = TestAgent(memory)
-    env = TestEnv()
-    agent.compile()
-    agent.fit(env, 20, verbose=0)
-
-    # Inspect memory to see if observations are correct.
-    experiencies = memory.sample(batch_size=6, batch_idxs=range(2, 8))
-
-    assert experiencies[0].reward == .4
-    assert experiencies[0].action == 3
-    assert_allclose(experiencies[0].state0, np.array([2, 3]))
-    assert_allclose(experiencies[0].state1, np.array([3, 4]))
-    assert experiencies[0].terminal1 is False
-
-    assert experiencies[1].reward == .5
-    assert experiencies[1].action == 4
-    assert_allclose(experiencies[1].state0, np.array([3, 4]))
-    assert_allclose(experiencies[1].state1, np.array([4, 5]))
-    assert experiencies[1].terminal1 is False
-
-    assert experiencies[2].reward == .6
-    assert experiencies[2].action == 5
-    assert_allclose(experiencies[2].state0, np.array([4, 5]))
-    assert_allclose(experiencies[2].state1, np.array([5, 6]))
-    assert experiencies[2].terminal1 is True
-
-    # Experience 3 has been re-sampled since since state0 would be terminal in which case we
-    # cannot really have a meaningful transition because the environment gets reset. We thus
-    # just ensure that state0 is not terminal.
-    assert not np.all(experiencies[3].state0 == np.array([5, 6]))
-
-    assert experiencies[4].reward == .2
-    assert experiencies[4].action == 1
-    assert_allclose(experiencies[4].state0, np.array([0, 1]))
-    assert_allclose(experiencies[4].state1, np.array([1, 2]))
-    assert experiencies[4].terminal1 is False
-
-    assert experiencies[5].reward == .3
-    assert experiencies[5].action == 2
-    assert_allclose(experiencies[5].state0, np.array([1, 2]))
-    assert_allclose(experiencies[5].state1, np.array([2, 3]))
-    assert experiencies[5].terminal1 is False
+def test_resume():
+    sa = core.Core()
+    with taddons.context(loadcore=False):
+        f = tflow.tflow()
+        assert not sa.resume([f])
+        f.intercept()
+        sa.resume([f])
+        assert not f.intercepted
 
 
-def test_copy_observations():
-    methods = [
-        'fit',
-        'test',
-    ]
+def test_mark():
+    sa = core.Core()
+    with taddons.context(loadcore=False):
+        f = tflow.tflow()
+        assert not f.marked
+        sa.mark([f], ":default:")
+        assert f.marked
 
-    for method in methods:
-        original_observations = []
+        with pytest.raises(exceptions.CommandError):
+            sa.mark([f], "invalid")
 
-        class LocalEnv(Env):
-            def __init__(self):
-                super(LocalEnv, self).__init__()
-
-            def step(self, action):
-                self.state += 1
-                done = self.state >= 6
-                reward = float(self.state) / 10.
-                obs = np.array(self.state)
-                original_observations.append(obs)
-                return obs, reward, done, {}
-
-            def reset(self):
-                self.state = 1
-                return np.array(self.state)
-
-            def seed(self, seed=None):
-                pass
-
-            def configure(self, *args, **kwargs):
-                pass
-
-        # Slight abuse of the processor for test purposes.
-        observations = []
-
-        class LocalProcessor(Processor):
-            def process_step(self, observation, reward, done, info):
-                observations.append(observation)
-                return observation, reward, done, info
-
-        processor = LocalProcessor()
-        memory = SequentialMemory(100, window_length=1)
-        agent = TestAgent(memory, processor=processor)
-        env = LocalEnv()
-        agent.compile()
-        getattr(agent, method)(env, 20, verbose=0, visualize=False)
-
-        assert len(observations) == len(original_observations)
-        assert_allclose(np.array(observations), np.array(original_observations))
-        assert np.all([o is not o_ for o, o_ in zip(original_observations, observations)])
+        sa.mark_toggle([f])
+        assert not f.marked
+        sa.mark_toggle([f])
+        assert f.marked
 
 
-if __name__ == '__main__':
-    pytest.main([__file__])
+def test_kill():
+    sa = core.Core()
+    with taddons.context(loadcore=False):
+        f = tflow.tflow()
+        f.intercept()
+        assert f.killable
+        sa.kill([f])
+        assert not f.killable
+
+
+def test_revert():
+    sa = core.Core()
+    with taddons.context(loadcore=False):
+        f = tflow.tflow()
+        f.backup()
+        f.request.content = b"bar"
+        assert f.modified()
+        sa.revert([f])
+        assert not f.modified()
+
+
+def test_flow_set():
+    sa = core.Core()
+    with taddons.context(loadcore=False):
+        f = tflow.tflow(resp=True)
+        assert sa.flow_set_options()
+
+        assert f.request.method != "post"
+        sa.flow_set([f], "method", "post")
+        assert f.request.method == "POST"
+
+        assert f.request.host != "testhost"
+        sa.flow_set([f], "host", "testhost")
+        assert f.request.host == "testhost"
+
+        assert f.request.path != "/test/path"
+        sa.flow_set([f], "path", "/test/path")
+        assert f.request.path == "/test/path"
+
+        assert f.request.url != "http://foo.com/bar"
+        sa.flow_set([f], "url", "http://foo.com/bar")
+        assert f.request.url == "http://foo.com/bar"
+        with pytest.raises(exceptions.CommandError):
+            sa.flow_set([f], "url", "oink")
+
+        assert f.response.status_code != 404
+        sa.flow_set([f], "status_code", "404")
+        assert f.response.status_code == 404
+        assert f.response.reason == "Not Found"
+        with pytest.raises(exceptions.CommandError):
+            sa.flow_set([f], "status_code", "oink")
+
+        assert f.response.reason != "foo"
+        sa.flow_set([f], "reason", "foo")
+        assert f.response.reason == "foo"
+
+
+def test_encoding():
+    sa = core.Core()
+    with taddons.context(loadcore=False):
+        f = tflow.tflow()
+        assert sa.encode_options()
+        sa.encode([f], "request", "deflate")
+        assert f.request.headers["content-encoding"] == "deflate"
+
+        sa.encode([f], "request", "br")
+        assert f.request.headers["content-encoding"] == "deflate"
+
+        sa.decode([f], "request")
+        assert "content-encoding" not in f.request.headers
+
+        sa.encode([f], "request", "br")
+        assert f.request.headers["content-encoding"] == "br"
+
+        sa.encode_toggle([f], "request")
+        assert "content-encoding" not in f.request.headers
+        sa.encode_toggle([f], "request")
+        assert f.request.headers["content-encoding"] == "deflate"
+        sa.encode_toggle([f], "request")
+        assert "content-encoding" not in f.request.headers
+
+
+def test_options(tmpdir):
+    p = str(tmpdir.join("path"))
+    sa = core.Core()
+    with taddons.context() as tctx:
+        tctx.options.listen_host = "foo"
+        assert tctx.options.listen_host == "foo"
+        sa.options_reset_one("listen_host")
+        assert tctx.options.listen_host != "foo"
+
+        with pytest.raises(exceptions.CommandError):
+            sa.options_reset_one("unknown")
+
+        tctx.options.listen_host = "foo"
+        sa.options_save(p)
+        with pytest.raises(exceptions.CommandError):
+            sa.options_save("/")
+
+        sa.options_reset()
+        assert tctx.options.listen_host == ""
+        sa.options_load(p)
+        assert tctx.options.listen_host == "foo"
+
+        sa.options_load("/nonexistent")
+
+        with open(p, "a") as f:
+            f.write("'''")
+        with pytest.raises(exceptions.CommandError):
+            sa.options_load(p)
+
+
+def test_validation_simple():
+    sa = core.Core()
+    with taddons.context() as tctx:
+        with pytest.raises(
+            exceptions.OptionsError,
+            match="requires the upstream_cert option to be enabled",
+        ):
+            tctx.configure(
+                sa, add_upstream_certs_to_client_chain=True, upstream_cert=False
+            )
+
+
+def test_client_certs(tdata):
+    sa = core.Core()
+    with taddons.context() as tctx:
+        # Folders should work.
+        tctx.configure(sa, client_certs=tdata.path("mitmproxy/data/clientcert"))
+        # Files, too.
+        tctx.configure(
+            sa, client_certs=tdata.path("mitmproxy/data/clientcert/client.pem")
+        )
+
+        with pytest.raises(
+            exceptions.OptionsError, match="certificate path does not exist"
+        ):
+            tctx.configure(sa, client_certs="invalid")

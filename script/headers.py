@@ -1,178 +1,137 @@
-from wfuzz.plugin_api.base import BasePlugin
-from wfuzz.externals.moduleman.plugin import moduleman_plugin
+from __future__ import annotations
 
-import re
-
-KBASE_KEY = "http.servers"
-KBASE_KEY_RESP_UNCOMMON = "http.response.headers.uncommon"
-KBASE_KEY_REQ_UNCOMMON = "http.request.headers.uncommon"
-
-SERVER_HEADERS = ["server", "x-powered-by" "via"]
-
-COMMON_RESPONSE_HEADERS_REGEX_LIST = [
-    r"^Server$",
-    r"^X-Powered-By$",
-    r"^Via$",
-    r"^Access-Control.*$",
-    r"^Accept-.*$",
-    r"^age$",
-    r"^allow$",
-    r"^Cache-control$",
-    r"^Client-.*$",
-    r"^Connection$",
-    r"^Content-.*$",
-    r"^Cross-Origin-Resource-Policy$",
-    r"^Date$",
-    r"^Etag$",
-    r"^Expires$",
-    r"^Keep-Alive$",
-    r"^Last-Modified$",
-    r"^Link$",
-    r"^Location$",
-    r"^P3P$",
-    r"^Pragma$",
-    r"^Proxy-.*$",
-    r"^Refresh$",
-    r"^Retry-After$",
-    r"^Referrer-Policy$",
-    r"^Set-Cookie$",
-    r"^Server-Timing$",
-    r"^Status$",
-    r"^Strict-Transport-Security$",
-    r"^Timing-Allow-Origin$",
-    r"^Trailer$",
-    r"^Transfer-Encoding$",
-    r"^Upgrade$",
-    r"^Vary$",
-    r"^Warning^$",
-    r"^WWW-Authenticate$",
-    r"^X-Content-Type-Options$",
-    r"^X-Download-Options$",
-    r"^X-Frame-Options$",
-    r"^X-Microsite$",
-    r"^X-Request-Handler-Origin-Region$",
-    r"^X-XSS-Protection$",
-]
-
-COMMON_RESPONSE_HEADERS_REGEX = re.compile(
-    "({})".format("|".join(COMMON_RESPONSE_HEADERS_REGEX_LIST)), re.IGNORECASE
+from collections.abc import Mapping
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AnyStr,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+    cast,
 )
 
-COMMON_REQ_HEADERS_REGEX_LIST = [
-    r"A-IM$",
-    r"Accept$",
-    r"Accept-.*$",
-    r"Access-Control-.*$",
-    r"Authorization$",
-    r"Cache-Control$",
-    r"Connection$",
-    r"Content-.*$",
-    r"Cookie$",
-    r"Date$",
-    r"Expect$",
-    r"Forwarded$",
-    r"From$",
-    r"Host$",
-    r"If-.*$",
-    r"Max-Forwards$",
-    r"Origin$",
-    r"Pragma$",
-    r"Proxy-Authorization$",
-    r"Range$",
-    r"Referer$",
-    r"TE$",
-    r"User-Agent$",
-    r"Upgrade$",
-    r"Upgrade-Insecure-Requests$",
-    r"Via$",
-    r"Warning$",
-    r"X-Requested-With$",
-    r"X-HTTP-Method-Override$",
-    r"X-Requested-With$",
-]
+from w3lib.http import headers_dict_to_raw
 
-COMMON_REQ_HEADERS_REGEX = re.compile(
-    "({})".format("|".join(COMMON_REQ_HEADERS_REGEX_LIST)), re.IGNORECASE
-)
+from scrapy.utils.datatypes import CaseInsensitiveDict, CaselessDict
+from scrapy.utils.python import to_unicode
+
+if TYPE_CHECKING:
+    # typing.Self requires Python 3.11
+    from typing_extensions import Self
 
 
-@moduleman_plugin
-class headers(BasePlugin):
-    name = "headers"
-    author = ("Xavi Mendez (@xmendez)",)
-    version = "0.1"
-    summary = "Looks for HTTP headers."
-    description = (
-        "Looks for NEW HTTP headers:",
-        "\t- Response HTTP headers associated to web servers.",
-        "\t- Uncommon response HTTP headers.",
-        "\t- Uncommon request HTTP headers.",
-        "It is worth noting that, only the FIRST match of the above headers is registered.",
-    )
-    category = ["info", "passive", "default"]
-    priority = 99
-    parameters = ()
+_RawValueT = Union[bytes, str, int]
 
-    def __init__(self):
-        BasePlugin.__init__(self)
 
-    def validate(self, fuzzresult):
-        return True
+# isn't fully compatible typing-wise with either dict or CaselessDict,
+# but it needs refactoring anyway, see also https://github.com/scrapy/scrapy/pull/5146
+class Headers(CaselessDict):
+    """Case insensitive http headers dictionary"""
 
-    def check_request_header(self, fuzzresult, header, value):
-        header_value = None
-        if not COMMON_REQ_HEADERS_REGEX.match(header):
-            header_value = header
+    def __init__(
+        self,
+        seq: Union[Mapping[AnyStr, Any], Iterable[Tuple[AnyStr, Any]], None] = None,
+        encoding: str = "utf-8",
+    ):
+        self.encoding: str = encoding
+        super().__init__(seq)
 
-        if header_value is not None:
-            if (
-                header_value.lower() not in self.kbase[KBASE_KEY_REQ_UNCOMMON]
-                or KBASE_KEY_REQ_UNCOMMON not in self.kbase
-            ):
-                self.add_result(
-                    "reqheader",
-                    "New uncommon HTTP request header",
-                    "{}: {}".format(header_value, value),
-                )
+    def update(  # type: ignore[override]
+        self, seq: Union[Mapping[AnyStr, Any], Iterable[Tuple[AnyStr, Any]]]
+    ) -> None:
+        seq = seq.items() if isinstance(seq, Mapping) else seq
+        iseq: Dict[bytes, List[bytes]] = {}
+        for k, v in seq:
+            iseq.setdefault(self.normkey(k), []).extend(self.normvalue(v))
+        super().update(iseq)
 
-                self.kbase[KBASE_KEY_REQ_UNCOMMON].append(header_value.lower())
+    def normkey(self, key: AnyStr) -> bytes:  # type: ignore[override]
+        """Normalize key to bytes"""
+        return self._tobytes(key.title())
 
-    def check_response_header(self, fuzzresult, header, value):
-        header_value = None
-        if not COMMON_RESPONSE_HEADERS_REGEX.match(header):
-            header_value = header
+    def normvalue(self, value: Union[_RawValueT, Iterable[_RawValueT]]) -> List[bytes]:
+        """Normalize values to bytes"""
+        _value: Iterable[_RawValueT]
+        if value is None:
+            _value = []
+        elif isinstance(value, (str, bytes)):
+            _value = [value]
+        elif hasattr(value, "__iter__"):
+            _value = value
+        else:
+            _value = [value]
 
-        if header_value is not None:
-            if (
-                header_value.lower() not in self.kbase[KBASE_KEY_RESP_UNCOMMON]
-                or KBASE_KEY_RESP_UNCOMMON not in self.kbase
-            ):
-                self.add_result(
-                    "header",
-                    "New uncommon HTTP response header",
-                    "{}: {}".format(
-                        header_value, fuzzresult.history.headers.response[header_value],
-                    ),
-                )
+        return [self._tobytes(x) for x in _value]
 
-                self.kbase[KBASE_KEY_RESP_UNCOMMON].append(header_value.lower())
+    def _tobytes(self, x: _RawValueT) -> bytes:
+        if isinstance(x, bytes):
+            return x
+        if isinstance(x, str):
+            return x.encode(self.encoding)
+        if isinstance(x, int):
+            return str(x).encode(self.encoding)
+        raise TypeError(f"Unsupported value type: {type(x)}")
 
-    def check_server_header(self, fuzzresult, header, value):
-        if header.lower() in SERVER_HEADERS:
-            if (
-                value.lower() not in self.kbase[KBASE_KEY]
-                or KBASE_KEY not in self.kbase
-            ):
-                self.add_result(
-                    "server", "New server HTTP response header", "{}".format(value),
-                )
+    def __getitem__(self, key: AnyStr) -> Optional[bytes]:
+        try:
+            return cast(List[bytes], super().__getitem__(key))[-1]
+        except IndexError:
+            return None
 
-                self.kbase[KBASE_KEY].append(value.lower())
+    def get(self, key: AnyStr, def_val: Any = None) -> Optional[bytes]:
+        try:
+            return cast(List[bytes], super().get(key, def_val))[-1]
+        except IndexError:
+            return None
 
-    def process(self, fuzzresult):
-        for header, value in fuzzresult.history.headers.request.items():
-            self.check_request_header(fuzzresult, header, value)
+    def getlist(self, key: AnyStr, def_val: Any = None) -> List[bytes]:
+        try:
+            return cast(List[bytes], super().__getitem__(key))
+        except KeyError:
+            if def_val is not None:
+                return self.normvalue(def_val)
+            return []
 
-        for header, value in fuzzresult.history.headers.response.items():
-            self.check_response_header(fuzzresult, header, value)
-            self.check_server_header(fuzzresult, header, value)
+    def setlist(self, key: AnyStr, list_: Iterable[_RawValueT]) -> None:
+        self[key] = list_
+
+    def setlistdefault(
+        self, key: AnyStr, default_list: Iterable[_RawValueT] = ()
+    ) -> Any:
+        return self.setdefault(key, default_list)
+
+    def appendlist(self, key: AnyStr, value: Iterable[_RawValueT]) -> None:
+        lst = self.getlist(key)
+        lst.extend(self.normvalue(value))
+        self[key] = lst
+
+    def items(self) -> Iterable[Tuple[bytes, List[bytes]]]:  # type: ignore[override]
+        return ((k, self.getlist(k)) for k in self.keys())
+
+    def values(self) -> List[Optional[bytes]]:  # type: ignore[override]
+        return [self[k] for k in self.keys()]
+
+    def to_string(self) -> bytes:
+        # cast() can be removed if the headers_dict_to_raw() hint is improved
+        return cast(bytes, headers_dict_to_raw(self))
+
+    def to_unicode_dict(self) -> CaseInsensitiveDict:
+        """Return headers as a CaseInsensitiveDict with str keys
+        and str values. Multiple values are joined with ','.
+        """
+        return CaseInsensitiveDict(
+            (
+                to_unicode(key, encoding=self.encoding),
+                to_unicode(b",".join(value), encoding=self.encoding),
+            )
+            for key, value in self.items()
+        )
+
+    def __copy__(self) -> Self:
+        return self.__class__(self)
+
+    copy = __copy__

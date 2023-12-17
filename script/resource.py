@@ -1,87 +1,85 @@
 # -*- coding: utf-8 -*-
 """
-oauthlib.oauth2.rfc6749
-~~~~~~~~~~~~~~~~~~~~~~~
+    pygments.lexers.resource
+    ~~~~~~~~~~~~~~~~~~~~~~~~
 
-This module is an implementation of various logic needed
-for consuming and providing OAuth 2.0 RFC6749.
+    Lexer for resource definition files.
+
+    :copyright: Copyright 2006-2019 by the Pygments team, see AUTHORS.
+    :license: BSD, see LICENSE for details.
 """
-from __future__ import absolute_import, unicode_literals
 
-import logging
+import re
 
-from oauthlib.common import Request
+from pygments.lexer import RegexLexer, bygroups, words
+from pygments.token import Comment, String, Number, Operator, Text, \
+    Keyword, Name
 
-from .base import BaseEndpoint, catch_errors_and_unavailability
-
-log = logging.getLogger(__name__)
+__all__ = ['ResourceLexer']
 
 
-class ResourceEndpoint(BaseEndpoint):
+class ResourceLexer(RegexLexer):
+    """Lexer for `ICU Resource bundles
+    <http://userguide.icu-project.org/locale/resources>`_.
 
-    """Authorizes access to protected resources.
-
-    The client accesses protected resources by presenting the access
-    token to the resource server.  The resource server MUST validate the
-    access token and ensure that it has not expired and that its scope
-    covers the requested resource.  The methods used by the resource
-    server to validate the access token (as well as any error responses)
-    are beyond the scope of this specification but generally involve an
-    interaction or coordination between the resource server and the
-    authorization server::
-
-        # For most cases, returning a 403 should suffice.
-
-    The method in which the client utilizes the access token to
-    authenticate with the resource server depends on the type of access
-    token issued by the authorization server.  Typically, it involves
-    using the HTTP "Authorization" request header field [RFC2617] with an
-    authentication scheme defined by the specification of the access
-    token type used, such as [RFC6750]::
-
-        # Access tokens may also be provided in query and body
-        https://example.com/protected?access_token=kjfch2345sdf   # Query
-        access_token=sdf23409df   # Body
+    .. versionadded:: 2.0
     """
+    name = 'ResourceBundle'
+    aliases = ['resource', 'resourcebundle']
+    filenames = []
 
-    def __init__(self, default_token, token_types):
-        BaseEndpoint.__init__(self)
-        self._tokens = token_types
-        self._default_token = default_token
+    _types = (':table', ':array', ':string', ':bin', ':import', ':intvector',
+              ':int', ':alias')
 
-    @property
-    def default_token(self):
-        return self._default_token
+    flags = re.MULTILINE | re.IGNORECASE
+    tokens = {
+        'root': [
+            (r'//.*?$', Comment),
+            (r'"', String, 'string'),
+            (r'-?\d+', Number.Integer),
+            (r'[,{}]', Operator),
+            (r'([^\s{:]+)(\s*)(%s?)' % '|'.join(_types),
+             bygroups(Name, Text, Keyword)),
+            (r'\s+', Text),
+            (words(_types), Keyword),
+        ],
+        'string': [
+            (r'(\\x[0-9a-f]{2}|\\u[0-9a-f]{4}|\\U00[0-9a-f]{6}|'
+             r'\\[0-7]{1,3}|\\c.|\\[abtnvfre\'"?\\]|\\\{|[^"{\\])+', String),
+            (r'\{', String.Escape, 'msgname'),
+            (r'"', String, '#pop')
+        ],
+        'msgname': [
+            (r'([^{},]+)(\s*)', bygroups(Name, String.Escape), ('#pop', 'message'))
+        ],
+        'message': [
+            (r'\{', String.Escape, 'msgname'),
+            (r'\}', String.Escape, '#pop'),
+            (r'(,)(\s*)([a-z]+)(\s*\})',
+             bygroups(Operator, String.Escape, Keyword, String.Escape), '#pop'),
+            (r'(,)(\s*)([a-z]+)(\s*)(,)(\s*)(offset)(\s*)(:)(\s*)(-?\d+)(\s*)',
+             bygroups(Operator, String.Escape, Keyword, String.Escape, Operator,
+                      String.Escape, Operator.Word, String.Escape, Operator,
+                      String.Escape, Number.Integer, String.Escape), 'choice'),
+            (r'(,)(\s*)([a-z]+)(\s*)(,)(\s*)',
+             bygroups(Operator, String.Escape, Keyword, String.Escape, Operator,
+                      String.Escape), 'choice'),
+            (r'\s+', String.Escape)
+        ],
+        'choice': [
+            (r'(=|<|>|<=|>=|!=)(-?\d+)(\s*\{)',
+             bygroups(Operator, Number.Integer, String.Escape), 'message'),
+            (r'([a-z]+)(\s*\{)', bygroups(Keyword.Type, String.Escape), 'str'),
+            (r'\}', String.Escape, ('#pop', '#pop')),
+            (r'\s+', String.Escape)
+        ],
+        'str': [
+            (r'\}', String.Escape, '#pop'),
+            (r'\{', String.Escape, 'msgname'),
+            (r'[^{}]+', String)
+        ]
+    }
 
-    @property
-    def default_token_type_handler(self):
-        return self.tokens.get(self.default_token)
-
-    @property
-    def tokens(self):
-        return self._tokens
-
-    @catch_errors_and_unavailability
-    def verify_request(self, uri, http_method='GET', body=None, headers=None,
-                       scopes=None):
-        """Validate client, code etc, return body + headers"""
-        request = Request(uri, http_method, body, headers)
-        request.token_type = self.find_token_type(request)
-        request.scopes = scopes
-        token_type_handler = self.tokens.get(request.token_type,
-                                             self.default_token_type_handler)
-        log.debug('Dispatching token_type %s request to %r.',
-                  request.token_type, token_type_handler)
-        return token_type_handler.validate_request(request), request
-
-    def find_token_type(self, request):
-        """Token type identification.
-
-        RFC 6749 does not provide a method for easily differentiating between
-        different token types during protected resource access. We estimate
-        the most likely token type (if any) by asking each known token type
-        to give an estimation based on the request.
-        """
-        estimates = sorted(((t.estimate_type(request), n)
-                            for n, t in self.tokens.items()))
-        return estimates[0][1] if len(estimates) else None
+    def analyse_text(text):
+        if text.startswith('root:table'):
+            return 1.0

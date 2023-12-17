@@ -1,261 +1,210 @@
-from __future__ import absolute_import
+# YOLOv5 🚀 by Ultralytics, AGPL-3.0 license
+"""
+Model validation metrics
+"""
 
-import logging
-import sys
-import time
-import threading
+import numpy as np
 
-from kafka.metrics import AnonMeasurable, KafkaMetric, MetricConfig, MetricName
-from kafka.metrics.stats import Sensor
-
-logger = logging.getLogger(__name__)
+from ..metrics import ap_per_class
 
 
-class Metrics(object):
+def fitness(x):
+    # Model fitness as a weighted combination of metrics
+    w = [0.0, 0.0, 0.1, 0.9, 0.0, 0.0, 0.1, 0.9]
+    return (x[:, :8] * w).sum(1)
+
+
+def ap_per_class_box_and_mask(
+        tp_m,
+        tp_b,
+        conf,
+        pred_cls,
+        target_cls,
+        plot=False,
+        save_dir='.',
+        names=(),
+):
     """
-    A registry of sensors and metrics.
-
-    A metric is a named, numerical measurement. A sensor is a handle to
-    record numerical measurements as they occur. Each Sensor has zero or
-    more associated metrics. For example a Sensor might represent message
-    sizes and we might associate with this sensor a metric for the average,
-    maximum, or other statistics computed off the sequence of message sizes
-    that are recorded by the sensor.
-
-    Usage looks something like this:
-        # set up metrics:
-        metrics = Metrics() # the global repository of metrics and sensors
-        sensor = metrics.sensor('message-sizes')
-        metric_name = MetricName('message-size-avg', 'producer-metrics')
-        sensor.add(metric_name, Avg())
-        metric_name = MetricName('message-size-max', 'producer-metrics')
-        sensor.add(metric_name, Max())
-
-        # as messages are sent we record the sizes
-        sensor.record(message_size);
+    Args:
+        tp_b: tp of boxes.
+        tp_m: tp of masks.
+        other arguments see `func: ap_per_class`.
     """
-    def __init__(self, default_config=None, reporters=None,
-                 enable_expiration=False):
-        """
-        Create a metrics repository with a default config, given metric
-        reporters and the ability to expire eligible sensors
+    results_boxes = ap_per_class(tp_b,
+                                 conf,
+                                 pred_cls,
+                                 target_cls,
+                                 plot=plot,
+                                 save_dir=save_dir,
+                                 names=names,
+                                 prefix='Box')[2:]
+    results_masks = ap_per_class(tp_m,
+                                 conf,
+                                 pred_cls,
+                                 target_cls,
+                                 plot=plot,
+                                 save_dir=save_dir,
+                                 names=names,
+                                 prefix='Mask')[2:]
 
-        Arguments:
-            default_config (MetricConfig, optional): The default config
-            reporters (list of AbstractMetricsReporter, optional):
-                The metrics reporters
-            enable_expiration (bool, optional): true if the metrics instance
-                can garbage collect inactive sensors, false otherwise
-        """
-        self._lock = threading.RLock()
-        self._config = default_config or MetricConfig()
-        self._sensors = {}
-        self._metrics = {}
-        self._children_sensors = {}
-        self._reporters = reporters or []
-        for reporter in self._reporters:
-            reporter.init([])
+    results = {
+        'boxes': {
+            'p': results_boxes[0],
+            'r': results_boxes[1],
+            'ap': results_boxes[3],
+            'f1': results_boxes[2],
+            'ap_class': results_boxes[4]},
+        'masks': {
+            'p': results_masks[0],
+            'r': results_masks[1],
+            'ap': results_masks[3],
+            'f1': results_masks[2],
+            'ap_class': results_masks[4]}}
+    return results
 
-        if enable_expiration:
-            def expire_loop():
-                while True:
-                    # delay 30 seconds
-                    time.sleep(30)
-                    self.ExpireSensorTask.run(self)
-            metrics_scheduler = threading.Thread(target=expire_loop)
-            # Creating a daemon thread to not block shutdown
-            metrics_scheduler.daemon = True
-            metrics_scheduler.start()
 
-        self.add_metric(self.metric_name('count', 'kafka-metrics-count',
-                                         'total number of registered metrics'),
-                        AnonMeasurable(lambda config, now: len(self._metrics)))
+class Metric:
+
+    def __init__(self) -> None:
+        self.p = []  # (nc, )
+        self.r = []  # (nc, )
+        self.f1 = []  # (nc, )
+        self.all_ap = []  # (nc, 10)
+        self.ap_class_index = []  # (nc, )
 
     @property
-    def config(self):
-        return self._config
+    def ap50(self):
+        """AP@0.5 of all classes.
+        Return:
+            (nc, ) or [].
+        """
+        return self.all_ap[:, 0] if len(self.all_ap) else []
 
     @property
-    def metrics(self):
+    def ap(self):
+        """AP@0.5:0.95
+        Return:
+            (nc, ) or [].
         """
-        Get all the metrics currently maintained and indexed by metricName
+        return self.all_ap.mean(1) if len(self.all_ap) else []
+
+    @property
+    def mp(self):
+        """mean precision of all classes.
+        Return:
+            float.
         """
-        return self._metrics
+        return self.p.mean() if len(self.p) else 0.0
 
-    def metric_name(self, name, group, description='', tags=None):
+    @property
+    def mr(self):
+        """mean recall of all classes.
+        Return:
+            float.
         """
-        Create a MetricName with the given name, group, description and tags,
-        plus default tags specified in the metric configuration.
-        Tag in tags takes precedence if the same tag key is specified in
-        the default metric configuration.
+        return self.r.mean() if len(self.r) else 0.0
 
-        Arguments:
-            name (str): The name of the metric
-            group (str): logical group name of the metrics to which this
-                metric belongs
-            description (str, optional): A human-readable description to
-                include in the metric
-            tags (dict, optionals): additional key/value attributes of
-                the metric
+    @property
+    def map50(self):
+        """Mean AP@0.5 of all classes.
+        Return:
+            float.
         """
-        combined_tags = dict(self.config.tags)
-        combined_tags.update(tags or {})
-        return MetricName(name, group, description, combined_tags)
+        return self.all_ap[:, 0].mean() if len(self.all_ap) else 0.0
 
-    def get_sensor(self, name):
+    @property
+    def map(self):
+        """Mean AP@0.5:0.95 of all classes.
+        Return:
+            float.
         """
-        Get the sensor with the given name if it exists
+        return self.all_ap.mean() if len(self.all_ap) else 0.0
 
-        Arguments:
-            name (str): The name of the sensor
+    def mean_results(self):
+        """Mean of results, return mp, mr, map50, map"""
+        return (self.mp, self.mr, self.map50, self.map)
 
-        Returns:
-            Sensor: The sensor or None if no such sensor exists
+    def class_result(self, i):
+        """class-aware result, return p[i], r[i], ap50[i], ap[i]"""
+        return (self.p[i], self.r[i], self.ap50[i], self.ap[i])
+
+    def get_maps(self, nc):
+        maps = np.zeros(nc) + self.map
+        for i, c in enumerate(self.ap_class_index):
+            maps[c] = self.ap[i]
+        return maps
+
+    def update(self, results):
         """
-        if not name:
-            raise ValueError('name must be non-empty')
-        return self._sensors.get(name, None)
-
-    def sensor(self, name, config=None,
-               inactive_sensor_expiration_time_seconds=sys.maxsize,
-               parents=None):
+        Args:
+            results: tuple(p, r, ap, f1, ap_class)
         """
-        Get or create a sensor with the given unique name and zero or
-        more parent sensors. All parent sensors will receive every value
-        recorded with this sensor.
+        p, r, all_ap, f1, ap_class_index = results
+        self.p = p
+        self.r = r
+        self.all_ap = all_ap
+        self.f1 = f1
+        self.ap_class_index = ap_class_index
 
-        Arguments:
-            name (str): The name of the sensor
-            config (MetricConfig, optional): A default configuration to use
-                for this sensor for metrics that don't have their own config
-            inactive_sensor_expiration_time_seconds (int, optional):
-                If no value if recorded on the Sensor for this duration of
-                time, it is eligible for removal
-            parents (list of Sensor): The parent sensors
 
-        Returns:
-            Sensor: The sensor that is created
+class Metrics:
+    """Metric for boxes and masks."""
+
+    def __init__(self) -> None:
+        self.metric_box = Metric()
+        self.metric_mask = Metric()
+
+    def update(self, results):
         """
-        sensor = self.get_sensor(name)
-        if sensor:
-            return sensor
-
-        with self._lock:
-            sensor = self.get_sensor(name)
-            if not sensor:
-                sensor = Sensor(self, name, parents, config or self.config,
-                                inactive_sensor_expiration_time_seconds)
-                self._sensors[name] = sensor
-                if parents:
-                    for parent in parents:
-                        children = self._children_sensors.get(parent)
-                        if not children:
-                            children = []
-                            self._children_sensors[parent] = children
-                        children.append(sensor)
-                logger.debug('Added sensor with name %s', name)
-            return sensor
-
-    def remove_sensor(self, name):
+        Args:
+            results: Dict{'boxes': Dict{}, 'masks': Dict{}}
         """
-        Remove a sensor (if it exists), associated metrics and its children.
+        self.metric_box.update(list(results['boxes'].values()))
+        self.metric_mask.update(list(results['masks'].values()))
 
-        Arguments:
-            name (str): The name of the sensor to be removed
-        """
-        sensor = self._sensors.get(name)
-        if sensor:
-            child_sensors = None
-            with sensor._lock:
-                with self._lock:
-                    val = self._sensors.pop(name, None)
-                    if val and val == sensor:
-                        for metric in sensor.metrics:
-                            self.remove_metric(metric.metric_name)
-                        logger.debug('Removed sensor with name %s', name)
-                        child_sensors = self._children_sensors.pop(sensor, None)
-            if child_sensors:
-                for child_sensor in child_sensors:
-                    self.remove_sensor(child_sensor.name)
+    def mean_results(self):
+        return self.metric_box.mean_results() + self.metric_mask.mean_results()
 
-    def add_metric(self, metric_name, measurable, config=None):
-        """
-        Add a metric to monitor an object that implements measurable.
-        This metric won't be associated with any sensor.
-        This is a way to expose existing values as metrics.
+    def class_result(self, i):
+        return self.metric_box.class_result(i) + self.metric_mask.class_result(i)
 
-        Arguments:
-            metricName (MetricName): The name of the metric
-            measurable (AbstractMeasurable): The measurable that will be
-                measured by this metric
-            config (MetricConfig, optional): The configuration to use when
-                measuring this measurable
-        """
-        # NOTE there was a lock here, but i don't think it's needed
-        metric = KafkaMetric(metric_name, measurable, config or self.config)
-        self.register_metric(metric)
+    def get_maps(self, nc):
+        return self.metric_box.get_maps(nc) + self.metric_mask.get_maps(nc)
 
-    def remove_metric(self, metric_name):
-        """
-        Remove a metric if it exists and return it. Return None otherwise.
-        If a metric is removed, `metric_removal` will be invoked
-        for each reporter.
+    @property
+    def ap_class_index(self):
+        # boxes and masks have the same ap_class_index
+        return self.metric_box.ap_class_index
 
-        Arguments:
-            metric_name (MetricName): The name of the metric
 
-        Returns:
-            KafkaMetric: the removed `KafkaMetric` or None if no such
-                metric exists
-        """
-        with self._lock:
-            metric = self._metrics.pop(metric_name, None)
-            if metric:
-                for reporter in self._reporters:
-                    reporter.metric_removal(metric)
-            return metric
+KEYS = [
+    'train/box_loss',
+    'train/seg_loss',  # train loss
+    'train/obj_loss',
+    'train/cls_loss',
+    'metrics/precision(B)',
+    'metrics/recall(B)',
+    'metrics/mAP_0.5(B)',
+    'metrics/mAP_0.5:0.95(B)',  # metrics
+    'metrics/precision(M)',
+    'metrics/recall(M)',
+    'metrics/mAP_0.5(M)',
+    'metrics/mAP_0.5:0.95(M)',  # metrics
+    'val/box_loss',
+    'val/seg_loss',  # val loss
+    'val/obj_loss',
+    'val/cls_loss',
+    'x/lr0',
+    'x/lr1',
+    'x/lr2', ]
 
-    def add_reporter(self, reporter):
-        """Add a MetricReporter"""
-        with self._lock:
-            reporter.init(list(self.metrics.values()))
-            self._reporters.append(reporter)
-
-    def register_metric(self, metric):
-        with self._lock:
-            if metric.metric_name in self.metrics:
-                raise ValueError('A metric named "%s" already exists, cannot'
-                                 ' register another one.' % (metric.metric_name,))
-            self.metrics[metric.metric_name] = metric
-            for reporter in self._reporters:
-                reporter.metric_change(metric)
-
-    class ExpireSensorTask(object):
-        """
-        This iterates over every Sensor and triggers a remove_sensor
-        if it has expired. Package private for testing
-        """
-        @staticmethod
-        def run(metrics):
-            items = list(metrics._sensors.items())
-            for name, sensor in items:
-                # remove_sensor also locks the sensor object. This is fine
-                # because synchronized is reentrant. There is however a minor
-                # race condition here. Assume we have a parent sensor P and
-                # child sensor C. Calling record on C would cause a record on
-                # P as well. So expiration time for P == expiration time for C.
-                # If the record on P happens via C just after P is removed,
-                # that will cause C to also get removed. Since the expiration
-                # time is typically high it is not expected to be a significant
-                # concern and thus not necessary to optimize
-                with sensor._lock:
-                    if sensor.has_expired():
-                        logger.debug('Removing expired sensor %s', name)
-                        metrics.remove_sensor(name)
-
-    def close(self):
-        """Close this metrics repository."""
-        for reporter in self._reporters:
-            reporter.close()
-
-        self._metrics.clear()
+BEST_KEYS = [
+    'best/epoch',
+    'best/precision(B)',
+    'best/recall(B)',
+    'best/mAP_0.5(B)',
+    'best/mAP_0.5:0.95(B)',
+    'best/precision(M)',
+    'best/recall(M)',
+    'best/mAP_0.5(M)',
+    'best/mAP_0.5:0.95(M)', ]

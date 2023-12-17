@@ -1,138 +1,134 @@
-import re
+from unittest import mock
 
-from django.conf import settings
-from django.views.decorators.csrf import csrf_exempt
-
-from ninja import NinjaAPI
-from ninja.security import APIKeyCookie, APIKeyHeader
-from ninja.testing import TestClient as BaseTestClient
+from django.template import TemplateDoesNotExist
+from django.test import Client, RequestFactory, SimpleTestCase, override_settings
+from django.utils.translation import override
+from django.views.csrf import CSRF_FAILURE_TEMPLATE_NAME, csrf_failure
 
 
-class TestClient(BaseTestClient):
-    def _build_request(self, *args, **kwargs):
-        request = super()._build_request(*args, **kwargs)
-        request._dont_enforce_csrf_checks = False
-        return request
+@override_settings(ROOT_URLCONF="view_tests.urls")
+class CsrfViewTests(SimpleTestCase):
+    def setUp(self):
+        super().setUp()
+        self.client = Client(enforce_csrf_checks=True)
 
-
-csrf_OFF = NinjaAPI(urls_namespace="csrf_OFF")
-csrf_ON = NinjaAPI(urls_namespace="csrf_ON", csrf=True)
-
-
-@csrf_OFF.post("/post")
-def post_off(request):
-    return {"success": True}
-
-
-@csrf_ON.post("/post")
-def post_on(request):
-    return {"success": True}
-
-
-@csrf_ON.post("/post/csrf_exempt")
-@csrf_exempt
-def post_on_with_exempt(request):
-    return {"success": True}
-
-
-TOKEN = "1bcdefghij2bcdefghij3bcdefghij4bcdefghij5bcdefghij6bcdefghijABCD"
-COOKIES = {settings.CSRF_COOKIE_NAME: TOKEN}
-
-
-def test_csrf_off():
-    client = TestClient(csrf_OFF)
-    assert client.post("/post", COOKIES=COOKIES).status_code == 200
-
-
-def test_csrf_on():
-    client = TestClient(csrf_ON)
-
-    assert client.post("/post", COOKIES=COOKIES).status_code == 403
-
-    # check with token in formdata
-    response = client.post("/post", {"csrfmiddlewaretoken": TOKEN}, COOKIES=COOKIES)
-    assert response.status_code == 200
-
-    # check with headers
-    response = client.post("/post", COOKIES=COOKIES, headers={"X-CSRFTOKEN": TOKEN})
-    assert response.status_code == 200
-
-    # exempt check
-    assert client.post("/post/csrf_exempt", COOKIES=COOKIES).status_code == 200
-
-
-def test_csrf_cookie_auth():
-    "Cookie based authtentication should have csrf check by default"
-
-    class CookieAuth(APIKeyCookie):
-        def authenticate(self, request, key):
-            return key == "test"
-
-    cookie_auth = CookieAuth()
-    api = NinjaAPI(auth=cookie_auth)
-
-    @api.post("/test")
-    def test_view(request):
-        return {"success": True}
-
-    client = TestClient(api)
-
-    # No auth - access denied
-    assert client.post("/test").status_code == 403
-
-    # Cookie auth + valid csrf
-    cookies = {"key": "test"}
-    cookies.update(COOKIES)
-    response = client.post("/test", COOKIES=cookies, headers={"X-CSRFTOKEN": TOKEN})
-    assert response.status_code == 200, response.content
-
-    # Cookie auth + INVALID csrf
-    response = client.post(
-        "/test", COOKIES=cookies, headers={"X-CSRFTOKEN": TOKEN + "invalid"}
+    @override_settings(
+        USE_I18N=True,
+        MIDDLEWARE=[
+            "django.middleware.locale.LocaleMiddleware",
+            "django.middleware.common.CommonMiddleware",
+            "django.middleware.csrf.CsrfViewMiddleware",
+        ],
     )
-    assert response.status_code == 403, response.content
+    def test_translation(self):
+        """An invalid request is rejected with a localized error message."""
+        response = self.client.post("/")
+        self.assertContains(response, "Forbidden", status_code=403)
+        self.assertContains(
+            response, "CSRF verification failed. Request aborted.", status_code=403
+        )
 
-    # Turning off csrf on cookie, valid key, no csrf passed
-    cookie_auth.csrf = False
-    response = client.post("/test", COOKIES={"key": "test"})
-    assert response.status_code == 200, response.content
+        with self.settings(LANGUAGE_CODE="nl"), override("en-us"):
+            response = self.client.post("/")
+            self.assertContains(response, "Verboden", status_code=403)
+            self.assertContains(
+                response,
+                "CSRF-verificatie mislukt. Verzoek afgebroken.",
+                status_code=403,
+            )
 
+    @override_settings(SECURE_PROXY_SSL_HEADER=("HTTP_X_FORWARDED_PROTO", "https"))
+    def test_no_referer(self):
+        """
+        Referer header is strictly checked for POST over HTTPS. Trigger the
+        exception by sending an incorrect referer.
+        """
+        response = self.client.post("/", headers={"x-forwarded-proto": "https"})
+        self.assertContains(
+            response,
+            "You are seeing this message because this HTTPS site requires a "
+            "“Referer header” to be sent by your web browser, but "
+            "none was sent.",
+            status_code=403,
+        )
+        self.assertContains(
+            response,
+            "If you have configured your browser to disable “Referer” "
+            "headers, please re-enable them, at least for this site, or for "
+            "HTTPS connections, or for “same-origin” requests.",
+            status_code=403,
+        )
+        self.assertContains(
+            response,
+            "If you are using the &lt;meta name=&quot;referrer&quot; "
+            "content=&quot;no-referrer&quot;&gt; tag or including the "
+            "“Referrer-Policy: no-referrer” header, please remove them.",
+            status_code=403,
+        )
 
-def test_docs():
-    "Testing that docs are initializing csrf headers correctly"
+    def test_no_cookies(self):
+        """
+        The CSRF cookie is checked for POST. Failure to send this cookie should
+        provide a nice error message.
+        """
+        response = self.client.post("/")
+        self.assertContains(
+            response,
+            "You are seeing this message because this site requires a CSRF "
+            "cookie when submitting forms. This cookie is required for "
+            "security reasons, to ensure that your browser is not being "
+            "hijacked by third parties.",
+            status_code=403,
+        )
 
-    api = NinjaAPI(csrf=True)
+    @override_settings(TEMPLATES=[])
+    def test_no_django_template_engine(self):
+        """
+        The CSRF view doesn't depend on the TEMPLATES configuration (#24388).
+        """
+        response = self.client.post("/")
+        self.assertContains(response, "Forbidden", status_code=403)
 
-    client = TestClient(api)
-    resp = client.get("/docs")
-    assert resp.status_code == 200
-    csrf_token = re.findall(r'data-csrf-token="(.*?)"', resp.content.decode("utf8"))[0]
-    assert len(csrf_token) > 0
+    @override_settings(
+        TEMPLATES=[
+            {
+                "BACKEND": "django.template.backends.django.DjangoTemplates",
+                "OPTIONS": {
+                    "loaders": [
+                        (
+                            "django.template.loaders.locmem.Loader",
+                            {
+                                CSRF_FAILURE_TEMPLATE_NAME: (
+                                    "Test template for CSRF failure"
+                                )
+                            },
+                        ),
+                    ],
+                },
+            }
+        ]
+    )
+    def test_custom_template(self):
+        """A custom CSRF_FAILURE_TEMPLATE_NAME is used."""
+        response = self.client.post("/")
+        self.assertContains(response, "Test template for CSRF failure", status_code=403)
+        self.assertIs(response.wsgi_request, response.context.request)
 
-    api.csrf = False
-    resp = client.get("/docs")
-    assert resp.status_code == 200
-    csrf_token = re.findall(r'data-csrf-token="(.*?)"', resp.content.decode("utf8"))[0]
-    assert len(csrf_token) == 0
+    def test_custom_template_does_not_exist(self):
+        """An exception is raised if a nonexistent template is supplied."""
+        factory = RequestFactory()
+        request = factory.post("/")
+        with self.assertRaises(TemplateDoesNotExist):
+            csrf_failure(request, template_name="nonexistent.html")
 
+    def test_template_encoding(self):
+        """
+        The template is loaded directly, not via a template loader, and should
+        be opened as utf-8 charset as is the default specified on template
+        engines.
+        """
+        from django.views.csrf import Path
 
-def test_docs_cookie_auth():
-    class CookieAuth(APIKeyCookie):
-        def authenticate(self, request, key):
-            return key == "test"
-
-    class HeaderAuth(APIKeyHeader):
-        def authenticate(self, request, key):
-            return key == "test"
-
-    api = NinjaAPI(csrf=False, auth=CookieAuth())
-    client = TestClient(api)
-    resp = client.get("/docs")
-    csrf_token = re.findall(r'data-csrf-token="(.*?)"', resp.content.decode("utf8"))[0]
-    assert len(csrf_token) > 0
-
-    api = NinjaAPI(csrf=False, auth=HeaderAuth())
-    client = TestClient(api)
-    resp = client.get("/docs")
-    csrf_token = re.findall(r'data-csrf-token="(.*?)"', resp.content.decode("utf8"))[0]
-    assert len(csrf_token) == 0
+        with mock.patch.object(Path, "open") as m:
+            csrf_failure(mock.MagicMock(), mock.Mock())
+            m.assert_called_once_with(encoding="utf-8")

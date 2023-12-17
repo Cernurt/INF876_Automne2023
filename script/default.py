@@ -1,167 +1,73 @@
-import asyncio
-import os
-from typing import Dict, List
+# -*- coding: utf-8 -*-
+"""
+    pygments.styles.default
+    ~~~~~~~~~~~~~~~~~~~~~~~
 
-from ...llm.base import LLM
-from ..chunkers.chunk import Chunk
+    The default highlighting style.
+
+    :copyright: Copyright 2006-2019 by the Pygments team, see AUTHORS.
+    :license: BSD, see LICENSE for details.
+"""
+
+from pygments.style import Style
+from pygments.token import Keyword, Name, Comment, String, Error, \
+     Number, Operator, Generic, Whitespace
 
 
-async def decide_include_remove(
-    chunks: List[Chunk], user_input: str, n: int, model: LLM
-) -> Dict[str, str]:
+class DefaultStyle(Style):
     """
-    Reranks the results from the codebase index based on the user input.
-
-    Returns a tuple of (include, remove) where both are lists of chunk ids
+    The default style (inspired by Emacs 22).
     """
-    # TODO: Go back to using disambiguated names instead of just basename
-    results_prompt = "\n\n".join(
-        map(
-            lambda chunk: f"{os.path.basename(chunk.id)}\n```\n{chunk.content[:500]}\n```",
-            chunks,
-        )
-    )
-    include_prompt = f"""\
-You will be asked to select the most relevant results from a list. You should choose the results that will be most useful in answering the user's request. For each result that you think is important, you should simply say its title on a new line. Here is an example input:
-\"\"\"
-add.py::0
-```
-def add(a, b):
-    return a + b
-```
-            
-multiply.py::0
-```
-def multiply(a, b):
-    return a * b
-```
 
-subtract.py::0
-```
-def subtract(a, b):
-    return a - b
-```
-\"\"\"
-And here is the output you would give if you thought that add.py and subtract.py were the most relevant results:
-\"\"\"
-add.py::0
-subtract.py::0
-\"\"\"
-            
-Now for the real task, here are the top {len(chunks)} results from the codebase for the user request, "{user_input}":
+    background_color = "#f8f8f8"
+    default_style = ""
 
-{results_prompt}
+    styles = {
+        Whitespace:                "#bbbbbb",
+        Comment:                   "italic #408080",
+        Comment.Preproc:           "noitalic #BC7A00",
 
-Here are the {n} most relevant results listed in the same format from the example:"""
+        #Keyword:                   "bold #AA22FF",
+        Keyword:                   "bold #008000",
+        Keyword.Pseudo:            "nobold",
+        Keyword.Type:              "nobold #B00040",
 
-    remove_prompt = f"""\
-You will be asked to select items from a list that are irrelevant to the given request. For each result that is unrelated, you should simply say its title on a new line. Here is an example input:
-\"\"\"
-add.py::0
-```
-def add(a, b):
-    return a + b
-```
-            
-multiply.py::0
-```
-def multiply(a, b):
-    return a * b
-```
+        Operator:                  "#666666",
+        Operator.Word:             "bold #AA22FF",
 
-subtract.py::0
-```
-def subtract(a, b):
-    return a - b
-```
-\"\"\"
-And here is the output you would give if you thought that add.py and subtract.py were not useful to answer the given request:
-\"\"\"
-add.py::0
-subtract.py::0
-\"\"\"
-            
-Now for the real task, here are the top {len(chunks)} results from the codebase for the user request, "{user_input}":
+        Name.Builtin:              "#008000",
+        Name.Function:             "#0000FF",
+        Name.Class:                "bold #0000FF",
+        Name.Namespace:            "bold #0000FF",
+        Name.Exception:            "bold #D2413A",
+        Name.Variable:             "#19177C",
+        Name.Constant:             "#880000",
+        Name.Label:                "#A0A000",
+        Name.Entity:               "bold #999999",
+        Name.Attribute:            "#7D9029",
+        Name.Tag:                  "bold #008000",
+        Name.Decorator:            "#AA22FF",
 
-{results_prompt}
+        String:                    "#BA2121",
+        String.Doc:                "italic",
+        String.Interpol:           "bold #BB6688",
+        String.Escape:             "bold #BB6622",
+        String.Regex:              "#BB6688",
+        #String.Symbol:             "#B8860B",
+        String.Symbol:             "#19177C",
+        String.Other:              "#008000",
+        Number:                    "#666666",
 
-List the results that are not useful in answering the request, using in the same format from the example. Only choose those that are completely unrelated, and no more than {n // 2}:"""
+        Generic.Heading:           "bold #000080",
+        Generic.Subheading:        "bold #800080",
+        Generic.Deleted:           "#A00000",
+        Generic.Inserted:          "#00A000",
+        Generic.Error:             "#FF0000",
+        Generic.Emph:              "italic",
+        Generic.Strong:            "bold",
+        Generic.Prompt:            "bold #000080",
+        Generic.Output:            "#888",
+        Generic.Traceback:         "#04D",
 
-    include = model.complete(include_prompt, log=False)
-    remove = model.complete(remove_prompt, log=False)
-    include_completion, remove_completion = await asyncio.gather(include, remove)
-
-    return include_completion.split("\n"), remove_completion.split("\n")
-
-
-async def default_reranker_parallel(
-    chunks: List[Chunk], user_input: str, n: int, model: LLM, group_size: int = 10
-) -> List[Chunk]:
-    """
-    A reranker, given a mapping from id to contents, returns the subset of the mapping that is most relevant to the user_input
-    """
-    # Split the results into groups of max size 10
-    groups = []
-    group = []
-    for chunk in chunks:
-        group.append(chunk)
-        if len(group) == group_size:
-            groups.append(group)
-            group = []
-
-    if len(group) > 0:
-        groups.append(group)
-
-    # Gather the ids of chunks that should be removed and included
-    include = set([])
-    remove = set([])
-
-    tasks = []
-    for group in groups:
-        tasks.append(decide_include_remove(group, user_input, n, model))
-
-    reranking_results = await asyncio.gather(*tasks)
-    for rr in reranking_results:
-        include.update(rr[0])
-        remove.update(rr[1])
-
-    # Determine which documents were repeated, these are probably important
-    counts_per_document = {}
-    for chunk in chunks:
-        if chunk.digest not in counts_per_document:
-            counts_per_document[chunk.digest] = 0
-        counts_per_document[chunk.digest] += 1
-
-    repeated_documents = set(
-        filter(lambda x: counts_per_document[x] > 1, counts_per_document)
-    )
-
-    not_disqualified = set(
-        [
-            chunk.id
-            for chunk in chunks
-            if chunk.id not in remove or chunk.digest in repeated_documents
-        ]
-    )
-
-    included = set([id for id in not_disqualified if chunk.id in include])
-
-    additional = n - len(included)
-    for i in range(additional):
-        if len(not_disqualified) == 0:
-            break
-
-        # Get an item from not_disqualified
-        included.add(not_disqualified.pop())
-
-    if additional < 0:
-        # We need to remove some items
-        additional = -additional
-        for i in range(additional):
-            if len(included) == 0:
-                break
-
-            # Remove one
-            included.pop()
-
-    return [chunk for chunk in chunks if chunk.id in included]
+        Error:                     "border:#FF0000"
+    }

@@ -1,89 +1,91 @@
-import os
-import sys
+# -*- coding: utf-8 -*-
+from __future__ import absolute_import, division, print_function, unicode_literals
 
-import pytest
-
-
-class SomeClass:
-    class SomeClass:
-        def twice(self, a):
-            something = os
-            return something
-
-    def twice(self, b):
-        pass
-
-    def some_function():
-        pass
+from gratipay.testing import Harness
 
 
-@pytest.mark.parametrize(
-    'string, descriptions, kwargs', [
-        # No completions
-        ('SomeClass', ['class SomeClass'], {}),
-        ('SomeClass', ['class SomeClass', 'class SomeClass.SomeClass'], dict(all_scopes=True)),
-        ('Some', [], dict(all_scopes=True)),
-        ('os', ['module os'], {}),
-        ('sys', ['module sys'], {}),
-        ('sys.path', ['statement sys.path'], {}),
-        ('sys.exit', ['function sys.exit'], {}),
-        ('something', [], {}),
-        ('something', ['statement SomeClass.SomeClass.twice.something'], dict(all_scopes=True)),
+FULL = """\
 
-        # Completions
-        ('class Some', ['class SomeClass', 'class SomeClass.SomeClass'],
-         dict(all_scopes=True, complete=True)),
-        ('class Some', ['class SomeClass'], dict(complete=True)),
-        ('Some', ['class SomeClass', 'class SomeClass.SomeClass',
-                  'statement SomeClass.SomeClass.twice.something',
-                  'function SomeClass.some_function'], dict(all_scopes=True, complete=True)),
-        ('some', ['class SomeClass', 'class SomeClass.SomeClass',
-                  'statement SomeClass.SomeClass.twice.something',
-                  'function SomeClass.some_function'], dict(all_scopes=True, complete=True)),
+<p>Four score and seven years ago our fathers brought forth on this continent,
+a new nation, conceived in Liberty, and dedicated to the proposition that all
+men are created equal.</p>
 
-        # Fuzzy
-        ('class Smelss', ['class SomeClass'], dict(complete=True, fuzzy=True)),
-        ('class Smelss', ['class SomeClass', 'class SomeClass.SomeClass'],
-         dict(complete=True, fuzzy=True, all_scopes=True)),
+<p>Now we are engaged in a great civil war, testing whether that nation, or any
+nation so conceived and so dedicated, can long endure. We are met on a great
+battle-field of that war. We have come to dedicate a portion of that field, as
+a final resting place for those who here gave their lives that that nation
+might live. It is altogether fitting and proper that we should do this.</p>
 
-        # Nested
-        ('SomeClass.SomeClass', ['class SomeClass.SomeClass'],
-         dict(all_scopes=True)),
-        ('SomeClass.SomeClass.twice', ['function SomeClass.SomeClass.twice'],
-         dict(all_scopes=True)),
-        ('SomeClass.SomeClass.twice.__call__', ['function types.FunctionType.__call__'],
-         dict(all_scopes=True)),
-        ('SomeClass.SomeClass.twice.something', [], dict(all_scopes=True)),
-        ('SomeClass.twice', ['function SomeClass.twice', 'function SomeClass.SomeClass.twice'],
-         dict(all_scopes=True)),
+<p>But, in a larger sense, we can not dedicate&mdash;we can not
+consecrate&mdash;we can not hallow&mdash;this ground. The brave men, living and
+dead, who struggled here, have consecrated it, far above our poor power to add
+or detract. The world will little note, nor long remember what we say here, but
+it can never forget what they did here. It is for us the living, rather, to be
+dedicated here to the unfinished work which they who fought here have thus far
+so nobly advanced. It is rather for us to be here dedicated to the great task
+remaining before us&mdash;that from these honored dead we take increased
+devotion to that cause for which they gave the last full measure of
+devotion&mdash;that we here highly resolve that these dead shall not have died
+in vain&mdash;that this nation, under God, shall have a new birth of
+freedom&mdash;and that government of the people, by the people, for the people,
+shall not perish from the earth.</p>
 
-        # Nested completions
-        ('SomeClass.twi', ['function SomeClass.twice', 'function SomeClass.SomeClass.twice'],
-         dict(all_scopes=True, complete=True)),
-
-        # Fuzzy unfortunately doesn't work
-        ('SomeCl.twice', [], dict(all_scopes=True, complete=True, fuzzy=True)),
-    ]
-)
-def test_simple_search(Script, string, descriptions, kwargs):
-    if kwargs.pop('complete', False) is True:
-        defs = Script(path=__file__).complete_search(string, **kwargs)
-    else:
-        defs = Script(path=__file__).search(string, **kwargs)
-    this_mod = 'test.test_api.test_search.'
-    assert [d.type + ' ' + d.full_name.replace(this_mod, '') for d in defs] == descriptions
+"""
 
 
-@pytest.mark.parametrize(
-    'string, completions, fuzzy, all_scopes', [
-        ('SomeCl', ['ass'], False, False),
-        ('SomeCl', [None], True, False),
-        ('twic', [], False, False),
-        ('some_f', [], False, False),
-        ('twic', ['e', 'e'], False, True),
-        ('some_f', ['unction'], False, True),
-    ]
-)
-def test_complete_search(Script, string, completions, fuzzy, all_scopes):
-    defs = Script(path=__file__).complete_search(string, fuzzy=fuzzy, all_scopes=all_scopes)
-    assert [d.complete for d in defs] == completions
+class TestSearch(Harness):
+
+    def search(self, q):
+        return self.client.GET("/search?q=" + q).body.decode('utf8')
+
+
+    def test_includes_project(self):
+        self.make_team(is_approved=True)
+        assert 'Enterprise' in self.search('enterprise')
+
+    def test_doesnt_display_project_description(self):
+        self.make_team(is_approved=True, product_or_service="<i>Voyages!</i>")
+        assert 'Voyages' not in self.search('enterprise')
+
+    def test_includes_participant(self):
+        self.make_participant('alice', claimed_time='now')
+        assert 'alice' in self.search('alice')
+
+    def test_displays_scrubbed_participant_statement_for_username_match(self):
+        alice = self.make_participant('alice', claimed_time='now')
+        alice.upsert_statement('en',
+                           '<h1>Four</h1> score &amp; <script>seven&trade;</script> years ago ...')
+        assert 'Four score &amp; seven\u2122 years ago \u2026' in self.search('alice')
+
+    def test_displays_scrubbed_participant_statement_for_statement_match(self):
+        alice = self.make_participant('alice', claimed_time='now')
+        alice.upsert_statement('en',
+                           '<h1>Four</h1> score &amp; <script>seven&trade;</script> years ago ...')
+        assert '<b>Four</b> <b>score</b> &amp; seven\u2122 years' in self.search('four score')
+
+    def test_truncates_statement_appropriately(self):
+        alice = self.make_participant('alice', claimed_time='now')
+        alice.upsert_statement('en', FULL)
+        assert ('<span class="description">&middot; Four score and seven years ago our fathers '
+                'brought forth on this continent, a new nation, conceived in Liberty, and '
+                'dedicated to</span>') in self.search('alice')
+
+    def test_excerpts_statement_appropriately(self):
+        alice = self.make_participant('alice', claimed_time='now')
+        alice.upsert_statement('en', FULL)
+        assert ('&middot; &hellip; consecrate—we can not <b>hallow</b>—this ground. The brave '
+                'men, living &hellip;') in self.search('hallow')
+
+    def test_includes_unclaimed_packages_with_projects(self):
+        self.make_package()
+        body = self.search('fo')
+        assert 'foo' in body
+        assert 'has not joined' in body
+        assert 'owned by'       not in body
+
+    def test_does_not_include_claimed_packages(self):
+        self.make_package(claimed_by='picard')
+        body = self.search('fo')
+        assert 'foo' in body
+        assert 'has not joined' not in body
+        assert 'owned by'       in body

@@ -1,100 +1,213 @@
 # -*- coding: utf-8 -*-
 """
-oauthlib.oauth2.rfc6749
-~~~~~~~~~~~~~~~~~~~~~~~
+    pygments.token
+    ~~~~~~~~~~~~~~
 
-This module is an implementation of various logic needed
-for consuming and providing OAuth 2.0 RFC6749.
+    Basic token types and the standard tokens.
+
+    :copyright: Copyright 2006-2019 by the Pygments team, see AUTHORS.
+    :license: BSD, see LICENSE for details.
 """
-from __future__ import absolute_import, unicode_literals
-
-import logging
-
-from oauthlib.common import Request
-
-from .base import BaseEndpoint, catch_errors_and_unavailability
 
 
-log = logging.getLogger(__name__)
+class _TokenType(tuple):
+    parent = None
+
+    def split(self):
+        buf = []
+        node = self
+        while node is not None:
+            buf.append(node)
+            node = node.parent
+        buf.reverse()
+        return buf
+
+    def __init__(self, *args):
+        # no need to call super.__init__
+        self.subtypes = set()
+
+    def __contains__(self, val):
+        return self is val or (
+            type(val) is self.__class__ and
+            val[:len(self)] == self
+        )
+
+    def __getattr__(self, val):
+        if not val or not val[0].isupper():
+            return tuple.__getattribute__(self, val)
+        new = _TokenType(self + (val,))
+        setattr(self, val, new)
+        self.subtypes.add(new)
+        new.parent = self
+        return new
+
+    def __repr__(self):
+        return 'Token' + (self and '.' or '') + '.'.join(self)
+
+    def __copy__(self):
+        # These instances are supposed to be singletons
+        return self
+
+    def __deepcopy__(self, memo):
+        # These instances are supposed to be singletons
+        return self
 
 
-class TokenEndpoint(BaseEndpoint):
+Token = _TokenType()
 
-    """Token issuing endpoint.
+# Special token types
+Text = Token.Text
+Whitespace = Text.Whitespace
+Escape = Token.Escape
+Error = Token.Error
+# Text that doesn't belong to this lexer (e.g. HTML in PHP)
+Other = Token.Other
 
-    The token endpoint is used by the client to obtain an access token by
-    presenting its authorization grant or refresh token.  The token
-    endpoint is used with every authorization grant except for the
-    implicit grant type (since an access token is issued directly).
+# Common token types for source code
+Keyword = Token.Keyword
+Name = Token.Name
+Literal = Token.Literal
+String = Literal.String
+Number = Literal.Number
+Punctuation = Token.Punctuation
+Operator = Token.Operator
+Comment = Token.Comment
 
-    The means through which the client obtains the location of the token
-    endpoint are beyond the scope of this specification, but the location
-    is typically provided in the service documentation.
+# Generic types for non-source code
+Generic = Token.Generic
 
-    The endpoint URI MAY include an "application/x-www-form-urlencoded"
-    formatted (per `Appendix B`_) query component,
-    which MUST be retained when adding additional query parameters.  The
-    endpoint URI MUST NOT include a fragment component::
+# String and some others are not direct children of Token.
+# alias them:
+Token.Token = Token
+Token.String = String
+Token.Number = Number
 
-        https://example.com/path?query=component             # OK
-        https://example.com/path?query=component#fragment    # Not OK
 
-    Since requests to the authorization endpoint result in user
-    Since requests to the token endpoint result in the transmission of
-    clear-text credentials (in the HTTP request and response), the
-    authorization server MUST require the use of TLS as described in
-    Section 1.6 when sending requests to the token endpoint::
-
-        # We will deny any request which URI schema is not with https
-
-    The client MUST use the HTTP "POST" method when making access token
-    requests::
-
-        # HTTP method is currently not enforced
-
-    Parameters sent without a value MUST be treated as if they were
-    omitted from the request.  The authorization server MUST ignore
-    unrecognized request parameters.  Request and response parameters
-    MUST NOT be included more than once::
-
-        # Delegated to each grant type.
-
-    .. _`Appendix B`: http://tools.ietf.org/html/rfc6749#appendix-B
+def is_token_subtype(ttype, other):
     """
+    Return True if ``ttype`` is a subtype of ``other``.
 
-    def __init__(self, default_grant_type, default_token_type, grant_types):
-        BaseEndpoint.__init__(self)
-        self._grant_types = grant_types
-        self._default_token_type = default_token_type
-        self._default_grant_type = default_grant_type
+    exists for backwards compatibility. use ``ttype in other`` now.
+    """
+    return ttype in other
 
-    @property
-    def grant_types(self):
-        return self._grant_types
 
-    @property
-    def default_grant_type(self):
-        return self._default_grant_type
+def string_to_tokentype(s):
+    """
+    Convert a string into a token type::
 
-    @property
-    def default_grant_type_handler(self):
-        return self.grant_types.get(self.default_grant_type)
+        >>> string_to_token('String.Double')
+        Token.Literal.String.Double
+        >>> string_to_token('Token.Literal.Number')
+        Token.Literal.Number
+        >>> string_to_token('')
+        Token
 
-    @property
-    def default_token_type(self):
-        return self._default_token_type
+    Tokens that are already tokens are returned unchanged:
 
-    @catch_errors_and_unavailability
-    def create_token_response(self, uri, http_method='GET', body=None,
-                              headers=None, credentials=None):
-        """Extract grant_type and route to the designated handler."""
-        request = Request(
-            uri, http_method=http_method, body=body, headers=headers)
-        request.scopes = None
-        request.extra_credentials = credentials
-        grant_type_handler = self.grant_types.get(request.grant_type,
-                                                  self.default_grant_type_handler)
-        log.debug('Dispatching grant_type %s request to %r.',
-                  request.grant_type, grant_type_handler)
-        return grant_type_handler.create_token_response(
-            request, self.default_token_type)
+        >>> string_to_token(String)
+        Token.Literal.String
+    """
+    if isinstance(s, _TokenType):
+        return s
+    if not s:
+        return Token
+    node = Token
+    for item in s.split('.'):
+        node = getattr(node, item)
+    return node
+
+
+# Map standard token types to short names, used in CSS class naming.
+# If you add a new item, please be sure to run this file to perform
+# a consistency check for duplicate values.
+STANDARD_TYPES = {
+    Token:                         '',
+
+    Text:                          '',
+    Whitespace:                    'w',
+    Escape:                        'esc',
+    Error:                         'err',
+    Other:                         'x',
+
+    Keyword:                       'k',
+    Keyword.Constant:              'kc',
+    Keyword.Declaration:           'kd',
+    Keyword.Namespace:             'kn',
+    Keyword.Pseudo:                'kp',
+    Keyword.Reserved:              'kr',
+    Keyword.Type:                  'kt',
+
+    Name:                          'n',
+    Name.Attribute:                'na',
+    Name.Builtin:                  'nb',
+    Name.Builtin.Pseudo:           'bp',
+    Name.Class:                    'nc',
+    Name.Constant:                 'no',
+    Name.Decorator:                'nd',
+    Name.Entity:                   'ni',
+    Name.Exception:                'ne',
+    Name.Function:                 'nf',
+    Name.Function.Magic:           'fm',
+    Name.Property:                 'py',
+    Name.Label:                    'nl',
+    Name.Namespace:                'nn',
+    Name.Other:                    'nx',
+    Name.Tag:                      'nt',
+    Name.Variable:                 'nv',
+    Name.Variable.Class:           'vc',
+    Name.Variable.Global:          'vg',
+    Name.Variable.Instance:        'vi',
+    Name.Variable.Magic:           'vm',
+
+    Literal:                       'l',
+    Literal.Date:                  'ld',
+
+    String:                        's',
+    String.Affix:                  'sa',
+    String.Backtick:               'sb',
+    String.Char:                   'sc',
+    String.Delimiter:              'dl',
+    String.Doc:                    'sd',
+    String.Double:                 's2',
+    String.Escape:                 'se',
+    String.Heredoc:                'sh',
+    String.Interpol:               'si',
+    String.Other:                  'sx',
+    String.Regex:                  'sr',
+    String.Single:                 's1',
+    String.Symbol:                 'ss',
+
+    Number:                        'm',
+    Number.Bin:                    'mb',
+    Number.Float:                  'mf',
+    Number.Hex:                    'mh',
+    Number.Integer:                'mi',
+    Number.Integer.Long:           'il',
+    Number.Oct:                    'mo',
+
+    Operator:                      'o',
+    Operator.Word:                 'ow',
+
+    Punctuation:                   'p',
+
+    Comment:                       'c',
+    Comment.Hashbang:              'ch',
+    Comment.Multiline:             'cm',
+    Comment.Preproc:               'cp',
+    Comment.PreprocFile:           'cpf',
+    Comment.Single:                'c1',
+    Comment.Special:               'cs',
+
+    Generic:                       'g',
+    Generic.Deleted:               'gd',
+    Generic.Emph:                  'ge',
+    Generic.Error:                 'gr',
+    Generic.Heading:               'gh',
+    Generic.Inserted:              'gi',
+    Generic.Output:                'go',
+    Generic.Prompt:                'gp',
+    Generic.Strong:                'gs',
+    Generic.Subheading:            'gu',
+    Generic.Traceback:             'gt',
+}

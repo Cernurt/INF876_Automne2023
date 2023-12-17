@@ -1,335 +1,220 @@
-import re
-from itertools import zip_longest
-
-from parso.python import tree
-
-from jedi import debug
-from jedi.inference.utils import PushBackIterator
-from jedi.inference import analysis
-from jedi.inference.lazy_value import LazyKnownValue, LazyKnownValues, \
-    LazyTreeValue, get_merged_lazy_value
-from jedi.inference.names import ParamName, TreeNameDefinition, AnonymousParamName
-from jedi.inference.base_value import NO_VALUES, ValueSet, ContextualizedNode
-from jedi.inference.value import iterable
-from jedi.inference.cache import inference_state_as_method_param_cache
+from dataclasses import dataclass, field
+from typing import Optional
 
 
-def try_iter_content(types, depth=0):
-    """Helper method for static analysis."""
-    if depth > 10:
-        # It's possible that a loop has references on itself (especially with
-        # CompiledValue). Therefore don't loop infinitely.
-        return
-
-    for typ in types:
-        try:
-            f = typ.py__iter__
-        except AttributeError:
-            pass
-        else:
-            for lazy_value in f():
-                try_iter_content(lazy_value.infer(), depth + 1)
-
-
-class ParamIssue(Exception):
-    pass
-
-
-def repack_with_argument_clinic(clinic_string):
+@dataclass
+class TrainingArguments:
     """
-    Transforms a function or method with arguments to the signature that is
-    given as an argument clinic notation.
-
-    Argument clinic is part of CPython and used for all the functions that are
-    implemented in C (Python 3.7):
-
-        str.split.__text_signature__
-        # Results in: '($self, /, sep=None, maxsplit=-1)'
+    Configuration for training model.
     """
-    def decorator(func):
-        def wrapper(value, arguments):
-            try:
-                args = tuple(iterate_argument_clinic(
-                    value.inference_state,
-                    arguments,
-                    clinic_string,
-                ))
-            except ParamIssue:
-                return NO_VALUES
-            else:
-                return func(value, *args)
 
-        return wrapper
-    return decorator
-
-
-def iterate_argument_clinic(inference_state, arguments, clinic_string):
-    """Uses a list with argument clinic information (see PEP 436)."""
-    clinic_args = list(_parse_argument_clinic(clinic_string))
-
-    iterator = PushBackIterator(arguments.unpack())
-    for i, (name, optional, allow_kwargs, stars) in enumerate(clinic_args):
-        if stars == 1:
-            lazy_values = []
-            for key, argument in iterator:
-                if key is not None:
-                    iterator.push_back((key, argument))
-                    break
-
-                lazy_values.append(argument)
-            yield ValueSet([iterable.FakeTuple(inference_state, lazy_values)])
-            lazy_values
-            continue
-        elif stars == 2:
-            raise NotImplementedError()
-        key, argument = next(iterator, (None, None))
-        if key is not None:
-            debug.warning('Keyword arguments in argument clinic are currently not supported.')
-            raise ParamIssue
-        if argument is None and not optional:
-            debug.warning('TypeError: %s expected at least %s arguments, got %s',
-                          name, len(clinic_args), i)
-            raise ParamIssue
-
-        value_set = NO_VALUES if argument is None else argument.infer()
-
-        if not value_set and not optional:
-            # For the stdlib we always want values. If we don't get them,
-            # that's ok, maybe something is too hard to resolve, however,
-            # we will not proceed with the type inference of that function.
-            debug.warning('argument_clinic "%s" not resolvable.', name)
-            raise ParamIssue
-        yield value_set
+    model_ckpt: Optional[str] = field(
+        default="codeparrot/codeparrot", metadata={"help": "Model name or path of model to be trained."}
+    )
+    save_dir: Optional[str] = field(
+        default="./", metadata={"help": "Save dir where model repo is cloned and models updates are saved to."}
+    )
+    dataset_name_train: Optional[str] = field(
+        default="codeparrot/codeparrot-clean-train", metadata={"help": "Name or path of training dataset."}
+    )
+    dataset_name_valid: Optional[str] = field(
+        default="codeparrot/codeparrot-clean-valid", metadata={"help": "Name or path of validation dataset."}
+    )
+    train_batch_size: Optional[int] = field(default=2, metadata={"help": "Batch size for training."})
+    valid_batch_size: Optional[int] = field(default=2, metadata={"help": "Batch size for evaluation."})
+    weight_decay: Optional[float] = field(default=0.1, metadata={"help": "Value of weight decay."})
+    shuffle_buffer: Optional[int] = field(
+        default=10000, metadata={"help": "Size of buffer used to shuffle streaming dataset."}
+    )
+    learning_rate: Optional[float] = field(default=2e-4, metadata={"help": "Learning rate fo training."})
+    lr_scheduler_type: Optional[str] = field(default="cosine", metadata={"help": "Learning rate."})
+    num_warmup_steps: Optional[int] = field(
+        default=750, metadata={"help": "Number of warmup steps in the learning rate schedule."}
+    )
+    gradient_accumulation_steps: Optional[int] = field(
+        default=16, metadata={"help": "Number of gradient accumulation steps."}
+    )
+    gradient_checkpointing: Optional[bool] = field(
+        default=True, metadata={"help": "Use gradient checkpointing to reduce memory footprint."}
+    )
+    max_train_steps: Optional[int] = field(default=50000, metadata={"help": "Maximum number of training steps."})
+    max_eval_steps: Optional[int] = field(
+        default=-1, metadata={"help": "Maximum number of evaluation steps. If -1 the full dataset is evaluated."}
+    )
+    seq_length: Optional[int] = field(default=1024, metadata={"help": "Sequence lengths used for training."})
+    seed: Optional[int] = field(default=1, metadata={"help": "Training seed."})
+    save_checkpoint_steps: Optional[int] = field(
+        default=1024,
+        metadata={"help": "Interval to save checkpoints. Measured as number of forward passes not training steps."},
+    )
+    resume_from_checkpoint: Optional[str] = field(
+        default=None, metadata={"help": "States path if the training should continue from a checkpoint folder."}
+    )
+    tokenized: Optional[bool] = field(default=False, metadata={"help": "If True the data is pretokenized."})
 
 
-def _parse_argument_clinic(string):
-    allow_kwargs = False
-    optional = False
-    while string:
-        # Optional arguments have to begin with a bracket. And should always be
-        # at the end of the arguments. This is therefore not a proper argument
-        # clinic implementation. `range()` for exmple allows an optional start
-        # value at the beginning.
-        match = re.match(r'(?:(?:(\[),? ?|, ?|)(\**\w+)|, ?/)\]*', string)
-        string = string[len(match.group(0)):]
-        if not match.group(2):  # A slash -> allow named arguments
-            allow_kwargs = True
-            continue
-        optional = optional or bool(match.group(1))
-        word = match.group(2)
-        stars = word.count('*')
-        word = word[stars:]
-        yield (word, optional, allow_kwargs, stars)
-        if stars:
-            allow_kwargs = True
+@dataclass
+class EvaluationArguments:
+    """
+    Configuration for evaluating model.
+    """
+
+    model_ckpt: Optional[str] = field(
+        default="codeparrot/codeparrot", metadata={"help": "Model name or path of model to be evaluated."}
+    )
+    dataset_name: Optional[str] = field(
+        default="codeparrot/codeparrot-clean-valid", metadata={"help": "Name or path of validation dataset."}
+    )
+    batch_size: Optional[int] = field(default=2, metadata={"help": "Batch size used for evaluation."})
+    max_eval_steps: Optional[int] = field(
+        default=-1, metadata={"help": "Maximum number of evaluation steps. If -1 the full dataset is evaluated."}
+    )
+    seq_length: Optional[int] = field(default=1024, metadata={"help": "Length of sequences to be evaluated."})
+    seed: Optional[int] = field(default=1, metadata={"help": "Random seed used for evaluation."})
 
 
-class _AbstractArgumentsMixin:
-    def unpack(self, funcdef=None):
-        raise NotImplementedError
+@dataclass
+class HumanEvalArguments:
+    """
+    Configuration for running evaluation on HumanEval dataset.
+    """
 
-    def get_calling_nodes(self):
-        return []
-
-
-class AbstractArguments(_AbstractArgumentsMixin):
-    context = None
-    argument_node = None
-    trailer = None
-
-
-def unpack_arglist(arglist):
-    if arglist is None:
-        return
-
-    if arglist.type != 'arglist' and not (
-            arglist.type == 'argument' and arglist.children[0] in ('*', '**')):
-        yield 0, arglist
-        return
-
-    iterator = iter(arglist.children)
-    for child in iterator:
-        if child == ',':
-            continue
-        elif child in ('*', '**'):
-            c = next(iterator, None)
-            assert c is not None
-            yield len(child.value), c
-        elif child.type == 'argument' and \
-                child.children[0] in ('*', '**'):
-            assert len(child.children) == 2
-            yield len(child.children[0].value), child.children[1]
-        else:
-            yield 0, child
-
-
-class TreeArguments(AbstractArguments):
-    def __init__(self, inference_state, context, argument_node, trailer=None):
-        """
-        :param argument_node: May be an argument_node or a list of nodes.
-        """
-        self.argument_node = argument_node
-        self.context = context
-        self._inference_state = inference_state
-        self.trailer = trailer  # Can be None, e.g. in a class definition.
-
-    @classmethod
-    @inference_state_as_method_param_cache()
-    def create_cached(cls, *args, **kwargs):
-        return cls(*args, **kwargs)
-
-    def unpack(self, funcdef=None):
-        named_args = []
-        for star_count, el in unpack_arglist(self.argument_node):
-            if star_count == 1:
-                arrays = self.context.infer_node(el)
-                iterators = [_iterate_star_args(self.context, a, el, funcdef)
-                             for a in arrays]
-                for values in list(zip_longest(*iterators)):
-                    yield None, get_merged_lazy_value(
-                        [v for v in values if v is not None]
-                    )
-            elif star_count == 2:
-                arrays = self.context.infer_node(el)
-                for dct in arrays:
-                    yield from _star_star_dict(self.context, dct, el, funcdef)
-            else:
-                if el.type == 'argument':
-                    c = el.children
-                    if len(c) == 3:  # Keyword argument.
-                        named_args.append((c[0].value, LazyTreeValue(self.context, c[2]),))
-                    else:  # Generator comprehension.
-                        # Include the brackets with the parent.
-                        sync_comp_for = el.children[1]
-                        if sync_comp_for.type == 'comp_for':
-                            sync_comp_for = sync_comp_for.children[1]
-                        comp = iterable.GeneratorComprehension(
-                            self._inference_state,
-                            defining_context=self.context,
-                            sync_comp_for_node=sync_comp_for,
-                            entry_node=el.children[0],
-                        )
-                        yield None, LazyKnownValue(comp)
-                else:
-                    yield None, LazyTreeValue(self.context, el)
-
-        # Reordering arguments is necessary, because star args sometimes appear
-        # after named argument, but in the actual order it's prepended.
-        yield from named_args
-
-    def _as_tree_tuple_objects(self):
-        for star_count, argument in unpack_arglist(self.argument_node):
-            default = None
-            if argument.type == 'argument':
-                if len(argument.children) == 3:  # Keyword argument.
-                    argument, default = argument.children[::2]
-            yield argument, default, star_count
-
-    def iter_calling_names_with_star(self):
-        for name, default, star_count in self._as_tree_tuple_objects():
-            # TODO this function is a bit strange. probably refactor?
-            if not star_count or not isinstance(name, tree.Name):
-                continue
-
-            yield TreeNameDefinition(self.context, name)
-
-    def __repr__(self):
-        return '<%s: %s>' % (self.__class__.__name__, self.argument_node)
-
-    def get_calling_nodes(self):
-        old_arguments_list = []
-        arguments = self
-
-        while arguments not in old_arguments_list:
-            if not isinstance(arguments, TreeArguments):
-                break
-
-            old_arguments_list.append(arguments)
-            for calling_name in reversed(list(arguments.iter_calling_names_with_star())):
-                names = calling_name.goto()
-                if len(names) != 1:
-                    break
-                if isinstance(names[0], AnonymousParamName):
-                    # Dynamic parameters should not have calling nodes, because
-                    # they are dynamic and extremely random.
-                    return []
-                if not isinstance(names[0], ParamName):
-                    break
-                executed_param_name = names[0].get_executed_param_name()
-                arguments = executed_param_name.arguments
-                break
-
-        if arguments.argument_node is not None:
-            return [ContextualizedNode(arguments.context, arguments.argument_node)]
-        if arguments.trailer is not None:
-            return [ContextualizedNode(arguments.context, arguments.trailer)]
-        return []
+    model_ckpt: Optional[str] = field(
+        default="codeparrot/codeparrot", metadata={"help": "Model name or path of model to be evaluated."}
+    )
+    num_workers: Optional[int] = field(default=None, metadata={"help": "Number of workers used for code evaluation."})
+    num_tasks: Optional[int] = field(
+        default=None,
+        metadata={"help": "The number of human-eval tasks to run. If not included all tasks are evaluated."},
+    )
+    do_sample: Optional[bool] = field(
+        default=True, metadata={"help": "Sample from the language model's output distribution."}
+    )
+    temperature: Optional[float] = field(default=0.2, metadata={"help": "Sampling temperature used for generation."})
+    max_new_tokens: Optional[int] = field(default=256, metadata={"help": "Maximum number of newly generated tokens."})
+    top_k: Optional[int] = field(default=0, metadata={"help": "Top-k parameter used for generation."})
+    top_p: Optional[float] = field(default=0.95, metadata={"help": "Top-p parameter used for nucleus sampling."})
+    batch_size: Optional[int] = field(default=10, metadata={"help": "Number of generations to run in parallel."})
+    n_samples: Optional[int] = field(
+        default=200, metadata={"help": "Number of completions to generate for each sample."}
+    )
+    seed: Optional[int] = field(default=1, metadata={"help": "Random seed used for evaluation."})
+    output_file: Optional[str] = field(
+        default="eval_results.json", metadata={"help": "Random seed used for evaluation."}
+    )
+    HF_ALLOW_CODE_EVAL: Optional[str] = field(
+        default="0", metadata={"help": "Allow `code_eval` to execute Python code on machine"}
+    )
+    device_int: Optional[int] = field(
+        default=-1,
+        metadata={
+            "help": (
+                "Determine which device to run the `text-generation` Pipeline on. -1 is CPU and any zero or positive"
+                " number corresponds to which GPU device id to run on."
+            )
+        },
+    )
 
 
-class ValuesArguments(AbstractArguments):
-    def __init__(self, values_list):
-        self._values_list = values_list
+@dataclass
+class PreprocessingArguments:
+    """
+    Configuration for preprocessing data.
+    """
 
-    def unpack(self, funcdef=None):
-        for values in self._values_list:
-            yield None, LazyKnownValues(values)
-
-    def __repr__(self):
-        return '<%s: %s>' % (self.__class__.__name__, self._values_list)
-
-
-class TreeArgumentsWrapper(_AbstractArgumentsMixin):
-    def __init__(self, arguments):
-        self._wrapped_arguments = arguments
-
-    @property
-    def context(self):
-        return self._wrapped_arguments.context
-
-    @property
-    def argument_node(self):
-        return self._wrapped_arguments.argument_node
-
-    @property
-    def trailer(self):
-        return self._wrapped_arguments.trailer
-
-    def unpack(self, func=None):
-        raise NotImplementedError
-
-    def get_calling_nodes(self):
-        return self._wrapped_arguments.get_calling_nodes()
-
-    def __repr__(self):
-        return '<%s: %s>' % (self.__class__.__name__, self._wrapped_arguments)
-
-
-def _iterate_star_args(context, array, input_node, funcdef=None):
-    if not array.py__getattribute__('__iter__'):
-        if funcdef is not None:
-            # TODO this funcdef should not be needed.
-            m = "TypeError: %s() argument after * must be a sequence, not %s" \
-                % (funcdef.name.value, array)
-            analysis.add(context, 'type-error-star', input_node, message=m)
-    try:
-        iter_ = array.py__iter__
-    except AttributeError:
-        pass
-    else:
-        yield from iter_()
+    num_workers: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "The number of CPU cores to use for parallel preprocessing. Default uses the maximum available."
+        },
+    )
+    dataset_name: Optional[str] = field(
+        default="transformersbook/codeparrot", metadata={"help": "Folder or name of dataset to process."}
+    )
+    output_dir: Optional[str] = field(
+        default="codeparrot-clean", metadata={"help": "Folder to save processed processed dataset."}
+    )
+    samples_per_file: Optional[int] = field(
+        default=100_000, metadata={"help": "Number of files to save per JSON output file."}
+    )
+    text_column: Optional[str] = field(default="content", metadata={"help": "Column containing text data to process."})
+    line_max: Optional[float] = field(
+        default=1000, metadata={"help": "Maximum line length in file, otherwise file is filtered."}
+    )
+    line_mean: Optional[float] = field(
+        default=100, metadata={"help": "Maximum mean line length in file, otherwise file is filtered."}
+    )
+    alpha_frac: Optional[float] = field(
+        default=0.25, metadata={"help": "Maximum fraction of non-alphanumeric characters, otherwise file is filtered."}
+    )
+    min_token_ratio: Optional[float] = field(
+        default=1.5, metadata={"help": "Minimum character token ratio for the file, otherwise file is filtered."}
+    )
+    filter_proba: Optional[float] = field(
+        default=0.7, metadata={"help": "Probability for filtering config, test and uncommon files."}
+    )
+    tokenizer: Optional[str] = field(
+        default="codeparrot/codeparrot",
+        metadata={"help": "Name or path to the tokenizer."},
+    )
+    near_deduplication: Optional[bool] = field(
+        default=False, metadata={"help": "If True, near-duplicate samples are removed."}
+    )
+    jaccard_threshold: Optional[float] = field(
+        default=0.85, metadata={"help": "Jaccard threshold for near-duplicate samples."}
+    )
 
 
-def _star_star_dict(context, array, input_node, funcdef):
-    from jedi.inference.value.instance import CompiledInstance
-    if isinstance(array, CompiledInstance) and array.name.string_name == 'dict':
-        # For now ignore this case. In the future add proper iterators and just
-        # make one call without crazy isinstance checks.
-        return {}
-    elif isinstance(array, iterable.Sequence) and array.array_type == 'dict':
-        return array.exact_key_items()
-    else:
-        if funcdef is not None:
-            m = "TypeError: %s argument after ** must be a mapping, not %s" \
-                % (funcdef.name.value, array)
-            analysis.add(context, 'type-error-star-star', input_node, message=m)
-        return {}
+@dataclass
+class TokenizerTrainingArguments:
+    """
+    Configuration for tokenizer training.
+    """
+
+    base_tokenizer: Optional[str] = field(
+        default="gpt2", metadata={"help": "Base tokenizer to build new tokenizer from."}
+    )
+    dataset_name: Optional[str] = field(
+        default="transformersbook/codeparrot-train", metadata={"help": "Dataset to train tokenizer on."}
+    )
+    text_column: Optional[str] = field(default="content", metadata={"help": "Column containing text data to process."})
+    vocab_size: Optional[int] = field(default=200_000, metadata={"help": "Number of examples to train tokenizer on."})
+    n_examples: Optional[int] = field(
+        default=32768, metadata={"help": "Number of examples to train the tokenizer on."}
+    )
+    tokenizer_name: Optional[str] = field(default="codeparrot", metadata={"help": "Name of new tokenizer."})
+    push_to_hub: Optional[bool] = field(default=True, metadata={"help": "Push saved tokenizer to the hub."})
+
+
+@dataclass
+class PretokenizationArguments:
+    """
+    Configuration for data pretokenization.
+    """
+
+    tokenizer_dir: Optional[str] = field(
+        default="codeparrot/codeparrot", metadata={"help": "Name or path to the tokenizer."}
+    )
+    dataset_name: Optional[str] = field(
+        default="codeparrot/codeparrot-clean-train", metadata={"help": "Name or path to the dataset to pretokenize."}
+    )
+    tokenized_data_repo: Optional[str] = field(
+        default="tokenized-codeparrot-train", metadata={"help": "Repo name of the pretokenized data."}
+    )
+    num_workers: Optional[int] = field(default=None, metadata={"help": "Number of workers used for code evaluation."})
+
+
+@dataclass
+class InitializationArguments:
+    """
+    Configuration for initializing new model.
+    """
+
+    config_name: Optional[str] = field(
+        default="gpt2-large", metadata={"help": "Configuration to use for model initialization."}
+    )
+    tokenizer_name: Optional[str] = field(
+        default="codeparrot/codeparrot", metadata={"help": "Tokenizer attached to model."}
+    )
+    model_name: Optional[str] = field(default="codeparrot", metadata={"help": "Name of the created model."})
+    push_to_hub: Optional[bool] = field(default=True, metadata={"help": "Push saved tokenizer to the hub."})

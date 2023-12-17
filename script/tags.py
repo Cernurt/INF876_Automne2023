@@ -1,412 +1,122 @@
-""" Define the routes that deal with tags
-
-This includes:
-  - /tag_pages
-  - /batch_tags
-  - /delete_tag
-  - /delete_tag_posts
-  - /edit_tag_description
-  - /rename_tag
-  - /remove_posts_tags
-  - /toggle_tag_subscription
-  - /tag_list
-"""
-from .. import permissions
-from ..models import (
-    assoc_post_tag,
-    PageView,
-    Post,
-    Subscription,
-    Tag,
-)
-from ..proxies import current_user, db_session
-from ..utils.emails import send_subscription_email
-from ..utils.requests import from_request_get_feed_params
-from ..utils.shared import get_blueprint
-from flask import (
-    current_app,
-    render_template,
-    request,
-)
-from sqlalchemy import and_
-import logging
-import math
-
-blueprint = get_blueprint('tag', __name__)
+## @package tags
+# Module caffe2.python.layers.tags
 
 
-@blueprint.route('/batch_tags')
-@PageView.logged
-def render_batch_tags():
-    """ Render the batch_tags page, which lists all the tags.
 
-        From this view, editors can:
-            - rename them
-            - delete them
-            - delete the tag from certain posts
-            - add a tag description
+
+
+import functools
+
+from caffe2.python import context
+
+
+class TagContext(context.DefaultManaged):
     """
-    # get the args
-    # sort_by will either be "Tag" or "Number of Posts"
-    sort_by = request.args.get('sort_by', '')
-    sort_asc = request.args.get('sort_asc', '')
-    sort_desc = not sort_asc
-    feed_params = from_request_get_feed_params(request)
-
-    excluded_tags = current_app.config.get('EXCLUDED_TAGS', [])
-    all_tags = db_session.query(Tag).all()
-    tags_to_posts = {}
-    nonzero_tags = []
-    tags_to_description = {}
-    for tag in all_tags:
-        posts = tag.posts
-
-        if not posts:
-            db_session.delete(tag)
-            db_session.commit()
-
-        tags_to_posts[tag.id] = \
-            [(post.path, post.title) for post in posts
-             if post.is_published and not post.contains_excluded_tag]
-        nonzero_tags.append(tag)
-        # so that we can use the tag in the jinja template
-        db_session.expunge(tag)
-
-        tags_to_description[tag.id] = tag.description
-
-    if sort_by:
-        if sort_by == "Tag":
-            def compare(x):
-                return x.name.lower()
-        elif sort_by == "Number_of_Posts":
-            def compare(x):
-                return len(tags_to_posts[x.id])
-        else:
-            def compare(x):
-                return x
-        nonzero_tags = sorted(nonzero_tags, key=compare, reverse=sort_desc)
-
-    return render_template("batch_tags.html",
-                           tags=nonzero_tags,
-                           tags_to_posts=tags_to_posts,
-                           tags_to_desc=tags_to_description,
-                           feed_params=feed_params)
-
-
-@blueprint.route('/delete_tag_post', methods=['GET', 'POST'])
-@PageView.logged
-@permissions.post_comment.require()
-def delete_tags_from_posts():
-    """ Delete a tag from all the posts associated with it """
-    tag_id = int(request.args.get('tag_id'))
-
-    tag_obj = (db_session.query(Tag)
-               .filter(Tag.id == tag_id)
-               .first())
-
-    delete_query = assoc_post_tag.delete().where(
-        assoc_post_tag.c.tag_id == tag_id)
-    db_session.execute(delete_query)
-    db_session.delete(tag_obj)
-    db_session.commit()
-
-    return ""
-
-
-@delete_tags_from_posts.object_extractor
-def delete_tags_from_posts():
-    tag_obj = Tag.query.filter(
-        Tag.name == request.args.get('tag_name', '')).first()
-    return {
-        'id': tag_obj.id if tag_obj else None,
-        'type': 'tag',
-        'action': 'delete'
-    }
-
-
-@blueprint.route('/tag_pages')
-@PageView.logged
-@permissions.tags_view.require()
-def render_tag_pages():
-    feed_params = from_request_get_feed_params(request)
-    start = feed_params['start']
-    num_results = feed_params['results']
-    tag = request.args.get('tag', '')
-
-    if tag[0] == '#':
-        tag = tag[1:]
-
-    if tag in current_app.config.get('EXCLUDED_TAGS', []):
-        return render_template('error.html')
-
-    tag_obj = (db_session.query(Tag)
-               .filter(Tag.name == tag)
-               .first())
-
-    tag_description = tag_obj.description
-
-    # Get subscription status
-    subscribed = tag in feed_params.get("subscriptions", [])
-
-    # get all files with given tag
-    tag_posts = tag_obj.posts
-    posts = [post for post in tag_posts if post.is_published]
-
-    feed_params['posts_count'] = len(posts)
-    feed_params['page_count'] = int(math.ceil(
-        1.0 * len(posts) / feed_params['results']))
-
-    posts = posts[start:min(start + num_results, len(posts))]
-
-    post_stats = {
-        post.path: {'all_views': post.view_count,
-                    'distinct_views': post.view_user_count,
-                    'total_likes': post.vote_count,
-                    'total_comments': post.comment_count} for post in posts}
-
-    author_to_count = {}
-    for post in posts:
-        authors = post.authors
-        for author in authors:
-            name = author.format_name
-            if name in author_to_count:
-                author_to_count[name] += 1
-            else:
-                author_to_count[name] = 1
-
-    # get author with the max count
-    max_count = 1
-    max_author = ''
-    for (author, count) in author_to_count.items():
-        if count >= max_count:
-            max_author = author
-            max_count = count
-
-    return render_template("tag_pages.html",
-                           feed_params=feed_params,
-                           full_tag=tag,
-                           top_header=tag,
-                           tag_description=tag_description,
-                           tag_pocs=max_author,
-                           posts=posts,
-                           subscribed=subscribed,
-                           post_stats=post_stats)
-
-
-@render_tag_pages.object_extractor
-def render_tag_pages():
-    tag_obj = Tag.query.filter(Tag.name == request.args.get('tag', '')).first()
-    return {
-        'id': tag_obj.id if tag_obj is not None else None,
-        'type': 'tag',
-        'action': 'view'
-    }
-
-
-@blueprint.route('/edit_tag_description', methods=['POST'])
-@PageView.logged
-@permissions.post_comment.require()
-def edit_tag_desc():
-    """ Edit the description of a tag. This is used in the tag_page """
-    data = request.get_json()
-    tag_id = int(data['tagId'])
-    new_tag_desc = data['tagDesc']
-    if new_tag_desc:
-        tag = (db_session.query(Tag)
-               .filter(Tag.id == tag_id)
-               .first())
-        tag._description = new_tag_desc
-        db_session.commit()
-    return ""
-
-
-@edit_tag_desc.object_extractor
-def edit_tag_desc():
-    tag_obj = Tag.query.filter(Tag.id == request.get_json()['tagId']).first()
-    return {
-        'id': tag_obj.id if tag_obj is not None else None,
-        'type': 'tag',
-        'action': 'edit'
-    }
-
-
-@blueprint.route('/toggle_tag_subscription', methods=['GET', 'POST'])
-@PageView.logged
-def toggle_tag_subscription():
-    """ Subscribe/Unsubscribe a user from a tag """
-    try:
-        # retrieve relevant tag and user args from request
-        tag_name = request.args.get('tag_name', '')
-
-        if tag_name in current_app.config.get('EXCLUDED_TAGS', []):
-            logging.warning("Trying to subscribe to an excluded tag")
-            return ""
-
-        subscribe_action = request.args.get('subscribe_action', '')
-        if subscribe_action not in ['unsubscribe', 'subscribe']:
-            logging.warning("ERROR processing request")
-            return ""
-
-        # get the tag object so we can get the id
-        tag_obj = (db_session.query(Tag)
-                   .filter(and_(Tag.name == tag_name))
-                   .first())
-        # retrieve the current subscription object for a user and tag if exists
-        subscription = None
-        if tag_obj:
-            subscription = db_session.query(Subscription).filter(
-                and_(Subscription.object_type == 'tag',
-                     Subscription.user_id == current_user.id,
-                     Subscription.object_id == tag_obj.id)).first()
-        if subscription and subscribe_action == 'unsubscribe':
-            db_session.delete(subscription)
-        elif not subscription and subscribe_action == 'subscribe':
-            # otherwise, create new subscription
-            subscription = Subscription(
-                user_id=current_user.id,
-                object_type='tag',
-                object_id=tag_obj.id)
-            db_session.add(subscription)
-        else:
-            logging.warning("ERROR processing request")
-            return ""
-        db_session.commit()
-    except Exception as e:
-        logging.warning(f'ERROR processing request: {e}')
-    return ""
-
-
-@toggle_tag_subscription.object_extractor
-def toggle_tag_subscription():
-    tag_obj = Tag(name=request.args.get('tag_name', ''))
-    subscription = db_session.query(Subscription).filter(
-        and_(Subscription.object_type == 'tag',
-             Subscription.user_id == current_user.id,
-             Subscription.object_id == tag_obj.id)
-    ).first()
-    return {
-        'id': tag_obj.id if tag_obj is not None else None,
-        'type': 'tag',
-        'action': 'unsubscribe' if subscription else 'subscribe'
-    }
-
-
-@blueprint.route('/rename_tag', methods=['POST'])
-@PageView.logged
-@permissions.post_comment.require()
-def rename_tags_and_posts():
-    """ Rename a tag
-        This requires deleteing all the post-tag associations for the old tag
-        and re-adding them for the new tag
+    Scope driven way to provide tags to the layers.
     """
-    data = request.get_json()
-    old_tag_id = int(data['oldTagId'])
-    new_tag = data['newTag']
 
-    old_tag_obj = (db_session.query(Tag)
-                   .filter(Tag.id == old_tag_id)
-                   .first())
+    def __init__(self, tags=None):
+        # Tags is expected to be list to keep order of adding/removing things
+        self.tags = tags or []
 
-    new_tag_obj = (db_session.query(Tag)
-                   .filter(Tag.name == new_tag)
-                   .first())
-    if not new_tag_obj:
-        new_tag_obj = Tag(name=new_tag)
-        db_session.commit()
+    def add_tags(self, tags):
+        self.tags.extend(tags)
 
-    # add all the new associations in
-    new_tag_post_ids_before = [p.id for p in new_tag_obj.posts]
-    for p in old_tag_obj.posts:
-        if p.id not in new_tag_post_ids_before:
-            new_tag_obj.posts.append(p)
-    db_session.commit()
-
-    # delete the tag associations
-    old_tag_obj.posts = []
-    db_session.delete(old_tag_obj)
-    db_session.commit()
-    return ""
+    def remove_tags(self, tags):
+        assert self.tags[-len(tags):] == tags
+        self.tags = self.tags[:-len(tags)]
 
 
-@rename_tags_and_posts.object_extractor
-def rename_tags_and_posts():
-    tag_id = int(request.get_json()['oldTagId'])
-    return {
-        'id': tag_id if tag_id else None,
-        'type': 'tag',
-        'action': 'rename'
-    }
+class Tags:
+    # TODO(amalevich): Tags might need to live in their own contexts, add this
+    # split later
+    EXCLUDE_FROM_TRAIN = 'exclude_from_train'
+    EXCLUDE_FROM_EVAL = 'exclude_from_eval'
+    EXCLUDE_FROM_PREDICTION = 'exclude_from_prediction'
+    EXCLUDE_FROM_ACCUMULATE_PRED = 'exclude_from_accumulate_pred'
+    PREPROCESSING = 'preprocessing'
+    HANDLE_AS_SPARSE_LAYER = 'handle_as_sparse_layer'
+    PREFER_GPU = 'prefer_gpu'
+    CPU_ONLY = 'cpu_only'
+    LOCAL = 'local'
 
-
-@blueprint.route('/remove_posts_tags', methods=['POST'])
-@PageView.logged
-@permissions.post_comment.require()
-def remove_posts_tags():
-    """ Delete a tag from certain posts """
-    data = request.get_json()
-    tag_id = data['tagId']
-    posts = data['posts']
-    posts = [str(x) for x in posts]
-
-    # for all the posts, query & remove that tag
-    for post in posts:
-        post_id = (db_session.query(Post).filter(Post.path == post).first()).id
-        delete_query = assoc_post_tag.delete().where(
-            and_(assoc_post_tag.c.tag_id == tag_id,
-                 assoc_post_tag.c.post_id == post_id))
-        db_session.execute(delete_query)
-    db_session.commit()
-    return ""
-
-
-@remove_posts_tags.object_extractor
-def remove_posts_tags():
-    return {
-        'id': int(request.get_json()['tagId']),
-        'type': 'tag',
-        'action': 'dissociate'
-    }
-
-
-@blueprint.route('/tag_list', methods=['POST'])
-@PageView.logged
-@permissions.post_comment.require()
-def change_tags():
-    """ Change the tags associated with a given post.
-        This is called when someone clicks on the a knowledge post
-        and changes the tag through the web ui
+    # The following three tags are hints to **distributed training framework**.
     """
-    post_path = request.args.get('post_path', ' ')
-    data = request.get_json()
-    tags_string = data['tags']
+    Indicates a layer contains a sparse shardable parameter.  The parameter
+    should be sharded nd operators on those parameters should be done on
+    distributed parameter servers.
+    """
+    SPARSE_SHARDED = 'sparse_sharded'
+    """
+    Indicates a layer contains a sparse parameters among others, and that the
+    parameters should not be sharded (i.e. should be placed together on a node).
+    """
+    SPARSE_DONT_SHARD = 'sparse_dont_shard'
+    """
+    Used to manually indicate a component for an operator.  Parameters for
+    all operators with the same component should be colocated on the same
+    parameter server.
+    """
+    COMPONENT = 'component:'
+    PIPELINE = 'pipeline:'
+    """
+    Indicate it's a dense layer or dense param init,
+    but we use hogwild across multiple trainers
+    """
+    HOGWILD_DENSE = "hogwild_dense"
+    """
+    Valid tag prefixes for distributed training framework.
+    """
+    """
+    Used to pass on info to the 'extra_info' field in the net
+    Proto. Typically to provide info for distributed training.
+    """
+    EXTRA_INFO = 'extra_info:'
+    """
+    An empty tag, used to make conditional statement on with(Tags) block more concise
+    """
+    EMPTY_TAG = 'empty_tag'
 
-    post = (db_session.query(Post)
-            .filter(Post.path == post_path)
-            .first())
+    DT_TAGS = (SPARSE_SHARDED, SPARSE_DONT_SHARD, COMPONENT, HOGWILD_DENSE)
 
-    old_tags = post.tags
-    tag_set = set(old_tags)
-    tags_list = tags_string.split(",")
-    post.tags = tags_list
-    # post tag settr might take subset of tags_list
-    # to avoid dupes or whatever else
-    new_tags = post.tags
+    # In certain cases we want to have different schema for training and
+    # prediction, as an example in prediction we might need to have only
+    # subset of ids present in the original schema. This tag is one of the ways
+    # to mark operators that will be removed from prediction and should
+    # override schema for predictors.
+    PREDICTION_SCHEMA = 'prediction_schema'
 
-    email_tags = [tag for tag in new_tags if tag not in tag_set]
+    # This is to mark layers in the feature transform process.
+    FEATURE_TRANSFORM = 'feature_transform'
+    # This is to mark the output layers in the feature transform process
+    FEATURE_TRANSFORM_SCHEMA = 'feature_transform_schema'
 
-    db_session.commit()
+    def __init__(self, tags):
+        if not isinstance(tags, list):
+            tags = [tags]
+        self.tags = tags
 
-    for tag in email_tags:
-        send_subscription_email(post, tag)
+    def __enter__(self):
+        TagContext.current().add_tags(self.tags)
+        return self
 
-    return " "
+    def __exit__(self, type, value, traceback):
+        TagContext.current().remove_tags(self.tags)
+
+    def __call__(self, func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            with self:
+                return func(*args, **kwargs)
+        return wrapper
 
 
-@change_tags.object_extractor
-def change_tags():
-    post_path = request.args.get('post_path', '')
-    return {
-        'id': Post.query.filter(Post.path == post_path).first().id,
-        'type': 'post',
-        'action': 'tag'
-    }
+# pyre-fixme[16]: Tags has no attribute `TRAIN_ONLY`
+Tags.TRAIN_ONLY = [Tags.EXCLUDE_FROM_PREDICTION, Tags.EXCLUDE_FROM_EVAL,
+                   Tags.EXCLUDE_FROM_ACCUMULATE_PRED]
+# pyre-fixme[16]: Tags has no attribute `EVAL_ONLY`
+Tags.EVAL_ONLY = [Tags.EXCLUDE_FROM_PREDICTION, Tags.EXCLUDE_FROM_TRAIN,
+                  Tags.EXCLUDE_FROM_ACCUMULATE_PRED]
+# pyre-fixme[16]: Tags has no attribute `PREDICTION_ONLY`
+Tags.PREDICTION_ONLY = [Tags.EXCLUDE_FROM_TRAIN, Tags.EXCLUDE_FROM_EVAL,
+                        Tags.EXCLUDE_FROM_ACCUMULATE_PRED]

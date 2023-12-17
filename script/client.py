@@ -1,188 +1,93 @@
-from json import dumps as json_dumps
-from json import loads as json_loads
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-from unittest.mock import Mock
-from urllib.parse import urljoin
+# Copyright The Lightning AI team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-from django.http import QueryDict, StreamingHttpResponse
-from django.http.request import HttpHeaders
+from typing import Any, Dict, List, Optional, Type, TypeVar
 
-from ninja import NinjaAPI, Router
-from ninja.responses import NinjaJSONEncoder
-from ninja.responses import Response as HttpResponse
+import requests
+from requests import Session
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
+from lightning.app.components.database.utilities import _GeneralModel
 
-def build_absolute_uri(location: Optional[str] = None) -> str:
-    base = "http://testlocation/"
-
-    if location:
-        base = urljoin(base, location)
-
-    return base
+_CONNECTION_RETRY_TOTAL = 5
+_CONNECTION_RETRY_BACKOFF_FACTOR = 1
 
 
-# TODO: this should be changed
-# maybe add here urlconf object and add urls from here
-class NinjaClientBase:
-    __test__ = False  # <- skip pytest
+def _configure_session() -> Session:
+    """Configures the session for GET and POST requests.
 
-    def __init__(self, router_or_app: Union[NinjaAPI, Router]) -> None:
-        self.router_or_app = router_or_app
+    It enables a generous retrial strategy that waits for the application server to connect.
 
-    def get(
-        self, path: str, data: Optional[Dict] = None, **request_params: Any
-    ) -> "NinjaResponse":
-        return self.request("GET", path, data, **request_params)
+    """
+    retry_strategy = Retry(
+        # wait time between retries increases exponentially according to: backoff_factor * (2 ** (retry - 1))
+        total=_CONNECTION_RETRY_TOTAL,
+        backoff_factor=_CONNECTION_RETRY_BACKOFF_FACTOR,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    http = requests.Session()
+    http.mount("https://", adapter)
+    http.mount("http://", adapter)
+    return http
 
-    def post(
-        self,
-        path: str,
-        data: Optional[Dict] = None,
-        json: Any = None,
-        **request_params: Any,
-    ) -> "NinjaResponse":
-        return self.request("POST", path, data, json, **request_params)
 
-    def patch(
-        self,
-        path: str,
-        data: Optional[Dict] = None,
-        json: Any = None,
-        **request_params: Any,
-    ) -> "NinjaResponse":
-        return self.request("PATCH", path, data, json, **request_params)
+T = TypeVar("T")
 
-    def put(
-        self,
-        path: str,
-        data: Optional[Dict] = None,
-        json: Any = None,
-        **request_params: Any,
-    ) -> "NinjaResponse":
-        return self.request("PUT", path, data, json, **request_params)
 
-    def delete(
-        self,
-        path: str,
-        data: Optional[Dict] = None,
-        json: Any = None,
-        **request_params: Any,
-    ) -> "NinjaResponse":
-        return self.request("DELETE", path, data, json, **request_params)
+class DatabaseClient:
+    def __init__(self, db_url: str, token: Optional[str] = None, model: Optional[T] = None) -> None:
+        self.db_url = db_url
+        self.model = model
+        self.token = token or ""
+        self._session = None
 
-    def request(
-        self,
-        method: str,
-        path: str,
-        data: Optional[Dict] = None,
-        json: Any = None,
-        **request_params: Any,
-    ) -> "NinjaResponse":
-        if json is not None:
-            request_params["body"] = json_dumps(json, cls=NinjaJSONEncoder)
-        if data is None:
-            data = {}
-        func, request, kwargs = self._resolve(method, path, data, request_params)
-        return self._call(func, request, kwargs)  # type: ignore
+    def select_all(self, model: Optional[Type[T]] = None) -> List[T]:
+        cls = model if model else self.model
+        resp = self.session.post(
+            self.db_url + "/select_all/", data=_GeneralModel.from_cls(cls, token=self.token).json()
+        )
+        assert resp.status_code == 200
+        return [cls(**data) for data in resp.json()]
+
+    def insert(self, model: T) -> None:
+        resp = self.session.post(
+            self.db_url + "/insert/",
+            data=_GeneralModel.from_obj(model, token=self.token).json(),
+        )
+        assert resp.status_code == 200
+
+    def update(self, model: T) -> None:
+        resp = self.session.post(
+            self.db_url + "/update/",
+            data=_GeneralModel.from_obj(model, token=self.token).json(),
+        )
+        assert resp.status_code == 200
+
+    def delete(self, model: T) -> None:
+        resp = self.session.post(
+            self.db_url + "/delete/",
+            data=_GeneralModel.from_obj(model, token=self.token).json(),
+        )
+        assert resp.status_code == 200
 
     @property
-    def urls(self) -> List:
-        if not hasattr(self, "_urls_cache"):
-            self._urls_cache: List
-            if isinstance(self.router_or_app, NinjaAPI):
-                self._urls_cache = self.router_or_app.urls[0]
-            else:
-                api = NinjaAPI()
-                self.router_or_app.set_api_instance(api)
-                self._urls_cache = list(self.router_or_app.urls_paths(""))
-        return self._urls_cache
+    def session(self):
+        if self._session is None:
+            self._session = _configure_session()
+        return self._session
 
-    def _resolve(
-        self, method: str, path: str, data: Dict, request_params: Any
-    ) -> Tuple[Callable, Mock, Dict]:
-        url_path = path.split("?")[0].lstrip("/")
-        for url in self.urls:
-            match = url.resolve(url_path)
-            if match:
-                request = self._build_request(method, path, data, request_params)
-                return match.func, request, match.kwargs
-        raise Exception(f'Cannot resolve "{path}"')
-
-    def _build_request(
-        self, method: str, path: str, data: Dict, request_params: Any
-    ) -> Mock:
-        request = Mock()
-        request.method = method
-        request.path = path
-        request.body = ""
-        request.COOKIES = {}
-        request._dont_enforce_csrf_checks = True
-        request.is_secure.return_value = False
-        request.build_absolute_uri = build_absolute_uri
-
-        if "user" not in request_params:
-            request.user.is_authenticated = False
-
-        request.META = request_params.pop("META", {})
-        request.FILES = request_params.pop("FILES", {})
-
-        request.META.update(
-            {
-                f"HTTP_{k.replace('-', '_')}": v
-                for k, v in request_params.pop("headers", {}).items()
-            }
-        )
-
-        request.headers = HttpHeaders(request.META)
-
-        if isinstance(data, QueryDict):
-            request.POST = data
-        else:
-            request.POST = QueryDict(mutable=True)
-
-            if isinstance(data, (str, bytes)):
-                request_params["body"] = data
-            elif data:
-                for k, v in data.items():
-                    request.POST[k] = v
-
-        if "?" in path:
-            request.GET = QueryDict(path.split("?")[1])
-        else:
-            request.GET = QueryDict()
-
-        for k, v in request_params.items():
-            setattr(request, k, v)
-        return request
-
-
-class TestClient(NinjaClientBase):
-    def _call(self, func: Callable, request: Mock, kwargs: Dict) -> "NinjaResponse":
-        return NinjaResponse(func(request, **kwargs))
-
-
-class TestAsyncClient(NinjaClientBase):
-    async def _call(
-        self, func: Callable, request: Mock, kwargs: Dict
-    ) -> "NinjaResponse":
-        return NinjaResponse(await func(request, **kwargs))
-
-
-class NinjaResponse:
-    def __init__(self, http_response: Union[HttpResponse, StreamingHttpResponse]):
-        self._response = http_response
-        self.status_code = http_response.status_code
-        self.streaming = http_response.streaming
-        if self.streaming:
-            self.content = b"".join(http_response.streaming_content)  # type: ignore
-        else:
-            self.content = http_response.content  # type: ignore[union-attr]
-
-    def json(self) -> Any:
-        return json_loads(self.content)
-
-    def __getitem__(self, key: str) -> Any:
-        return self._response[key]
-
-    def __getattr__(self, attr: str) -> Any:
-        return getattr(self._response, attr)
+    def to_dict(self) -> Dict[str, Any]:
+        return {"db_url": self.db_url, "model": self.model.__name__ if self.model else None}

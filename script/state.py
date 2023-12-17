@@ -1,106 +1,84 @@
-# state.py
-#
-# Copyright 2022 brombinmirko <send@mirko.pm>
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, in version 3 of the License.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
-#
-
-from datetime import datetime
-
-from gi.repository import Gtk, Adw
-
-from bottles.backend.utils.threading import RunAsync
-from bottles.frontend.utils.gtk import GtkUtils
+from collections.abc import Mapping
+from typing import Any, Dict, ItemsView, Iterator, KeysView, List, ValuesView
+from typing import Mapping as MappingType
 
 
-@Gtk.Template(resource_path='/com/usebottles/bottles/state-entry.ui')
-class StateEntry(Adw.ActionRow):
-    __gtype_name__ = 'StateEntry'
+dict
 
-    # region Widgets
-    btn_restore = Gtk.Template.Child()
-    spinner = Gtk.Template.Child()
 
-    # endregion
+class WorkerState(Mapping):
+    RESTRICTED = (
+        "health",
+        "pid",
+        "requests",
+        "restart_at",
+        "server",
+        "start_at",
+        "starts",
+        "state",
+    )
 
-    def __init__(self, parent, config, state, active, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, state: Dict[str, Any], current: str) -> None:
+        self._name = current
+        self._state = state
 
-        # common variables and references
-        self.parent = parent
-        self.window = parent.window
-        self.manager = parent.window.manager
-        self.queue = parent.window.page_details.queue
-        self.state = state
+    def __getitem__(self, key: str) -> Any:
+        return self._state[self._name][key]
 
-        if config.Versioning:
-            self.state_name = "#{} - {}".format(
-                state[0],
-                datetime.strptime(state[1]["Creation_Date"], "%Y-%m-%d %H:%M:%S.%f").strftime("%d %B %Y, %H:%M")
+    def __setitem__(self, key: str, value: Any) -> None:
+        if key in self.RESTRICTED:
+            self._write_error([key])
+        self._state[self._name] = {
+            **self._state[self._name],
+            key: value,
+        }
+
+    def __delitem__(self, key: str) -> None:
+        if key in self.RESTRICTED:
+            self._write_error([key])
+        self._state[self._name] = {
+            k: v for k, v in self._state[self._name].items() if k != key
+        }
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._state[self._name])
+
+    def __len__(self) -> int:
+        return len(self._state[self._name])
+
+    def __repr__(self) -> str:
+        return repr(self._state[self._name])
+
+    def __eq__(self, other: object) -> bool:
+        return self._state[self._name] == other
+
+    def keys(self) -> KeysView[str]:
+        return self._state[self._name].keys()
+
+    def values(self) -> ValuesView[Any]:
+        return self._state[self._name].values()
+
+    def items(self) -> ItemsView[str, Any]:
+        return self._state[self._name].items()
+
+    def update(self, mapping: MappingType[str, Any]) -> None:
+        if any(k in self.RESTRICTED for k in mapping.keys()):
+            self._write_error(
+                [k for k in mapping.keys() if k in self.RESTRICTED]
             )
+        self._state[self._name] = {
+            **self._state[self._name],
+            **mapping,
+        }
 
-            self.set_subtitle(self.state[1]["Comment"])
-            if state[0] == config.State:
-                self.add_css_class("current-state")
-        else:
-            self.state_name = "{} - {}".format(
-                state[0],
-                datetime.fromtimestamp(state[1]["timestamp"]).strftime("%d %B %Y, %H:%M")
-            )
-            self.set_subtitle(state[1]["message"])
-            if active:
-                self.add_css_class("current-state")
+    def pop(self) -> None:
+        raise NotImplementedError
 
-        self.set_title(self.state_name)
-        self.config = config
-        self.versioning_manager = self.manager.versioning_manager
+    def full(self) -> Dict[str, Any]:
+        return dict(self._state)
 
-        # connect signals
-        self.btn_restore.connect("clicked", self.set_state)
-
-    def set_state(self, widget):
-        """
-        Set the bottle state to this one.
-        """
-        self.queue.add_task()
-        self.parent.set_sensitive(False)
-        self.spinner.show()
-        self.spinner.start()
-
-        def _after():
-            self.window.page_details.view_versioning.update(None, self.config)  # update states
-            self.manager.update_bottles()  # update bottles
-
-        RunAsync(
-            task_func=self.versioning_manager.set_state,
-            callback=self.set_completed,
-            config=self.config,
-            state_id=self.state[0],
-            after=_after
+    def _write_error(self, keys: List[str]) -> None:
+        raise LookupError(
+            f"Cannot set restricted key{'s' if len(keys) > 1 else ''} on "
+            f"WorkerState: {', '.join(keys)}"
         )
-
-    @GtkUtils.run_in_main_loop
-    def set_completed(self, result, error=False):
-        """
-        Set completed status to the widget.
-        """
-        if not self.config.Versioning and result.message:
-            self.window.show_toast(result.message)
-        self.spinner.stop()
-        self.spinner.hide()
-        self.btn_restore.set_visible(False)
-        self.parent.set_sensitive(True)
-        self.queue.end_task()
-        self.manager.update_bottles()
-        config = self.manager.local_bottles[self.config.Path]
-        self.window.page_details.set_config(config)

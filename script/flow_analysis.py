@@ -1,310 +1,123 @@
-# -----------------
-# First a few name resolution things
-# -----------------
+from jedi.parser_utils import get_flow_branch_keyword, is_scope, get_parent_scope
+from jedi.inference.recursion import execution_allowed
+from jedi.inference.helpers import is_big_annoying_library
 
-x = 3
-if NOT_DEFINED:
-    x = ''
-#? 6 int()
-elif x:
-    pass
-else:
-    #? int()
-    x
 
-x = 1
-try:
-    x = ''
-#? 8 int() str()
-except x:
-    #? 5 int() str()
-    x
-    x = 1.0
-else:
-    #? 5 int() str()
-    x
-    x = list
-finally:
-    #? 5 int() str() float() list
-    x
-    x = tuple
+class Status(object):
+    lookup_table = {}
 
-if False:
-    with open("") as defined_in_false:
-        #? ['flush']
-        defined_in_false.flu
+    def __init__(self, value, name):
+        self._value = value
+        self._name = name
+        Status.lookup_table[value] = self
 
-# -----------------
-# Return checks
-# -----------------
+    def invert(self):
+        if self is REACHABLE:
+            return UNREACHABLE
+        elif self is UNREACHABLE:
+            return REACHABLE
+        else:
+            return UNSURE
 
-def foo(x):
-    if 1.0:
-        return 1
+    def __and__(self, other):
+        if UNSURE in (self, other):
+            return UNSURE
+        else:
+            return REACHABLE if self._value and other._value else UNREACHABLE
+
+    def __repr__(self):
+        return '<%s: %s>' % (type(self).__name__, self._name)
+
+
+REACHABLE = Status(True, 'reachable')
+UNREACHABLE = Status(False, 'unreachable')
+UNSURE = Status(None, 'unsure')
+
+
+def _get_flow_scopes(node):
+    while True:
+        node = get_parent_scope(node, include_flows=True)
+        if node is None or is_scope(node):
+            return
+        yield node
+
+
+def reachability_check(context, value_scope, node, origin_scope=None):
+    if is_big_annoying_library(context) \
+            or not context.inference_state.flow_analysis_enabled:
+        return UNSURE
+
+    first_flow_scope = get_parent_scope(node, include_flows=True)
+    if origin_scope is not None:
+        origin_flow_scopes = list(_get_flow_scopes(origin_scope))
+        node_flow_scopes = list(_get_flow_scopes(node))
+
+        branch_matches = True
+        for flow_scope in origin_flow_scopes:
+            if flow_scope in node_flow_scopes:
+                node_keyword = get_flow_branch_keyword(flow_scope, node)
+                origin_keyword = get_flow_branch_keyword(flow_scope, origin_scope)
+                branch_matches = node_keyword == origin_keyword
+                if flow_scope.type == 'if_stmt':
+                    if not branch_matches:
+                        return UNREACHABLE
+                elif flow_scope.type == 'try_stmt':
+                    if not branch_matches and origin_keyword == 'else' \
+                            and node_keyword == 'except':
+                        return UNREACHABLE
+                if branch_matches:
+                    break
+
+        # Direct parents get resolved, we filter scopes that are separate
+        # branches.  This makes sense for autocompletion and static analysis.
+        # For actual Python it doesn't matter, because we're talking about
+        # potentially unreachable code.
+        # e.g. `if 0:` would cause all name lookup within the flow make
+        # unaccessible. This is not a "problem" in Python, because the code is
+        # never called. In Jedi though, we still want to infer types.
+        while origin_scope is not None:
+            if first_flow_scope == origin_scope and branch_matches:
+                return REACHABLE
+            origin_scope = origin_scope.parent
+
+    return _break_check(context, value_scope, first_flow_scope, node)
+
+
+def _break_check(context, value_scope, flow_scope, node):
+    reachable = REACHABLE
+    if flow_scope.type == 'if_stmt':
+        if flow_scope.is_node_after_else(node):
+            for check_node in flow_scope.get_test_nodes():
+                reachable = _check_if(context, check_node)
+                if reachable in (REACHABLE, UNSURE):
+                    break
+            reachable = reachable.invert()
+        else:
+            flow_node = flow_scope.get_corresponding_test_node(node)
+            if flow_node is not None:
+                reachable = _check_if(context, flow_node)
+    elif flow_scope.type in ('try_stmt', 'while_stmt'):
+        return UNSURE
+
+    # Only reachable branches need to be examined further.
+    if reachable in (UNREACHABLE, UNSURE):
+        return reachable
+
+    if value_scope != flow_scope and value_scope != flow_scope.parent:
+        flow_scope = get_parent_scope(flow_scope, include_flows=True)
+        return reachable & _break_check(context, value_scope, flow_scope, node)
     else:
-        return ''
-
-#? int()
-foo(1)
+        return reachable
 
 
-#  Exceptions are not analyzed. So check both if branches
-def try_except(x):
-    try:
-        if 0:
-            return 1
+def _check_if(context, node):
+    with execution_allowed(context.inference_state, node) as allowed:
+        if not allowed:
+            return UNSURE
+
+        types = context.infer_node(node)
+        values = set(x.py__bool__() for x in types)
+        if len(values) == 1:
+            return Status.lookup_table[values.pop()]
         else:
-            return ''
-    except AttributeError:
-        return 1.0
-
-#? float() str()
-try_except(1)
-
-
-#  Exceptions are not analyzed. So check both if branches
-def try_except(x):
-    try:
-        if 0:
-            return 1
-        else:
-            return ''
-    except AttributeError:
-        return 1.0
-
-#? float() str()
-try_except(1)
-
-def test_function():
-    a = int(input())
-    if a % 2 == 0:
-        return True
-    return "False"
-
-#? bool() str()
-test_function()
-
-# -----------------
-# elif
-# -----------------
-
-def elif_flows1(x):
-    if False:
-        return 1
-    elif True:
-        return 1.0
-    else:
-        return ''
-
-#? float()
-elif_flows1(1)
-
-
-def elif_flows2(x):
-    try:
-        if False:
-            return 1
-        elif 0:
-            return 1.0
-        else:
-            return ''
-    except ValueError:
-        return set
-
-#? str() set
-elif_flows2(1)
-
-
-def elif_flows3(x):
-    try:
-        if True:
-            return 1
-        elif 0:
-            return 1.0
-        else:
-            return ''
-    except ValueError:
-        return set
-
-#? int() set
-elif_flows3(1)
-
-# -----------------
-# mid-difficulty if statements
-# -----------------
-def check(a):
-    if a is None:
-        return 1
-    return ''
-    return set
-
-#? int()
-check(None)
-#? str()
-check('asb')
-
-a = list
-if 2 == True:
-    a = set
-elif 1 == True:
-    a = 0
-
-#? int()
-a
-if check != 1:
-    a = ''
-#? int() str()
-a
-if check == check:
-    a = list
-#? list
-a
-if check != check:
-    a = set
-else:
-    a = dict
-#? dict
-a
-if not (check is not check):
-    a = 1
-#? int()
-a
-
-
-# -----------------
-# name resolution
-# -----------------
-
-a = list
-def elif_name(x):
-    try:
-        if True:
-            a = 1
-        elif 0:
-            a = 1.0
-        else:
-            return ''
-    except ValueError:
-        a = x
-    return a
-
-#? int() set
-elif_name(set)
-
-if 0:
-    a = ''
-else:
-    a = int
-
-#? int
-a
-
-# -----------------
-# isinstance
-# -----------------
-
-class A(): pass
-
-def isinst(x):
-    if isinstance(x, A):
-        return dict
-    elif isinstance(x, int) and x == 1 or x is True:
-        return set
-    elif isinstance(x, (float, reversed)):
-        return list
-    elif not isinstance(x, str):
-        return tuple
-    return 1
-
-#? dict
-isinst(A())
-#? set
-isinst(True)
-#? set
-isinst(1)
-#? tuple
-isinst(2)
-#? list
-isinst(1.0)
-#? tuple
-isinst(False)
-#? int()
-isinst('')
-
-# -----------------
-# flows that are not reachable should be able to access parent scopes.
-# -----------------
-
-foobar = ''
-
-if 0:
-    within_flow = 1.0
-    #? float()
-    within_flow
-    #? str()
-    foobar
-    if 0:
-        nested = 1
-        #? int()
-        nested
-        #? float()
-        within_flow
-        #? str()
-        foobar
-    #?
-    nested
-
-if False:
-    in_false = 1
-    #? ['in_false']
-    in_false
-
-# -----------------
-# True objects like modules
-# -----------------
-
-class X():
-    pass
-if X:
-    a = 1
-else:
-    a = ''
-#? int()
-a
-
-
-# -----------------
-# Recursion issues
-# -----------------
-
-def possible_recursion_error(filename):
-    if filename == 'a':
-        return filename
-    # It seems like without the brackets there wouldn't be a RecursionError.
-    elif type(filename) == str:
-        return filename
-
-
-if NOT_DEFINED:
-    s = str()
-else:
-    s = str()
-#? str()
-possible_recursion_error(s)
-
-
-# -----------------
-# In combination with imports
-# -----------------
-
-from import_tree import flow_import
-
-if 1 == flow_import.env:
-    a = 1
-elif 2 == flow_import.env:
-    a = ''
-elif 3 == flow_import.env:
-    a = 1.0
-
-#? int() str()
-a
+            return UNSURE

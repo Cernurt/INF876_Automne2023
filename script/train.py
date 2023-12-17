@@ -1,4 +1,4 @@
-# Copyright 2023 Baichuan Inc. All Rights Reserved.
+# Copyright 2020 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,133 +12,147 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import os
+from argparse import ArgumentParser, Namespace
 
-import argparse
-import deepspeed
-import deepspeed.comm as dist
-import numpy as np
-import sentencepiece as spm
-import torch
-
-from models.configuration_baichuan import BaiChuanConfig
-from models.modeling_baichuan import BaiChuanForCausalLM
+from ..data import SingleSentenceClassificationProcessor as Processor
+from ..pipelines import TextClassificationPipeline
+from ..utils import is_tf_available, is_torch_available, logging
+from . import BaseTransformersCLICommand
 
 
-def get_argument_parser():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="data_dir",
-                        help="Text files to do pre-train on")
+if not is_tf_available() and not is_torch_available():
+    raise RuntimeError("At least one of PyTorch or TensorFlow 2.0+ should be installed to use CLI training")
 
-    parser.add_argument("--tokenizer_path", type=str,
-                        default="tokenizer.model",
-                        help="Tokenizer model file path")
-
-    parser.add_argument("--max_length", type=int, default=4096,
-                        help="Max tokens per sentence in corpus")
-
-    parser.add_argument("--steps_per_epoch", type=int, default=4096,
-                        help="Step intervals to save checkpoint")
-
-    parser.add_argument("--checkpoint_saving_path", type=str,
-                        default="checkpoints",
-                        help="Path to store checkpoint files")
-
-    parser.add_argument("--local_rank", type=int, default=-1,
-                        help="Reserved for deepspeed framework")
-    return parser
+# TF training parameters
+USE_XLA = False
+USE_AMP = False
 
 
-arg_parser = get_argument_parser()
-arg_parser = deepspeed.add_config_arguments(arg_parser)
-args = arg_parser.parse_args()
-deepspeed.init_distributed()
+def train_command_factory(args: Namespace):
+    """
+    Factory function used to instantiate training command from provided command line arguments.
+
+    Returns: TrainCommand
+    """
+    return TrainCommand(args)
 
 
-class DataEngine():
-    def __init__(self, data_dir, tokenizer_path, micro_batch_size, max_length):
-        self.MIN_TEXT_LEN = 20
-        self.EOS_TOKEN_ID = 2
-        self.data_dir = data_dir
-        self.sp = spm.SentencePieceProcessor()
-        self.sp.Load(tokenizer_path)
-        self.micro_batch_size = micro_batch_size
-        self.max_length = max_length
-        self.data = []
-        self.global_input_paths = [self.data_dir + "/" + x
-                                   for x in os.listdir(self.data_dir)]
-        self.local_input_paths = [x for i, x in
-                                  enumerate(self.global_input_paths)
-                                  if i % dist.get_world_size() == dist.get_rank()]
+class TrainCommand(BaseTransformersCLICommand):
+    @staticmethod
+    def register_subcommand(parser: ArgumentParser):
+        """
+        Register this command to argparse so it's available for the transformer-cli
 
-    def load_data(self):
-        for file_path in self.local_input_paths:
-            data = []
-            with open(file_path, encoding="utf-8", errors="ignore") as f:
-                for line_id, line in enumerate(f):
-                    cc = self.sp.EncodeAsIds(line.strip()) + [self.EOS_TOKEN_ID]
-                    if len(cc) < self.MIN_TEXT_LEN:
-                        cc = []
-                    data.extend(cc)
-                    if len(data) >= self.micro_batch_size * (self.max_length + 1):
-                        index = self.micro_batch_size * (self.max_length + 1)
-                        self.data.append(data[:index])
-                        data = []
-        return
+        Args:
+            parser: Root parser to register command-specific arguments
+        """
+        train_parser = parser.add_parser("train", help="CLI tool to train a model on a task.")
 
-    def get_data(self):
-        data = self.data.pop(0)
-        seq = np.asarray(data).reshape(self.micro_batch_size, self.max_length + 1)
-        data = torch.LongTensor(seq)
-        data = data.cuda(non_blocking=True)
-        return data
+        train_parser.add_argument(
+            "--train_data",
+            type=str,
+            required=True,
+            help="path to train (and optionally evaluation) dataset as a csv with tab separated labels and sentences.",
+        )
+        train_parser.add_argument(
+            "--column_label", type=int, default=0, help="Column of the dataset csv file with example labels."
+        )
+        train_parser.add_argument(
+            "--column_text", type=int, default=1, help="Column of the dataset csv file with example texts."
+        )
+        train_parser.add_argument(
+            "--column_id", type=int, default=2, help="Column of the dataset csv file with example ids."
+        )
+        train_parser.add_argument(
+            "--skip_first_row", action="store_true", help="Skip the first row of the csv file (headers)."
+        )
 
+        train_parser.add_argument("--validation_data", type=str, default="", help="path to validation dataset.")
+        train_parser.add_argument(
+            "--validation_split",
+            type=float,
+            default=0.1,
+            help="if validation dataset is not provided, fraction of train dataset to use as validation dataset.",
+        )
 
-def prepare_data():
-    data_dir = args.data_dir
-    tokenizer_path = args.tokenizer_path
-    ds_config = json.load(open(args.deepspeed_config))
-    micro_batch_size = ds_config["train_micro_batch_size_per_gpu"]
-    max_length = args.max_length
-    data_engine = DataEngine(data_dir, tokenizer_path, micro_batch_size, max_length)
-    data_engine.load_data()
-    return data_engine
+        train_parser.add_argument("--output", type=str, default="./", help="path to saved the trained model.")
 
+        train_parser.add_argument(
+            "--task", type=str, default="text_classification", help="Task to train the model on."
+        )
+        train_parser.add_argument(
+            "--model", type=str, default="bert-base-uncased", help="Model's name or path to stored model."
+        )
+        train_parser.add_argument("--train_batch_size", type=int, default=32, help="Batch size for training.")
+        train_parser.add_argument("--valid_batch_size", type=int, default=64, help="Batch size for validation.")
+        train_parser.add_argument("--learning_rate", type=float, default=3e-5, help="Learning rate.")
+        train_parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon for Adam optimizer.")
+        train_parser.set_defaults(func=train_command_factory)
 
-def prepare_model():
-    with deepspeed.zero.Init(config_dict_or_path=args.deepspeed_config,
-                             enabled=True,
-                             mem_efficient_linear=False,
-                             mpu=None):
-        model = BaiChuanForCausalLM(BaiChuanConfig())
+    def __init__(self, args: Namespace):
+        self.logger = logging.get_logger("transformers-cli/training")
 
-    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
-    model_engine, _, _, _ = deepspeed.initialize(args=args,
-                                                 model=model,
-                                                 optimizer=None,
-                                                 model_parameters=model_parameters)
-    return model_engine
+        self.framework = "tf" if is_tf_available() else "torch"
 
+        os.makedirs(args.output, exist_ok=True)
+        self.output = args.output
 
-def train(data_engine, model_engine):
-    model_engine.train()
-    step = 0
-    while step < args.steps_per_epoch:
-        data = data_engine.get_data()
-        loss = model_engine(data, labels=data).loss
-        model_engine.backward(loss)
-        model_engine.step()
-        step += 1
-    return
+        self.column_label = args.column_label
+        self.column_text = args.column_text
+        self.column_id = args.column_id
 
+        self.logger.info(f"Loading {args.task} pipeline for {args.model}")
+        if args.task == "text_classification":
+            self.pipeline = TextClassificationPipeline.from_pretrained(args.model)
+        elif args.task == "token_classification":
+            raise NotImplementedError
+        elif args.task == "question_answering":
+            raise NotImplementedError
 
-if __name__ == "__main__":
-    data_engine = prepare_data()
-    model_engine = prepare_model()
-    epoch = 0
-    while True:
-        train(data_engine, model_engine)
-        epoch += 1
-        model_engine.save_checkpoint(f"{args.checkpoint_saving_path}",
-                                     tag=f"Epoch-{epoch}")
+        self.logger.info(f"Loading dataset from {args.train_data}")
+        self.train_dataset = Processor.create_from_csv(
+            args.train_data,
+            column_label=args.column_label,
+            column_text=args.column_text,
+            column_id=args.column_id,
+            skip_first_row=args.skip_first_row,
+        )
+        self.valid_dataset = None
+        if args.validation_data:
+            self.logger.info(f"Loading validation dataset from {args.validation_data}")
+            self.valid_dataset = Processor.create_from_csv(
+                args.validation_data,
+                column_label=args.column_label,
+                column_text=args.column_text,
+                column_id=args.column_id,
+                skip_first_row=args.skip_first_row,
+            )
+
+        self.validation_split = args.validation_split
+        self.train_batch_size = args.train_batch_size
+        self.valid_batch_size = args.valid_batch_size
+        self.learning_rate = args.learning_rate
+        self.adam_epsilon = args.adam_epsilon
+
+    def run(self):
+        if self.framework == "tf":
+            return self.run_tf()
+        return self.run_torch()
+
+    def run_torch(self):
+        raise NotImplementedError
+
+    def run_tf(self):
+        self.pipeline.fit(
+            self.train_dataset,
+            validation_data=self.valid_dataset,
+            validation_split=self.validation_split,
+            learning_rate=self.learning_rate,
+            adam_epsilon=self.adam_epsilon,
+            train_batch_size=self.train_batch_size,
+            valid_batch_size=self.valid_batch_size,
+        )
+
+        # Save trained pipeline
+        self.pipeline.save_pretrained(self.output)

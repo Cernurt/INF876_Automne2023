@@ -1,119 +1,193 @@
-try:
-    import readline
-except ImportError:
-    readline = False
-import unittest
+# Owner(s): ["oncall: quantization"]
 
-from jedi import utils
+import torch
+from torch.testing._internal.common_utils import TestCase
+from torch.ao.quantization.utils import get_fqn_to_example_inputs
+from torch.ao.nn.quantized.modules.utils import _quantize_weight
+from torch.ao.quantization import MovingAverageMinMaxObserver, MovingAveragePerChannelMinMaxObserver
 
 
-@unittest.skipIf(not readline, "readline not found")
-class TestSetupReadline(unittest.TestCase):
-    class NameSpace(object):
-        pass
+class TestUtils(TestCase):
+    def _test_get_fqn_to_example_inputs(self, M, example_inputs, expected_fqn_to_dim):
+        m = M().eval()
+        fqn_to_example_inputs = get_fqn_to_example_inputs(m, example_inputs)
+        for fqn, expected_dims in expected_fqn_to_dim.items():
+            assert fqn in expected_fqn_to_dim
+            example_inputs = fqn_to_example_inputs[fqn]
+            for example_input, expected_dim in zip(example_inputs, expected_dims):
+                assert example_input.dim() == expected_dim
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def test_get_fqn_to_example_inputs_simple(self):
+        class Sub(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = torch.nn.Linear(5, 5)
+                self.linear2 = torch.nn.Linear(5, 5)
 
-        self.namespace = self.NameSpace()
-        utils.setup_readline(self.namespace)
+            def forward(self, x):
+                x = self.linear1(x)
+                x = self.linear2(x)
+                return x
 
-    def complete(self, text):
-        completer = readline.get_completer()
-        i = 0
-        completions = []
-        while True:
-            completion = completer(text, i)
-            if completion is None:
-                break
-            completions.append(completion)
-            i += 1
-        return completions
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = torch.nn.Linear(5, 5)
+                self.linear2 = torch.nn.Linear(5, 5)
+                self.sub = Sub()
 
-    def test_simple(self):
-        assert self.complete('list') == ['list']
-        assert self.complete('importerror') == ['ImportError']
-        s = "print(BaseE"
-        assert self.complete(s) == [s + 'xception']
+            def forward(self, x):
+                x = self.linear1(x)
+                x = self.linear2(x)
+                x = self.sub(x)
+                return x
 
-    def test_nested(self):
-        assert self.complete('list.Insert') == ['list.insert']
-        assert self.complete('list().Insert') == ['list().insert']
-
-    def test_magic_methods(self):
-        assert self.complete('list.__getitem__') == ['list.__getitem__']
-        assert self.complete('list().__getitem__') == ['list().__getitem__']
-
-    def test_modules(self):
-        import sys
-        import os
-        self.namespace.sys = sys
-        self.namespace.os = os
-
-        try:
-            assert self.complete('os.path.join') == ['os.path.join']
-            string = 'os.path.join("a").upper'
-            assert self.complete(string) == [string]
-
-            c = {'os.' + d for d in dir(os) if d.startswith('ch')}
-            assert set(self.complete('os.ch')) == set(c)
-        finally:
-            del self.namespace.sys
-            del self.namespace.os
-
-    def test_calls(self):
-        s = 'str(bytes'
-        assert self.complete(s) == [s, 'str(BytesWarning']
-
-    def test_import(self):
-        s = 'from os.path import a'
-        assert set(self.complete(s)) == {s + 'ltsep', s + 'bspath'}
-        assert self.complete('import keyword') == ['import keyword']
-
-        import os
-        s = 'from os import '
-        goal = {s + el for el in dir(os)}
-        # There are minor differences, e.g. the dir doesn't include deleted
-        # items as well as items that are not only available on linux.
-        difference = set(self.complete(s)).symmetric_difference(goal)
-        difference = {
-            x for x in difference
-            if all(not x.startswith('from os import ' + s)
-                   for s in ['_', 'O_', 'EX_', 'MFD_', 'SF_', 'ST_',
-                             'CLD_', 'POSIX_SPAWN_', 'P_', 'RWF_',
-                             'CLONE_', 'SCHED_'])
+        expected_fqn_to_dim = {
+            "": (2,),
+            "linear1": (2,),
+            "linear2": (2,),
+            "sub": (2,),
+            "sub.linear1": (2,),
+            "sub.linear2": (2,)
         }
-        # There are quite a few differences, because both Windows and Linux
-        # (posix and nt) libraries are included.
-        assert len(difference) < 30
+        example_inputs = (torch.rand(1, 5),)
+        self._test_get_fqn_to_example_inputs(M, example_inputs, expected_fqn_to_dim)
 
-    def test_local_import(self):
-        s = 'import test.test_utils'
-        assert self.complete(s) == [s]
-
-    def test_preexisting_values(self):
-        self.namespace.a = range(10)
-        assert set(self.complete('a.')) == {'a.' + n for n in dir(range(1))}
-        del self.namespace.a
-
-    def test_colorama(self):
+    def test_get_fqn_to_example_inputs_default_kwargs(self):
+        """ Test that we can get example inputs for functions with default keyword arguments
         """
-        Only test it if colorama library is available.
+        class Sub(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = torch.nn.Linear(5, 5)
+                self.linear2 = torch.nn.Linear(5, 5)
 
-        This module is being tested because it uses ``setattr`` at some point,
-        which Jedi doesn't understand, but it should still work in the REPL.
+            def forward(self, x, key1=torch.rand(1), key2=torch.rand(1)):
+                x = self.linear1(x)
+                x = self.linear2(x)
+                return x
+
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = torch.nn.Linear(5, 5)
+                self.linear2 = torch.nn.Linear(5, 5)
+                self.sub = Sub()
+
+            def forward(self, x):
+                x = self.linear1(x)
+                x = self.linear2(x)
+                # only override `key2`, `key1` will use default
+                x = self.sub(x, key2=torch.rand(1, 2))
+                return x
+
+        expected_fqn_to_dim = {
+            "": (2,),
+            "linear1": (2,),
+            "linear2": (2,),
+            # second arg is `key1`, which is using default argument
+            # third arg is `key2`, override by callsite
+            "sub": (2, 1, 2),
+            "sub.linear1": (2,),
+            "sub.linear2": (2,)
+        }
+        example_inputs = (torch.rand(1, 5),)
+        self._test_get_fqn_to_example_inputs(M, example_inputs, expected_fqn_to_dim)
+
+    def test_get_fqn_to_example_inputs_complex_args(self):
+        """ Test that we can record complex example inputs such as lists and dicts
         """
-        try:
-            # if colorama is installed
-            import colorama
-        except ImportError:
-            pass
-        else:
-            self.namespace.colorama = colorama
-            assert self.complete('colorama')
-            assert self.complete('colorama.Fore.BLACK') == ['colorama.Fore.BLACK']
-            del self.namespace.colorama
+        class Sub(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = torch.nn.Linear(5, 5)
+                self.linear2 = torch.nn.Linear(5, 5)
 
+            def forward(self, x, list_arg, dict_arg):
+                x = self.linear1(x)
+                x = self.linear2(x)
+                return x
 
-def test_version_info():
-    assert utils.version_info()[:2] > (0, 7)
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = torch.nn.Linear(5, 5)
+                self.linear2 = torch.nn.Linear(5, 5)
+                self.sub = Sub()
+
+            def forward(self, x):
+                x = self.linear1(x)
+                x = self.linear2(x)
+                x = self.sub(x, [x], {"3": x})
+                return x
+
+        example_inputs = (torch.rand(1, 5),)
+        m = M().eval()
+        fqn_to_example_inputs = get_fqn_to_example_inputs(m, example_inputs)
+        assert "sub" in fqn_to_example_inputs
+        assert isinstance(fqn_to_example_inputs["sub"][1], list)
+        assert isinstance(fqn_to_example_inputs["sub"][2], dict) and \
+            "3" in fqn_to_example_inputs["sub"][2]
+
+    def test_quantize_weight_clamping_per_tensor(self):
+        """ Test quant_{min, max} from per tensor observer is honored by `_quantize_weight` method
+        """
+        fp_min, fp_max = -1000.0, 1000.0
+        q8_min, q8_max = -10, 10
+
+        float_tensor = torch.tensor([fp_min, fp_max])
+
+        observer = MovingAverageMinMaxObserver(
+            averaging_constant=1.0,
+            dtype=torch.qint8,
+            quant_min=q8_min,
+            quant_max=q8_max,
+            qscheme=torch.per_tensor_symmetric,
+        )
+
+        observer(float_tensor)
+        assert observer.min_val == fp_min
+        assert observer.max_val == fp_max
+
+        quantized_tensor = _quantize_weight(float_tensor, observer)
+        assert quantized_tensor.int_repr().max().item() == q8_max
+        assert quantized_tensor.int_repr().min().item() == q8_min
+
+        # Actual weight values can be outside than observer [min_val, max_val] for the moving average observer
+        float_tensor *= 1.2
+
+        quantized_tensor = _quantize_weight(float_tensor, observer)
+        assert quantized_tensor.int_repr().max().item() == q8_max
+        assert quantized_tensor.int_repr().min().item() == q8_min
+
+    def test_quantize_weight_clamping_per_channel(self):
+        """ Test quant_{min, max} from per channel observer is honored by `_quantize_weight` method
+        """
+        fp_min, fp_max = -1000.0, 1000.0
+        q8_min, q8_max = -10, 10
+
+        float_tensor = torch.tensor([[fp_min, fp_max]])
+
+        observer = MovingAveragePerChannelMinMaxObserver(
+            averaging_constant=1.0,
+            dtype=torch.qint8,
+            quant_min=q8_min,
+            quant_max=q8_max,
+            qscheme=torch.per_channel_symmetric,
+            ch_axis=0,
+        )
+
+        observer(float_tensor)
+        assert observer.min_val == fp_min
+        assert observer.max_val == fp_max
+
+        quantized_tensor = _quantize_weight(float_tensor, observer)
+        assert quantized_tensor.int_repr().max().item() == q8_max
+        assert quantized_tensor.int_repr().min().item() == q8_min
+
+        # Actual weight values can be outside than observer [min_val, max_val] for the moving average observer
+        float_tensor *= 1.2
+
+        quantized_tensor = _quantize_weight(float_tensor, observer)
+        assert quantized_tensor.int_repr().max().item() == q8_max
+        assert quantized_tensor.int_repr().min().item() == q8_min

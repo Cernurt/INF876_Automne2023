@@ -1,151 +1,162 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-# 
+# Copyright 2020 The HuggingFace Team. All rights reserved.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# 
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-# 
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import torch
-from torchvision.models.resnet import resnet50
 
-import vision_transformer as vits
-
-dependencies = ["torch", "torchvision"]
+import os
+import sys
 
 
-def dino_vits16(pretrained=True, **kwargs):
+SRC_DIR = os.path.join(os.path.dirname(__file__), "src")
+sys.path.append(SRC_DIR)
+
+
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoModelForMaskedLM,
+    AutoModelForQuestionAnswering,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    add_start_docstrings,
+)
+
+
+dependencies = ["torch", "numpy", "tokenizers", "filelock", "requests", "tqdm", "regex", "sentencepiece", "sacremoses", "importlib_metadata", "huggingface_hub"]
+
+
+@add_start_docstrings(AutoConfig.__doc__)
+def config(*args, **kwargs):
+    r"""
+                # Using torch.hub !
+                import torch
+
+                config = torch.hub.load('huggingface/transformers', 'config', 'bert-base-uncased')  # Download configuration from huggingface.co and cache.
+                config = torch.hub.load('huggingface/transformers', 'config', './test/bert_saved_model/')  # E.g. config (or model) was saved using `save_pretrained('./test/saved_model/')`
+                config = torch.hub.load('huggingface/transformers', 'config', './test/bert_saved_model/my_configuration.json')
+                config = torch.hub.load('huggingface/transformers', 'config', 'bert-base-uncased', output_attentions=True, foo=False)
+                assert config.output_attentions == True
+                config, unused_kwargs = torch.hub.load('huggingface/transformers', 'config', 'bert-base-uncased', output_attentions=True, foo=False, return_unused_kwargs=True)
+                assert config.output_attentions == True
+                assert unused_kwargs == {'foo': False}
+
+            """
+
+    return AutoConfig.from_pretrained(*args, **kwargs)
+
+
+@add_start_docstrings(AutoTokenizer.__doc__)
+def tokenizer(*args, **kwargs):
+    r"""
+        # Using torch.hub !
+        import torch
+
+        tokenizer = torch.hub.load('huggingface/transformers', 'tokenizer', 'bert-base-uncased')    # Download vocabulary from huggingface.co and cache.
+        tokenizer = torch.hub.load('huggingface/transformers', 'tokenizer', './test/bert_saved_model/')  # E.g. tokenizer was saved using `save_pretrained('./test/saved_model/')`
+
     """
-    ViT-Small/16x16 pre-trained with DINO.
-    Achieves 74.5% top-1 accuracy on ImageNet with k-NN classification.
-    """
-    model = vits.__dict__["vit_small"](patch_size=16, num_classes=0, **kwargs)
-    if pretrained:
-        state_dict = torch.hub.load_state_dict_from_url(
-            url="https://dl.fbaipublicfiles.com/dino/dino_deitsmall16_pretrain/dino_deitsmall16_pretrain.pth",
-            map_location="cpu",
-        )
-        model.load_state_dict(state_dict, strict=True)
-    return model
+
+    return AutoTokenizer.from_pretrained(*args, **kwargs)
 
 
-def dino_vits8(pretrained=True, **kwargs):
-    """
-    ViT-Small/8x8 pre-trained with DINO.
-    Achieves 78.3% top-1 accuracy on ImageNet with k-NN classification.
-    """
-    model = vits.__dict__["vit_small"](patch_size=8, num_classes=0, **kwargs)
-    if pretrained:
-        state_dict = torch.hub.load_state_dict_from_url(
-            url="https://dl.fbaipublicfiles.com/dino/dino_deitsmall8_pretrain/dino_deitsmall8_pretrain.pth",
-            map_location="cpu",
-        )
-        model.load_state_dict(state_dict, strict=True)
-    return model
+@add_start_docstrings(AutoModel.__doc__)
+def model(*args, **kwargs):
+    r"""
+            # Using torch.hub !
+            import torch
+
+            model = torch.hub.load('huggingface/transformers', 'model', 'bert-base-uncased')    # Download model and configuration from huggingface.co and cache.
+            model = torch.hub.load('huggingface/transformers', 'model', './test/bert_model/')  # E.g. model was saved using `save_pretrained('./test/saved_model/')`
+            model = torch.hub.load('huggingface/transformers', 'model', 'bert-base-uncased', output_attentions=True)  # Update configuration during loading
+            assert model.config.output_attentions == True
+            # Loading from a TF checkpoint file instead of a PyTorch model (slower)
+            config = AutoConfig.from_pretrained('./tf_model/bert_tf_model_config.json')
+            model = torch.hub.load('huggingface/transformers', 'model', './tf_model/bert_tf_checkpoint.ckpt.index', from_tf=True, config=config)
+
+        """
+
+    return AutoModel.from_pretrained(*args, **kwargs)
 
 
-def dino_vitb16(pretrained=True, **kwargs):
+@add_start_docstrings(AutoModelForCausalLM.__doc__)
+def modelForCausalLM(*args, **kwargs):
+    r"""
+        # Using torch.hub !
+        import torch
+
+        model = torch.hub.load('huggingface/transformers', 'modelForCausalLM', 'gpt2')    # Download model and configuration from huggingface.co and cache.
+        model = torch.hub.load('huggingface/transformers', 'modelForCausalLM', './test/saved_model/')  # E.g. model was saved using `save_pretrained('./test/saved_model/')`
+        model = torch.hub.load('huggingface/transformers', 'modelForCausalLM', 'gpt2', output_attentions=True)  # Update configuration during loading
+        assert model.config.output_attentions == True
+        # Loading from a TF checkpoint file instead of a PyTorch model (slower)
+        config = AutoConfig.from_pretrained('./tf_model/gpt_tf_model_config.json')
+        model = torch.hub.load('huggingface/transformers', 'modelForCausalLM', './tf_model/gpt_tf_checkpoint.ckpt.index', from_tf=True, config=config)
+
     """
-    ViT-Base/16x16 pre-trained with DINO.
-    Achieves 76.1% top-1 accuracy on ImageNet with k-NN classification.
-    """
-    model = vits.__dict__["vit_base"](patch_size=16, num_classes=0, **kwargs)
-    if pretrained:
-        state_dict = torch.hub.load_state_dict_from_url(
-            url="https://dl.fbaipublicfiles.com/dino/dino_vitbase16_pretrain/dino_vitbase16_pretrain.pth",
-            map_location="cpu",
-        )
-        model.load_state_dict(state_dict, strict=True)
-    return model
+    return AutoModelForCausalLM.from_pretrained(*args, **kwargs)
 
 
-def dino_vitb8(pretrained=True, **kwargs):
-    """
-    ViT-Base/8x8 pre-trained with DINO.
-    Achieves 77.4% top-1 accuracy on ImageNet with k-NN classification.
-    """
-    model = vits.__dict__["vit_base"](patch_size=8, num_classes=0, **kwargs)
-    if pretrained:
-        state_dict = torch.hub.load_state_dict_from_url(
-            url="https://dl.fbaipublicfiles.com/dino/dino_vitbase8_pretrain/dino_vitbase8_pretrain.pth",
-            map_location="cpu",
-        )
-        model.load_state_dict(state_dict, strict=True)
-    return model
+@add_start_docstrings(AutoModelForMaskedLM.__doc__)
+def modelForMaskedLM(*args, **kwargs):
+    r"""
+            # Using torch.hub !
+            import torch
+
+            model = torch.hub.load('huggingface/transformers', 'modelForMaskedLM', 'bert-base-uncased')    # Download model and configuration from huggingface.co and cache.
+            model = torch.hub.load('huggingface/transformers', 'modelForMaskedLM', './test/bert_model/')  # E.g. model was saved using `save_pretrained('./test/saved_model/')`
+            model = torch.hub.load('huggingface/transformers', 'modelForMaskedLM', 'bert-base-uncased', output_attentions=True)  # Update configuration during loading
+            assert model.config.output_attentions == True
+            # Loading from a TF checkpoint file instead of a PyTorch model (slower)
+            config = AutoConfig.from_pretrained('./tf_model/bert_tf_model_config.json')
+            model = torch.hub.load('huggingface/transformers', 'modelForMaskedLM', './tf_model/bert_tf_checkpoint.ckpt.index', from_tf=True, config=config)
+
+        """
+
+    return AutoModelForMaskedLM.from_pretrained(*args, **kwargs)
 
 
-def dino_resnet50(pretrained=True, **kwargs):
-    """
-    ResNet-50 pre-trained with DINO.
-    Achieves 75.3% top-1 accuracy on ImageNet linear evaluation benchmark (requires to train `fc`).
-    """
-    model = resnet50(pretrained=False, **kwargs)
-    model.fc = torch.nn.Identity()
-    if pretrained:
-        state_dict = torch.hub.load_state_dict_from_url(
-            url="https://dl.fbaipublicfiles.com/dino/dino_resnet50_pretrain/dino_resnet50_pretrain.pth",
-            map_location="cpu",
-        )
-        model.load_state_dict(state_dict, strict=False)
-    return model
+@add_start_docstrings(AutoModelForSequenceClassification.__doc__)
+def modelForSequenceClassification(*args, **kwargs):
+    r"""
+            # Using torch.hub !
+            import torch
+
+            model = torch.hub.load('huggingface/transformers', 'modelForSequenceClassification', 'bert-base-uncased')    # Download model and configuration from huggingface.co and cache.
+            model = torch.hub.load('huggingface/transformers', 'modelForSequenceClassification', './test/bert_model/')  # E.g. model was saved using `save_pretrained('./test/saved_model/')`
+            model = torch.hub.load('huggingface/transformers', 'modelForSequenceClassification', 'bert-base-uncased', output_attentions=True)  # Update configuration during loading
+            assert model.config.output_attentions == True
+            # Loading from a TF checkpoint file instead of a PyTorch model (slower)
+            config = AutoConfig.from_pretrained('./tf_model/bert_tf_model_config.json')
+            model = torch.hub.load('huggingface/transformers', 'modelForSequenceClassification', './tf_model/bert_tf_checkpoint.ckpt.index', from_tf=True, config=config)
+
+        """
+
+    return AutoModelForSequenceClassification.from_pretrained(*args, **kwargs)
 
 
-def dino_xcit_small_12_p16(pretrained=True, **kwargs):
-    """
-    XCiT-Small-12/16 pre-trained with DINO.
-    """
-    model = torch.hub.load('facebookresearch/xcit:main', "xcit_small_12_p16", num_classes=0, **kwargs)
-    if pretrained:
-        state_dict = torch.hub.load_state_dict_from_url(
-            url="https://dl.fbaipublicfiles.com/dino/dino_xcit_small_12_p16_pretrain/dino_xcit_small_12_p16_pretrain.pth",
-            map_location="cpu",
-        )
-        model.load_state_dict(state_dict, strict=True)
-    return model
+@add_start_docstrings(AutoModelForQuestionAnswering.__doc__)
+def modelForQuestionAnswering(*args, **kwargs):
+    r"""
+        # Using torch.hub !
+        import torch
 
+        model = torch.hub.load('huggingface/transformers', 'modelForQuestionAnswering', 'bert-base-uncased')    # Download model and configuration from huggingface.co and cache.
+        model = torch.hub.load('huggingface/transformers', 'modelForQuestionAnswering', './test/bert_model/')  # E.g. model was saved using `save_pretrained('./test/saved_model/')`
+        model = torch.hub.load('huggingface/transformers', 'modelForQuestionAnswering', 'bert-base-uncased', output_attentions=True)  # Update configuration during loading
+        assert model.config.output_attentions == True
+        # Loading from a TF checkpoint file instead of a PyTorch model (slower)
+        config = AutoConfig.from_pretrained('./tf_model/bert_tf_model_config.json')
+        model = torch.hub.load('huggingface/transformers', 'modelForQuestionAnswering', './tf_model/bert_tf_checkpoint.ckpt.index', from_tf=True, config=config)
 
-def dino_xcit_small_12_p8(pretrained=True, **kwargs):
     """
-    XCiT-Small-12/8 pre-trained with DINO.
-    """
-    model = torch.hub.load('facebookresearch/xcit:main', "xcit_small_12_p8", num_classes=0, **kwargs)
-    if pretrained:
-        state_dict = torch.hub.load_state_dict_from_url(
-            url="https://dl.fbaipublicfiles.com/dino/dino_xcit_small_12_p8_pretrain/dino_xcit_small_12_p8_pretrain.pth",
-            map_location="cpu",
-        )
-        model.load_state_dict(state_dict, strict=True)
-    return model
-
-
-def dino_xcit_medium_24_p16(pretrained=True, **kwargs):
-    """
-    XCiT-Medium-24/16 pre-trained with DINO.
-    """
-    model = torch.hub.load('facebookresearch/xcit:main', "xcit_medium_24_p16", num_classes=0, **kwargs)
-    if pretrained:
-        state_dict = torch.hub.load_state_dict_from_url(
-            url="https://dl.fbaipublicfiles.com/dino/dino_xcit_medium_24_p16_pretrain/dino_xcit_medium_24_p16_pretrain.pth",
-            map_location="cpu",
-        )
-        model.load_state_dict(state_dict, strict=True)
-    return model
-
-
-def dino_xcit_medium_24_p8(pretrained=True, **kwargs):
-    """
-    XCiT-Medium-24/8 pre-trained with DINO.
-    """
-    model = torch.hub.load('facebookresearch/xcit:main', "xcit_medium_24_p8", num_classes=0, **kwargs)
-    if pretrained:
-        state_dict = torch.hub.load_state_dict_from_url(
-            url="https://dl.fbaipublicfiles.com/dino/dino_xcit_medium_24_p8_pretrain/dino_xcit_medium_24_p8_pretrain.pth",
-            map_location="cpu",
-        )
-        model.load_state_dict(state_dict, strict=True)
-    return model
+    return AutoModelForQuestionAnswering.from_pretrained(*args, **kwargs)

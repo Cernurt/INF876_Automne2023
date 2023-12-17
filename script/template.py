@@ -1,196 +1,246 @@
-# template.py
-#
-# Copyright 2022 brombinmirko <send@mirko.pm>
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, in version 3 of the License.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
-#
+import warnings
+from io import StringIO
 
-import os
+from django.template.base import Lexer, TokenType
+from django.utils.regex_helper import _lazy_re_compile
 
-from bottles.backend.models.config import BottleConfig
-from bottles.backend.utils import yaml
-import uuid
-import shutil
-import contextlib
-from datetime import datetime
-from pathlib import Path
+from . import TranslatorCommentWarning, trim_whitespace
 
-from bottles.backend.logger import Logger
-from bottles.backend.utils.manager import ManagerUtils
-from bottles.backend.globals import Paths
-from bottles.backend.models.samples import Samples
+TRANSLATOR_COMMENT_MARK = "Translators"
 
-logging = Logger()
+dot_re = _lazy_re_compile(r"\S")
 
 
-class TemplateManager:
+def blankout(src, char):
+    """
+    Change every non-whitespace character to the given char.
+    Used in the templatize function.
+    """
+    return dot_re.sub(char, src)
 
-    @staticmethod
-    def new(env: str, config: BottleConfig):
-        env = env.lower()
-        templates = TemplateManager.get_templates()
 
-        for template in templates:
-            if template["env"] == env:
-                logging.info(f"Caching new template for {env}…")
-                TemplateManager.delete_template(template["uuid"])
+context_re = _lazy_re_compile(r"""^\s+.*context\s+((?:"[^"]*?")|(?:'[^']*?'))\s*""")
+inline_re = _lazy_re_compile(
+    # Match the trans/translate 'some text' part.
+    r"""^\s*trans(?:late)?\s+((?:"[^"]*?")|(?:'[^']*?'))"""
+    # Match and ignore optional filters
+    r"""(?:\s*\|\s*[^\s:]+(?::(?:[^\s'":]+|(?:"[^"]*?")|(?:'[^']*?')))?)*"""
+    # Match the optional context part
+    r"""(\s+.*context\s+((?:"[^"]*?")|(?:'[^']*?')))?\s*"""
+)
+block_re = _lazy_re_compile(
+    r"""^\s*blocktrans(?:late)?(\s+.*context\s+((?:"[^"]*?")|(?:'[^']*?')))?(?:\s+|$)"""
+)
+endblock_re = _lazy_re_compile(r"""^\s*endblocktrans(?:late)?$""")
+plural_re = _lazy_re_compile(r"""^\s*plural$""")
+constant_re = _lazy_re_compile(r"""_\(((?:".*?")|(?:'.*?'))\)""")
 
-        _uuid = str(uuid.uuid4())
-        logging.info(f"Creating new template: {_uuid}")
-        bottle = ManagerUtils.get_bottle_path(config)
 
-        delattr(config, "Name")
-        delattr(config, "Path")
-        delattr(config, "Creation_Date")
-        delattr(config, "Update_Date")
+def templatize(src, origin=None):
+    """
+    Turn a Django template into something that is understood by xgettext. It
+    does so by translating the Django translation tags into standard gettext
+    function invocations.
+    """
+    out = StringIO("")
+    message_context = None
+    intrans = False
+    inplural = False
+    trimmed = False
+    singular = []
+    plural = []
+    incomment = False
+    comment = []
+    lineno_comment_map = {}
+    comment_lineno_cache = None
+    # Adding the u prefix allows gettext to recognize the string (#26093).
+    raw_prefix = "u"
 
-        ignored = [
-            "dosdevices",
-            "states",
-            ".fvs",
-            "*.yml"
-            ".*"
-        ]
+    def join_tokens(tokens, trim=False):
+        message = "".join(tokens)
+        if trim:
+            message = trim_whitespace(message)
+        return message
 
-        _path = os.path.join(Paths.templates, _uuid)
-        logging.info("Copying files …")
+    for t in Lexer(src).tokenize():
+        if incomment:
+            if t.token_type == TokenType.BLOCK and t.contents == "endcomment":
+                content = "".join(comment)
+                translators_comment_start = None
+                for lineno, line in enumerate(content.splitlines(True)):
+                    if line.lstrip().startswith(TRANSLATOR_COMMENT_MARK):
+                        translators_comment_start = lineno
+                for lineno, line in enumerate(content.splitlines(True)):
+                    if (
+                        translators_comment_start is not None
+                        and lineno >= translators_comment_start
+                    ):
+                        out.write(" # %s" % line)
+                    else:
+                        out.write(" #\n")
+                incomment = False
+                comment = []
+            else:
+                comment.append(t.contents)
+        elif intrans:
+            if t.token_type == TokenType.BLOCK:
+                endbmatch = endblock_re.match(t.contents)
+                pluralmatch = plural_re.match(t.contents)
+                if endbmatch:
+                    if inplural:
+                        if message_context:
+                            out.write(
+                                " npgettext({p}{!r}, {p}{!r}, {p}{!r},count) ".format(
+                                    message_context,
+                                    join_tokens(singular, trimmed),
+                                    join_tokens(plural, trimmed),
+                                    p=raw_prefix,
+                                )
+                            )
+                        else:
+                            out.write(
+                                " ngettext({p}{!r}, {p}{!r}, count) ".format(
+                                    join_tokens(singular, trimmed),
+                                    join_tokens(plural, trimmed),
+                                    p=raw_prefix,
+                                )
+                            )
+                        for part in singular:
+                            out.write(blankout(part, "S"))
+                        for part in plural:
+                            out.write(blankout(part, "P"))
+                    else:
+                        if message_context:
+                            out.write(
+                                " pgettext({p}{!r}, {p}{!r}) ".format(
+                                    message_context,
+                                    join_tokens(singular, trimmed),
+                                    p=raw_prefix,
+                                )
+                            )
+                        else:
+                            out.write(
+                                " gettext({p}{!r}) ".format(
+                                    join_tokens(singular, trimmed),
+                                    p=raw_prefix,
+                                )
+                            )
+                        for part in singular:
+                            out.write(blankout(part, "S"))
+                    message_context = None
+                    intrans = False
+                    inplural = False
+                    singular = []
+                    plural = []
+                elif pluralmatch:
+                    inplural = True
+                else:
+                    filemsg = ""
+                    if origin:
+                        filemsg = "file %s, " % origin
+                    raise SyntaxError(
+                        "Translation blocks must not include other block tags: "
+                        "%s (%sline %d)" % (t.contents, filemsg, t.lineno)
+                    )
+            elif t.token_type == TokenType.VAR:
+                if inplural:
+                    plural.append("%%(%s)s" % t.contents)
+                else:
+                    singular.append("%%(%s)s" % t.contents)
+            elif t.token_type == TokenType.TEXT:
+                contents = t.contents.replace("%", "%%")
+                if inplural:
+                    plural.append(contents)
+                else:
+                    singular.append(contents)
+        else:
+            # Handle comment tokens (`{# ... #}`) plus other constructs on
+            # the same line:
+            if comment_lineno_cache is not None:
+                cur_lineno = t.lineno + t.contents.count("\n")
+                if comment_lineno_cache == cur_lineno:
+                    if t.token_type != TokenType.COMMENT:
+                        for c in lineno_comment_map[comment_lineno_cache]:
+                            filemsg = ""
+                            if origin:
+                                filemsg = "file %s, " % origin
+                            warn_msg = (
+                                "The translator-targeted comment '%s' "
+                                "(%sline %d) was ignored, because it wasn't "
+                                "the last item on the line."
+                            ) % (c, filemsg, comment_lineno_cache)
+                            warnings.warn(warn_msg, TranslatorCommentWarning)
+                        lineno_comment_map[comment_lineno_cache] = []
+                else:
+                    out.write(
+                        "# %s" % " | ".join(lineno_comment_map[comment_lineno_cache])
+                    )
+                comment_lineno_cache = None
 
-        with contextlib.suppress(FileNotFoundError):
-            shutil.copytree(bottle, _path, symlinks=True, ignore=shutil.ignore_patterns(*ignored))
-
-        template = {
-            "uuid": _uuid,
-            "env": env,
-            "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "config": config
-        }
-
-        with open(os.path.join(_path, "template.yml"), "w") as f:
-            yaml.dump(template, f)
-
-        logging.info(f"New template {env} created", jn=True)
-
-        if not TemplateManager.__validate_template(_uuid):
-            logging.error("Template validation failed, will retry with next bottle.")
-            shutil.rmtree(_path)
-
-    @staticmethod
-    def __validate_template(template_uuid: str):
-        result = True
-        template_path = os.path.join(Paths.templates, template_uuid)
-        essentials = [
-            "drive_c/ProgramData",
-            "drive_c/windows",
-        ]
-
-        if not os.path.exists(template_path):
-            logging.error(f"Template {template_uuid} not found!")
-            result = False
-
-        for essential in essentials:
-            if not os.path.exists(os.path.join(template_path, essential)):
-                logging.error(f"Template {template_uuid} is missing essential path: {essential}")
-                result = False
-
-        path_size = sum(file.stat().st_size for file in Path(template_path).rglob('*'))
-        if path_size < 300000000:
-            logging.error(f"Template {template_uuid} is too small!")
-            result = False
-        
-        with open(os.path.join(template_path, "template.yml"), "r") as f:
-            template = yaml.load(f)
-            if template["uuid"] != template_uuid:
-                logging.error(f"Template {template_uuid} has invalid uuid!")
-                result = False
-
-        return result
-
-    @staticmethod
-    def get_template_manifest(template: str):
-        with open(os.path.join(Paths.templates, template, "template.yml"), "r") as f:
-            return yaml.load(f)
-
-    @staticmethod
-    def get_templates():
-        res = []
-        templates = os.listdir(Paths.templates)
-
-        for template in templates:
-            if os.path.exists(os.path.join(Paths.templates, template, "template.yml")):
-                _manifest = TemplateManager.get_template_manifest(template)
-                if _manifest is not None:
-                    res.append(_manifest)
-
-        return res
-
-    @staticmethod
-    def delete_template(template_uuid: str):
-        if not template_uuid:
-            logging.error("Template uuid is not defined!")
-            return
-
-        if not os.path.exists(os.path.join(Paths.templates, template_uuid)):
-            logging.error(f"Template {template_uuid} not found!")
-            return
-
-        logging.info(f"Deleting template: {template_uuid}")
-        shutil.rmtree(os.path.join(Paths.templates, template_uuid))
-        logging.info("Template deleted successfully!")
-
-    @staticmethod
-    def check_outdated(template: dict):
-        env = template.get("env", "")
-        if env not in Samples.environments:
-            TemplateManager.delete_template(template.get("uuid"))
-            return True
-
-        _sample = Samples.environments[env]
-        for p in _sample.get("Parameters", {}):
-            _params = template.get("config", {}).get("Parameters", {})
-            if p not in _params or _params[p] != _sample["Parameters"][p]:
-                TemplateManager.delete_template(template.get("uuid"))
-                return True
-
-        for d in _sample.get("Installed_Dependencies", []):
-            _deps = template.get("config", {}).get("Installed_Dependencies", [])
-            if d not in _deps:
-                TemplateManager.delete_template(template.get("uuid"))
-                return True
-
-        return False
-
-    @staticmethod
-    def get_env_template(env: str):
-        _templates = TemplateManager.get_templates()
-        for template in _templates:
-            if template["env"] == env.lower():
-                if TemplateManager.check_outdated(template):
-                    logging.info(f"Deleting outdated template: {template['uuid']}")
-                    return None
-                return template
-        return None
-
-    @staticmethod
-    def unpack_template(template: dict, config: BottleConfig):
-        def copy_func(source: str, dest: str):
-            if os.path.islink(source):
-                # we don't want symlinks from templates
-                return
-            shutil.copy2(source, dest)
-
-        logging.info(f"Unpacking template: {template['uuid']}")
-        bottle = ManagerUtils.get_bottle_path(config)
-        _path = os.path.join(Paths.templates, template['uuid'])
-
-        shutil.copytree(_path, bottle, symlinks=True, dirs_exist_ok=True, ignore=shutil.ignore_patterns('.*'), ignore_dangling_symlinks=True)
-        logging.info("Template unpacked successfully!")
+            if t.token_type == TokenType.BLOCK:
+                imatch = inline_re.match(t.contents)
+                bmatch = block_re.match(t.contents)
+                cmatches = constant_re.findall(t.contents)
+                if imatch:
+                    g = imatch[1]
+                    if g[0] == '"':
+                        g = g.strip('"')
+                    elif g[0] == "'":
+                        g = g.strip("'")
+                    g = g.replace("%", "%%")
+                    if imatch[2]:
+                        # A context is provided
+                        context_match = context_re.match(imatch[2])
+                        message_context = context_match[1]
+                        if message_context[0] == '"':
+                            message_context = message_context.strip('"')
+                        elif message_context[0] == "'":
+                            message_context = message_context.strip("'")
+                        out.write(
+                            " pgettext({p}{!r}, {p}{!r}) ".format(
+                                message_context, g, p=raw_prefix
+                            )
+                        )
+                        message_context = None
+                    else:
+                        out.write(" gettext({p}{!r}) ".format(g, p=raw_prefix))
+                elif bmatch:
+                    for fmatch in constant_re.findall(t.contents):
+                        out.write(" _(%s) " % fmatch)
+                    if bmatch[1]:
+                        # A context is provided
+                        context_match = context_re.match(bmatch[1])
+                        message_context = context_match[1]
+                        if message_context[0] == '"':
+                            message_context = message_context.strip('"')
+                        elif message_context[0] == "'":
+                            message_context = message_context.strip("'")
+                    intrans = True
+                    inplural = False
+                    trimmed = "trimmed" in t.split_contents()
+                    singular = []
+                    plural = []
+                elif cmatches:
+                    for cmatch in cmatches:
+                        out.write(" _(%s) " % cmatch)
+                elif t.contents == "comment":
+                    incomment = True
+                else:
+                    out.write(blankout(t.contents, "B"))
+            elif t.token_type == TokenType.VAR:
+                parts = t.contents.split("|")
+                cmatch = constant_re.match(parts[0])
+                if cmatch:
+                    out.write(" _(%s) " % cmatch[1])
+                for p in parts[1:]:
+                    if p.find(":_(") >= 0:
+                        out.write(" %s " % p.split(":", 1)[1])
+                    else:
+                        out.write(blankout(p, "F"))
+            elif t.token_type == TokenType.COMMENT:
+                if t.contents.lstrip().startswith(TRANSLATOR_COMMENT_MARK):
+                    lineno_comment_map.setdefault(t.lineno, []).append(t.contents)
+                    comment_lineno_cache = t.lineno
+            else:
+                out.write(blankout(t.contents, "X"))
+    return out.getvalue()

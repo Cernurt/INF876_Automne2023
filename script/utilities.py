@@ -1,365 +1,95 @@
-import os
-import math
-import torch.multiprocessing as multiprocessing
-import subprocess as sp
-import time
-import ffmpeg
-import numpy as np
-import torch
-from .bg import DEVICE, Net, iter_frames, remove_many
-import tempfile
-import requests
+# Copyright The Lightning AI team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Utilities for loggers."""
+
 from pathlib import Path
+from typing import Any, List, Tuple, Union
 
-multiprocessing.set_start_method('spawn', force=True)
+from torch import Tensor
 
-
-def worker(worker_nodes,
-           worker_index,
-           result_dict,
-           model_name,
-           gpu_batchsize,
-           total_frames,
-           frames_dict):
-    print(F"WORKER {worker_index} ONLINE")
-
-    output_index = worker_index + 1
-    base_index = worker_index * gpu_batchsize
-    net = Net(model_name)
-    script_net = None
-    for fi in (list(range(base_index + i * worker_nodes * gpu_batchsize,
-                          min(base_index + i * worker_nodes * gpu_batchsize + gpu_batchsize, total_frames)))
-               for i in range(math.ceil(total_frames / worker_nodes / gpu_batchsize))):
-        if not fi:
-            break
-
-        # are we processing frames faster than the frame ripper is saving them?
-        last = fi[-1]
-        while last not in frames_dict:
-            time.sleep(0.1)
-
-        input_frames = [frames_dict[index] for index in fi]
-        if script_net is None:
-            script_net = torch.jit.trace(net,
-                                         torch.as_tensor(np.stack(input_frames), dtype=torch.float32, device=DEVICE))
-
-        result_dict[output_index] = remove_many(input_frames, script_net)
-
-        # clean up the frame buffer
-        for fdex in fi:
-            del frames_dict[fdex]
-        output_index += worker_nodes
+import lightning.pytorch as pl
+from lightning.pytorch.callbacks import Checkpoint
 
 
-def capture_frames(file_path, frames_dict, prefetched_samples, total_frames):
-    print(F"WORKER FRAMERIPPER ONLINE")
-    for idx, frame in enumerate(iter_frames(file_path)):
-        frames_dict[idx] = frame
-        while len(frames_dict) > prefetched_samples:
-            time.sleep(0.1)
-        if idx > total_frames:
-            break
+def _version(loggers: List[Any], separator: str = "_") -> Union[int, str]:
+    if len(loggers) == 1:
+        return loggers[0].version
+    # Concatenate versions together, removing duplicates and preserving order
+    return separator.join(dict.fromkeys(str(logger.version) for logger in loggers))
 
 
-def matte_key(output, file_path,
-              worker_nodes,
-              gpu_batchsize,
-              model_name,
-              frame_limit=-1,
-              prefetched_batches=4,
-              framerate=-1):
-    manager = multiprocessing.Manager()
+def _scan_checkpoints(checkpoint_callback: Checkpoint, logged_model_time: dict) -> List[Tuple[float, str, float, str]]:
+    """Return the checkpoints to be logged.
 
-    results_dict = manager.dict()
-    frames_dict = manager.dict()
+    Args:
+        checkpoint_callback: Checkpoint callback reference.
+        logged_model_time: dictionary containing the logged model times.
 
+    """
+    # get checkpoints to be saved with associated score
+    checkpoints = {}
+    if hasattr(checkpoint_callback, "last_model_path") and hasattr(checkpoint_callback, "current_score"):
+        checkpoints[checkpoint_callback.last_model_path] = (checkpoint_callback.current_score, "latest")
 
-    info = ffmpeg.probe(file_path)
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-count_packets",
-        "-show_entries",
-        "stream=nb_read_packets",
-        "-of",
-        "csv=p=0",
-        file_path
-    ]
-    framerate_output = sp.check_output(cmd, universal_newlines=True)
-    total_frames = int(framerate_output)
-    if frame_limit != -1:
-        total_frames = min(frame_limit, total_frames)
+    if hasattr(checkpoint_callback, "best_model_path") and hasattr(checkpoint_callback, "best_model_score"):
+        checkpoints[checkpoint_callback.best_model_path] = (checkpoint_callback.best_model_score, "best")
 
-    fr = info["streams"][0]["r_frame_rate"]
+    if hasattr(checkpoint_callback, "best_k_models"):
+        for key, value in checkpoint_callback.best_k_models.items():
+            checkpoints[key] = (value, "best_k")
 
-    if framerate == -1:
-        print(F"FRAME RATE DETECTED: {fr} (if this looks wrong, override the frame rate)")
-        framerate = math.ceil(eval(fr))
-
-    print(F"FRAME RATE: {framerate} TOTAL FRAMES: {total_frames}")
-
-    p = multiprocessing.Process(target=capture_frames,
-                                args=(file_path, frames_dict, gpu_batchsize * prefetched_batches, total_frames))
-    p.start()
-
-    # note I am deliberately not using pool
-    # we can't trust it to run all the threads concurrently (or at all)
-    workers = [multiprocessing.Process(target=worker,
-                                       args=(worker_nodes, wn, results_dict, model_name, gpu_batchsize, total_frames,
-                                             frames_dict))
-               for wn in range(worker_nodes)]
-    for w in workers:
-        w.start()
-
-    command = None
-    proc = None
-    frame_counter = 0
-    for i in range(math.ceil(total_frames / worker_nodes)):
-        for wx in range(worker_nodes):
-
-            hash_index = i * worker_nodes + 1 + wx
-
-            while hash_index not in results_dict:
-                time.sleep(0.1)
-
-            frames = results_dict[hash_index]
-            # dont block access to it anymore
-            del results_dict[hash_index]
-
-            for frame in frames:
-                if command is None:
-                    command = ['ffmpeg',
-                               '-y',
-                               '-f', 'rawvideo',
-                               '-vcodec', 'rawvideo',
-                               '-s', F"{frame.shape[1]}x320",
-                               '-pix_fmt', 'gray',
-                               '-r', F"{framerate}",
-                               '-i', '-',
-                               '-an',
-                               '-vcodec', 'mpeg4',
-                               '-b:v', '2000k',
-                               '%s' % output]
-
-                    proc = sp.Popen(command, stdin=sp.PIPE)
-
-                proc.stdin.write(frame.tostring())
-                frame_counter = frame_counter + 1
-
-                if frame_counter >= total_frames:
-                    p.join()
-                    for w in workers:
-                        w.join()
-                    proc.stdin.close()
-                    proc.wait()
-                    print(F"FINISHED ALL FRAMES ({total_frames})!")
-                    return
-
-    p.join()
-    for w in workers:
-        w.join()
-    proc.stdin.close()
-    proc.wait()
-    return
+    checkpoints = sorted(
+        (Path(p).stat().st_mtime, p, s, tag) for p, (s, tag) in checkpoints.items() if Path(p).is_file()
+    )
+    checkpoints = [c for c in checkpoints if c[1] not in logged_model_time or logged_model_time[c[1]] < c[0]]
+    return checkpoints
 
 
-def transparentgif(output, file_path,
-                   worker_nodes,
-                   gpu_batchsize,
-                   model_name,
-                   frame_limit=-1,
-                   prefetched_batches=4,
-                   framerate=-1):
-    temp_dir = tempfile.TemporaryDirectory()
-    tmpdirname = Path(temp_dir.name)
-    temp_file = os.path.abspath(os.path.join(tmpdirname, "matte.mp4"))
-    matte_key(temp_file, file_path,
-              worker_nodes,
-              gpu_batchsize,
-              model_name,
-              frame_limit,
-              prefetched_batches,
-              framerate)
-    cmd = [
-        'ffmpeg', '-y', '-i', file_path, '-i', temp_file, '-filter_complex',
-        '[1][0]scale2ref[mask][main];[main][mask]alphamerge=shortest=1,fps=10,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse',
-        '-shortest', output
-    ]
-
-    sp.run(cmd)
-
-    print("Process finished")
-
-    return
-
-
-def transparentgifwithbackground(output, overlay, file_path,
-                      worker_nodes,
-                      gpu_batchsize,
-                      model_name,
-                      frame_limit=-1,
-                      prefetched_batches=4,
-                      framerate=-1):
-    temp_dir = tempfile.TemporaryDirectory()
-    tmpdirname = Path(temp_dir.name)
-    temp_file = os.path.abspath(os.path.join(tmpdirname, "matte.mp4"))
-    matte_key(temp_file, file_path,
-              worker_nodes,
-              gpu_batchsize,
-              model_name,
-              frame_limit,
-              prefetched_batches,
-              framerate)
-    print("Starting alphamerge")
-    cmd = [
-        'ffmpeg', '-y', '-i', file_path, '-i', temp_file, '-i', overlay, '-filter_complex',
-        '[1][0]scale2ref[mask][main];[main][mask]alphamerge=shortest=1[fg];[2][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2:format=auto,fps=10,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse',
-        '-shortest', output
-    ]
-    sp.run(cmd)
-    print("Process finished")
-    try:
-        temp_dir.cleanup()
-    except PermissionError:
-        pass
-    return
-
-
-def transparentvideo(output, file_path,
-                     worker_nodes,
-                     gpu_batchsize,
-                     model_name,
-                     frame_limit=-1,
-                     prefetched_batches=4,
-                     framerate=-1):
-    temp_dir = tempfile.TemporaryDirectory()
-    tmpdirname = Path(temp_dir.name)
-    temp_file = os.path.abspath(os.path.join(tmpdirname, "matte.mp4"))
-    matte_key(temp_file, file_path,
-              worker_nodes,
-              gpu_batchsize,
-              model_name,
-              frame_limit,
-              prefetched_batches,
-              framerate)
-    print("Starting alphamerge")
-    cmd = [
-        'ffmpeg', '-y', '-i', file_path, '-i', temp_file, '-filter_complex',
-        '[1][0]scale2ref[mask][main];[main][mask]alphamerge=shortest=1', '-c:v', 'qtrle', '-shortest', output
-    ]
-
-    sp.run(cmd)
-    print("Process finished")
-    try:
-        temp_dir.cleanup()
-    except PermissionError:
-        pass
-    return
-
-
-def transparentvideoovervideo(output, overlay, file_path,
-                         worker_nodes,
-                         gpu_batchsize,
-                         model_name,
-                         frame_limit=-1,
-                         prefetched_batches=4,
-                         framerate=-1):
-    temp_dir = tempfile.TemporaryDirectory()
-    tmpdirname = Path(temp_dir.name)
-    temp_file = os.path.abspath(os.path.join(tmpdirname, "matte.mp4"))
-    matte_key(temp_file, file_path,
-              worker_nodes,
-              gpu_batchsize,
-              model_name,
-              frame_limit,
-              prefetched_batches,
-              framerate)
-    print("Starting alphamerge")
-    cmd = [
-        'ffmpeg', '-y', '-i', file_path, '-i', temp_file, '-i', overlay, '-filter_complex',
-        '[1][0]scale2ref[mask][main];[main][mask]alphamerge=shortest=1[vid];[vid][2:v]scale2ref[fg][bg];[bg][fg]overlay=shortest=1[out]', '-map', '[out]', '-shortest', output
-    ]
-    sp.run(cmd)
-    print("Process finished")
-    try:
-        temp_dir.cleanup()
-    except PermissionError:
-        pass
-    return
-
-
-def transparentvideooverimage(output, overlay, file_path,
-                         worker_nodes,
-                         gpu_batchsize,
-                         model_name,
-                         frame_limit=-1,
-                         prefetched_batches=4,
-                         framerate=-1):
-    temp_dir = tempfile.TemporaryDirectory()
-    tmpdirname = Path(temp_dir.name)
-    temp_file = os.path.abspath(os.path.join(tmpdirname, "matte.mp4"))
-    matte_key(temp_file, file_path,
-              worker_nodes,
-              gpu_batchsize,
-              model_name,
-              frame_limit,
-              prefetched_batches,
-              framerate)
-    print("Scale image")
-    temp_image = os.path.abspath("%s/new.jpg" % tmpdirname)
-    cmd = [
-        'ffmpeg', '-y', '-i', overlay, '-i', file_path, '-filter_complex',
-        'scale2ref[img][vid];[img]setsar=1;[vid]nullsink', '-q:v', '2', temp_image
-    ]
-    sp.run(cmd)
-    print("Starting alphamerge")
-    cmd = [
-        'ffmpeg', '-y', '-i', temp_image, '-i', file_path, '-i', temp_file, '-filter_complex',
-        '[0:v]scale2ref=oh*mdar:ih[bg];[1:v]scale2ref=oh*mdar:ih[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1[out]',
-        '-map', '[out]', '-shortest', output
-    ]
-    sp.run(cmd)
-    print("Process finished")
-    try:
-        temp_dir.cleanup()
-    except PermissionError:
-        pass
-    return
-
-def download_files_from_github(path, model_name):
-    if model_name not in ["u2net", "u2net_human_seg", "u2netp"]:
-        print("Invalid model name, please use 'u2net' or 'u2net_human_seg' or 'u2netp'")
-        return
-    print(f"downloading model [{model_name}] to {path} ...")
-    urls = []
-    if model_name == "u2net":
-        urls = ['https://github.com/nadermx/backgroundremover/raw/main/models/u2aa',
-                'https://github.com/nadermx/backgroundremover/raw/main/models/u2ab',
-                'https://github.com/nadermx/backgroundremover/raw/main/models/u2ac',
-                'https://github.com/nadermx/backgroundremover/raw/main/models/u2ad']
-    elif model_name == "u2net_human_seg":
-        urls = ['https://github.com/nadermx/backgroundremover/raw/main/models/u2haa',
-                'https://github.com/nadermx/backgroundremover/raw/main/models/u2hab',
-                'https://github.com/nadermx/backgroundremover/raw/main/models/u2hac',
-                'https://github.com/nadermx/backgroundremover/raw/main/models/u2had']
-    elif model_name == 'u2netp':
-        urls = ['https://github.com/nadermx/backgroundremover/raw/main/models/u2netp.pth']
-    try:
-        os.makedirs(os.path.expanduser("~/.u2net"), exist_ok=True)
-    except Exception as e:
-        print(f"Error creating directory: {e}")
+def _log_hyperparams(trainer: "pl.Trainer") -> None:
+    if not trainer.loggers:
         return
 
-    try:
+    pl_module = trainer.lightning_module
+    datamodule_log_hyperparams = trainer.datamodule._log_hyperparams if trainer.datamodule is not None else False
 
-        with open(path, 'wb') as out_file:
-            for i, url in enumerate(urls):
-                print(f'downloading part {i+1} of {model_name}')
-                part_content = requests.get(url)
-                out_file.write(part_content.content)
-                print(f'finished downloading part {i+1} of {model_name}')
-    except Exception as e:
-        print(e)
+    hparams_initial = None
+    if pl_module._log_hyperparams and datamodule_log_hyperparams:
+        datamodule_hparams = trainer.datamodule.hparams_initial
+        lightning_hparams = pl_module.hparams_initial
+        inconsistent_keys = []
+        for key in lightning_hparams.keys() & datamodule_hparams.keys():
+            lm_val, dm_val = lightning_hparams[key], datamodule_hparams[key]
+            if (
+                type(lm_val) != type(dm_val)
+                or (isinstance(lm_val, Tensor) and id(lm_val) != id(dm_val))
+                or lm_val != dm_val
+            ):
+                inconsistent_keys.append(key)
+        if inconsistent_keys:
+            raise RuntimeError(
+                f"Error while merging hparams: the keys {inconsistent_keys} are present "
+                "in both the LightningModule's and LightningDataModule's hparams "
+                "but have different values."
+            )
+        hparams_initial = {**lightning_hparams, **datamodule_hparams}
+    elif pl_module._log_hyperparams:
+        hparams_initial = pl_module.hparams_initial
+    elif datamodule_log_hyperparams:
+        hparams_initial = trainer.datamodule.hparams_initial
+
+    for logger in trainer.loggers:
+        if hparams_initial is not None:
+            logger.log_hyperparams(hparams_initial)
+        logger.log_graph(pl_module)
+        logger.save()

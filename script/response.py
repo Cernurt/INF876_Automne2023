@@ -1,243 +1,164 @@
-import re
-import cgi
+from django.http import HttpResponse
 
-from io import BytesIO
-import gzip
-import zlib
-
-from .TextParser import TextParser
-
-from wfuzz.helpers.str_func import python2_3_convert_from_unicode
+from .loader import get_template, select_template
 
 
-def get_encoding_from_headers(headers):
-    """Returns encodings from given HTTP Header Dict.
-
-    :param headers: dictionary to extract encoding from.
-    :rtype: str
-    """
-
-    content_type = headers.get("Content-Type")
-
-    if not content_type:
-        return None
-
-    content_type, params = cgi.parse_header(content_type)
-
-    if "charset" in params:
-        return params["charset"].strip("'\"")
-
-    if "text" in content_type:
-        return "ISO-8859-1"
-
-    if "image" in content_type:
-        return "utf-8"
-
-    if "application/json" in content_type:
-        return "utf-8"
+class ContentNotRenderedError(Exception):
+    pass
 
 
-def get_encodings_from_content(content):
-    """Returns encodings from given content string.
+class SimpleTemplateResponse(HttpResponse):
+    rendering_attrs = ["template_name", "context_data", "_post_render_callbacks"]
 
-    :param content: bytestring to extract encodings from.
-    """
-    charset_re = re.compile(r'<meta.*?charset=["\']*(.+?)["\'>]', flags=re.I)
-    pragma_re = re.compile(r'<meta.*?content=["\']*;?charset=(.+?)["\'>]', flags=re.I)
-    xml_re = re.compile(r'^<\?xml.*?encoding=["\']*(.+?)["\'>]')
+    def __init__(
+        self,
+        template,
+        context=None,
+        content_type=None,
+        status=None,
+        charset=None,
+        using=None,
+        headers=None,
+    ):
+        # It would seem obvious to call these next two members 'template' and
+        # 'context', but those names are reserved as part of the test Client
+        # API. To avoid the name collision, we use different names.
+        self.template_name = template
+        self.context_data = context
 
-    return (
-        charset_re.findall(content)
-        + pragma_re.findall(content)
-        + xml_re.findall(content)
-    )
+        self.using = using
 
+        self._post_render_callbacks = []
 
-class Response:
-    def __init__(self, protocol="", code="", message=""):
-        self.protocol = protocol  # HTTP/1.1
-        self.code = code  # 200
-        self.message = message  # OK
-        self._headers = []  # bueno pues las cabeceras igual que en la request
-        self.__content = (
-            ""  # contenido de la response (si i solo si Content-Length existe)
-        )
-        self.md5 = ""  # hash de los contenidos del resultado
-        self.charlen = ""  # Cantidad de caracteres de la respuesta
+        # _request stores the current request object in subclasses that know
+        # about requests, like TemplateResponse. It's defined in the base class
+        # to minimize code duplication.
+        # It's called self._request because self.request gets overwritten by
+        # django.test.client.Client. Unlike template_name and context_data,
+        # _request should not be considered part of the public API.
+        self._request = None
 
-    def addHeader(self, key, value):
-        self._headers += [(key, value)]
+        # content argument doesn't make sense here because it will be replaced
+        # with rendered template so we always pass empty string in order to
+        # prevent errors and provide shorter signature.
+        super().__init__("", content_type, status, charset=charset, headers=headers)
 
-    def delHeader(self, key):
-        for i in self._headers:
-            if i[0].lower() == key.lower():
-                self._headers.remove(i)
+        # _is_rendered tracks whether the template and context has been baked
+        # into a final response.
+        # Super __init__ doesn't know any better than to set self.content to
+        # the empty string we just gave it, which wrongly sets _is_rendered
+        # True, so we initialize it to False after the call to super __init__.
+        self._is_rendered = False
 
-    def addContent(self, text):
-        self.__content = self.__content + text
-
-    def __getitem__(self, key):
-        for i, j in self._headers:
-            if key == i:
-                return j
-        print("Error al obtener header!!!")
-
-    def getCookie(self):
-        str = []
-        for i, j in self._headers:
-            if i.lower() == "set-cookie":
-                str.append(j.split(";")[0])
-        return "; ".join(str)
-
-    def has_header(self, key):
-        for i, j in self._headers:
-            if i.lower() == key.lower():
-                return True
-        return False
-
-    def getLocation(self):
-        for i, j in self._headers:
-            if i.lower() == "location":
-                return j
-        return None
-
-    def header_equal(self, header, value):
-        for i, j in self._headers:
-            if i == header and j.lower() == value.lower():
-                return True
-        return False
-
-    def getHeaders(self):
-        return self._headers
-
-    def getContent(self):
-        return self.__content
-
-    def getTextHeaders(self):
-        string = (
-            str(self.protocol) + " " + str(self.code) + " " + str(self.message) + "\r\n"
-        )
-        for i, j in self._headers:
-            string += i + ": " + j + "\r\n"
-
-        return string
-
-    def getAll(self):
-        string = self.getTextHeaders() + "\r\n" + self.getContent()
-        return string
-
-    def Substitute(self, src, dst):
-        a = self.getAll()
-        b = a.replace(src, dst)
-        self.parseResponse(b)
-
-    def getAll_wpost(self):
-        string = (
-            str(self.protocol) + " " + str(self.code) + " " + str(self.message) + "\r\n"
-        )
-        for i, j in self._headers:
-            string += i + ": " + j + "\r\n"
-        return string
-
-    def parseResponse(self, rawheader, rawbody=None, type="curl"):
-        self.__content = ""
-        self._headers = []
-
-        tp = TextParser()
-        tp.setSource("string", rawheader)
-
-        tp.readUntil(r"(HTTP/[0-9.]+) ([0-9]+)")
-        while True:
-            while True:
-                try:
-                    self.protocol = tp[0][0]
-                except Exception:
-                    self.protocol = "unknown"
-
-                try:
-                    self.code = tp[0][1]
-                except Exception:
-                    self.code = "0"
-
-                if self.code != "100":
-                    break
-                else:
-                    tp.readUntil(r"(HTTP/[0-9.]+) ([0-9]+)")
-
-            self.code = int(self.code)
-
-            while True:
-                tp.readLine()
-                if tp.search("^([^:]+): ?(.*)$"):
-                    self.addHeader(tp[0][0], tp[0][1])
-                else:
-                    break
-
-            # curl sometimes sends two headers when using follow, 302 and the final header
-            # also when using proxies
-            tp.readLine()
-            if not tp.search(r"(HTTP/[0-9.]+) ([0-9]+)"):
-                break
-            else:
-                self._headers = []
-
-        # ignore CRLFs until request line
-        while tp.lastline == "" and tp.readLine():
-            pass
-
-        # TODO: this should be added to rawbody not directly to __content
-        if tp.lastFull_line:
-            self.addContent(tp.lastFull_line)
-
-        while tp.skip(1):
-            self.addContent(tp.lastFull_line)
-
-        if type == "curl":
-            self.delHeader("Transfer-Encoding")
-
-        if self.header_equal("Transfer-Encoding", "chunked"):
-            result = ""
-            content = BytesIO(rawbody)
-            hexa = content.readline()
-            nchunk = int(hexa.strip(), 16)
-
-            while nchunk:
-                result += content.read(nchunk)
-                content.readline()
-                hexa = content.readline()
-                nchunk = int(hexa.strip(), 16)
-
-            rawbody = result
-
-        if self.header_equal("Content-Encoding", "gzip"):
-            compressedstream = BytesIO(rawbody)
-            gzipper = gzip.GzipFile(fileobj=compressedstream)
-            rawbody = gzipper.read()
-            self.delHeader("Content-Encoding")
-        elif self.header_equal("Content-Encoding", "deflate"):
-            deflated_data = None
-            try:
-                deflater = zlib.decompressobj()
-                deflated_data = deflater.decompress(rawbody)
-                deflated_data += deflater.flush()
-            except zlib.error:
-                try:
-                    deflater = zlib.decompressobj(-zlib.MAX_WBITS)
-                    deflated_data = deflater.decompress(rawbody)
-                    deflated_data += deflater.flush()
-                except zlib.error:
-                    deflated_data = ""
-            rawbody = deflated_data
-            self.delHeader("Content-Encoding")
-
-        if rawbody is not None:
-            # Try to get charset encoding from headers
-            content_encoding = get_encoding_from_headers(dict(self.getHeaders()))
-
-            # fallback to default encoding
-            if content_encoding is None:
-                content_encoding = "utf-8"
-
-            self.__content = python2_3_convert_from_unicode(
-                rawbody.decode(content_encoding, errors="replace")
+    def __getstate__(self):
+        """
+        Raise an exception if trying to pickle an unrendered response. Pickle
+        only rendered data, not the data used to construct the response.
+        """
+        obj_dict = self.__dict__.copy()
+        if not self._is_rendered:
+            raise ContentNotRenderedError(
+                "The response content must be rendered before it can be pickled."
             )
+        for attr in self.rendering_attrs:
+            if attr in obj_dict:
+                del obj_dict[attr]
+
+        return obj_dict
+
+    def resolve_template(self, template):
+        """Accept a template object, path-to-template, or list of paths."""
+        if isinstance(template, (list, tuple)):
+            return select_template(template, using=self.using)
+        elif isinstance(template, str):
+            return get_template(template, using=self.using)
+        else:
+            return template
+
+    def resolve_context(self, context):
+        return context
+
+    @property
+    def rendered_content(self):
+        """Return the freshly rendered content for the template and context
+        described by the TemplateResponse.
+
+        This *does not* set the final content of the response. To set the
+        response content, you must either call render(), or set the
+        content explicitly using the value of this property.
+        """
+        template = self.resolve_template(self.template_name)
+        context = self.resolve_context(self.context_data)
+        return template.render(context, self._request)
+
+    def add_post_render_callback(self, callback):
+        """Add a new post-rendering callback.
+
+        If the response has already been rendered,
+        invoke the callback immediately.
+        """
+        if self._is_rendered:
+            callback(self)
+        else:
+            self._post_render_callbacks.append(callback)
+
+    def render(self):
+        """Render (thereby finalizing) the content of the response.
+
+        If the content has already been rendered, this is a no-op.
+
+        Return the baked response instance.
+        """
+        retval = self
+        if not self._is_rendered:
+            self.content = self.rendered_content
+            for post_callback in self._post_render_callbacks:
+                newretval = post_callback(retval)
+                if newretval is not None:
+                    retval = newretval
+        return retval
+
+    @property
+    def is_rendered(self):
+        return self._is_rendered
+
+    def __iter__(self):
+        if not self._is_rendered:
+            raise ContentNotRenderedError(
+                "The response content must be rendered before it can be iterated over."
+            )
+        return super().__iter__()
+
+    @property
+    def content(self):
+        if not self._is_rendered:
+            raise ContentNotRenderedError(
+                "The response content must be rendered before it can be accessed."
+            )
+        return super().content
+
+    @content.setter
+    def content(self, value):
+        """Set the content for the response."""
+        HttpResponse.content.fset(self, value)
+        self._is_rendered = True
+
+
+class TemplateResponse(SimpleTemplateResponse):
+    rendering_attrs = SimpleTemplateResponse.rendering_attrs + ["_request"]
+
+    def __init__(
+        self,
+        request,
+        template,
+        context=None,
+        content_type=None,
+        status=None,
+        charset=None,
+        using=None,
+        headers=None,
+    ):
+        super().__init__(
+            template, context, content_type, status, charset, using, headers=headers
+        )
+        self._request = request

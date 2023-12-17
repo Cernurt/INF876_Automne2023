@@ -1,233 +1,141 @@
-from typing import Any, Dict, Literal, Optional
+from __future__ import unicode_literals
 
-from ...libs.llm.prompts.chat import (
-    anthropic_template_messages,
-    chatml_template_messages,
-    deepseek_template_messages,
-    llama2_template_messages,
-    phind_template_messages,
-    template_alpaca_messages,
-    zephyr_template_messages,
+from .common import InfoExtractor
+from ..compat import (
+    compat_b64decode,
+    compat_urllib_parse_unquote_plus,
 )
-from ...libs.llm.prompts.edit import (
-    alpaca_edit_prompt,
-    codellama_edit_prompt,
-    deepseek_edit_prompt,
-    phind_edit_prompt,
-    simplest_edit_prompt,
-    zephyr_edit_prompt,
+from ..utils import (
+    determine_ext,
+    ExtractorError,
+    int_or_none,
+    js_to_json,
+    KNOWN_EXTENSIONS,
+    parse_filesize,
+    rot47,
+    url_or_none,
+    urlencode_postdata,
 )
 
-STEP_NAMES = [
-    "AnswerQuestionChroma",
-    "GenerateShellCommandStep",
-    "EditHighlightedCodeStep",
-    "ShareSessionStep",
-    "CommentCodeStep",
-    "ClearHistoryStep",
-    "StackOverflowStep",
-    "OpenConfigStep",
-    "GenerateShellCommandStep",
-    "DraftIssueStep",
-]
 
-StepName = Literal[
-    "AnswerQuestionChroma",
-    "GenerateShellCommandStep",
-    "EditHighlightedCodeStep",
-    "ShareSessionStep",
-    "CommentCodeStep",
-    "ClearHistoryStep",
-    "StackOverflowStep",
-    "OpenConfigStep",
-    "GenerateShellCommandStep",
-    "DraftIssueStep",
-]
+class SharedBaseIE(InfoExtractor):
+    def _real_extract(self, url):
+        video_id = self._match_id(url)
 
-TemplateType = Literal[
-    "llama2", "alpaca", "zephyr", "phind", "anthropic", "chatml", "deepseek"
-]
+        webpage, urlh = self._download_webpage_handle(url, video_id)
 
+        if self._FILE_NOT_FOUND in webpage:
+            raise ExtractorError(
+                'Video %s does not exist' % video_id, expected=True)
 
-def autodetect_template_type(model: str) -> Optional[TemplateType]:
-    lower = model.lower()
-    if "gpt" in lower or "chat-bison" in lower or "pplx" in lower:
-        return None
+        video_url = self._extract_video_url(webpage, video_id, url)
 
-    if "phind" in lower:
-        return "phind"
+        title = self._extract_title(webpage)
+        filesize = int_or_none(self._extract_filesize(webpage))
 
-    if "llama" in lower:
-        return "llama2"
-
-    if "zephyr" in lower:
-        return "zephyr"
-
-    if "claude" in lower:
-        return "anthropic"
-
-    if "alpaca" in lower or "wizard" in lower:
-        return "alpaca"
-
-    if "mistral" in lower:
-        return "llama2"
-
-    if "deepseek" in lower:
-        return "deepseek"
-
-    return "chatml"
-
-
-def autodetect_template_function(
-    model: str, explicit_template: Optional[TemplateType] = None
-):
-    if template_type := explicit_template or autodetect_template_type(model):
-        mapping: Dict[TemplateType, Any] = {
-            "llama2": llama2_template_messages,
-            "alpaca": template_alpaca_messages,
-            "phind": phind_template_messages,
-            "zephyr": zephyr_template_messages,
-            "anthropic": anthropic_template_messages,
-            "chatml": chatml_template_messages,
-            "deepseek": deepseek_template_messages,
+        return {
+            'id': video_id,
+            'url': video_url,
+            'ext': 'mp4',
+            'filesize': filesize,
+            'title': title,
         }
-        return mapping[template_type]
-    return None
+
+    def _extract_title(self, webpage):
+        return compat_b64decode(self._html_search_meta(
+            'full:title', webpage, 'title')).decode('utf-8')
+
+    def _extract_filesize(self, webpage):
+        return self._html_search_meta(
+            'full:size', webpage, 'file size', fatal=False)
 
 
-def autodetect_prompt_templates(
-    model: str, explicit_template: Optional[TemplateType] = None
-):
-    template_type = explicit_template or autodetect_template_type(model)
+class SharedIE(SharedBaseIE):
+    IE_DESC = 'shared.sx'
+    _VALID_URL = r'https?://shared\.sx/(?P<id>[\da-z]{10})'
+    _FILE_NOT_FOUND = '>File does not exist<'
 
-    templates = {}
+    _TEST = {
+        'url': 'http://shared.sx/0060718775',
+        'md5': '106fefed92a8a2adb8c98e6a0652f49b',
+        'info_dict': {
+            'id': '0060718775',
+            'ext': 'mp4',
+            'title': 'Bmp4',
+            'filesize': 1720110,
+        },
+    }
 
-    edit_template = None
-    if template_type == "phind":
-        edit_template = phind_edit_prompt
-    elif template_type == "zephyr":
-        edit_template = zephyr_edit_prompt
-    elif template_type == "llama2":
-        edit_template = codellama_edit_prompt
-    elif template_type == "alpaca":
-        edit_template = alpaca_edit_prompt
-    elif template_type == "deepseek":
-        edit_template = deepseek_edit_prompt
-    elif template_type is not None:
-        edit_template = simplest_edit_prompt
+    def _extract_video_url(self, webpage, video_id, url):
+        download_form = self._hidden_inputs(webpage)
 
-    if edit_template is not None:
-        templates["edit"] = edit_template
+        video_page = self._download_webpage(
+            url, video_id, 'Downloading video page',
+            data=urlencode_postdata(download_form),
+            headers={
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Referer': url,
+            })
 
-    return templates
+        video_url = self._html_search_regex(
+            r'data-url=(["\'])(?P<url>(?:(?!\1).)+)\1',
+            video_page, 'video URL', group='url')
+
+        return video_url
 
 
-ModelProvider = Literal[
-    "openai",
-    "openai-free-trial",
-    "openai-aiohttp",
-    "anthropic",
-    "together",
-    "ollama",
-    "huggingface-tgi",
-    "huggingface-inference-api",
-    "llama.cpp",
-    "replicate",
-    "text-gen-webui",
-    "google-palm",
-    "lmstudio",
-    "llamafile",
-]
+class VivoIE(SharedBaseIE):
+    IE_DESC = 'vivo.sx'
+    _VALID_URL = r'https?://vivo\.s[xt]/(?P<id>[\da-z]{10})'
+    _FILE_NOT_FOUND = '>The file you have requested does not exists or has been removed'
 
-MODEL_PROVIDER_TO_MODEL_CLASS = {
-    "openai": "OpenAI",
-    "openai-free-trial": "OpenAIFreeTrial",
-    "openai-aiohttp": "GGML",
-    "anthropic": "AnthropicLLM",
-    "together": "TogetherLLM",
-    "ollama": "Ollama",
-    "huggingface-tgi": "HuggingFaceTGI",
-    "huggingface-inference-api": "HuggingFaceInferenceAPI",
-    "llama.cpp": "LlamaCpp",
-    "replicate": "ReplicateLLM",
-    "text-gen-webui": "TextGenWebUI",
-    "google-palm": "GooglePaLMAPI",
-    "lmstudio": "LMStudio",
-    "llamafile": "Llamafile",
-}
+    _TESTS = [{
+        'url': 'http://vivo.sx/d7ddda0e78',
+        'md5': '15b3af41be0b4fe01f4df075c2678b2c',
+        'info_dict': {
+            'id': 'd7ddda0e78',
+            'ext': 'mp4',
+            'title': 'Chicken',
+            'filesize': 515659,
+        },
+    }, {
+        'url': 'http://vivo.st/d7ddda0e78',
+        'only_matching': True,
+    }]
 
-MODEL_CLASS_TO_MODEL_PROVIDER: Dict[str, ModelProvider] = {
-    "OpenAI": "openai",
-    "OpenAIFreeTrial": "openai-free-trial",
-    "AnthropicLLM": "anthropic",
-    "TogetherLLM": "together",
-    "Ollama": "ollama",
-    "HuggingFaceTGI": "huggingface-tgi",
-    "HuggingFaceInferenceAPI": "huggingface-inference-api",
-    "LlamaCpp": "llama.cpp",
-    "ReplicateLLM": "replicate",
-    "TextGenWebUI": "text-gen-webui",
-    "GooglePaLMAPI": "google-palm",
-    "LMStudio": "lmstudio",
-    "Llamafile": "llamafile",
-}
+    def _extract_title(self, webpage):
+        title = self._html_search_regex(
+            r'data-name\s*=\s*(["\'])(?P<title>(?:(?!\1).)+)\1', webpage,
+            'title', default=None, group='title')
+        if title:
+            ext = determine_ext(title)
+            if ext.lower() in KNOWN_EXTENSIONS:
+                title = title.rpartition('.' + ext)[0]
+            return title
+        return self._og_search_title(webpage)
 
-MODELS = [
-    # OpenAI
-    "gpt-3.5-turbo",
-    "gpt-3.5-turbo-16k",
-    "gpt-4",
-    "gpt-3.5-turbo-0613",
-    "gpt-4-32k",
-    "gpt-4-1106-preview",
-    # Open-Source
-    "mistral-7b",
-    "llama2-7b",
-    "llama2-13b",
-    "codellama-7b",
-    "codellama-13b",
-    "codellama-34b",
-    "phind-codellama-34b",
-    "wizardcoder-7b",
-    "wizardcoder-13b",
-    "wizardcoder-34b",
-    "zephyr-7b",
-    "codeup-13b",
-    "deepseek-1b",
-    "deepseek-7b",
-    "deepseek-33b",
-    # Anthropic
-    "claude-2",
-    # Google PaLM
-    "chat-bison-001",
-]
+    def _extract_filesize(self, webpage):
+        return parse_filesize(self._search_regex(
+            r'data-type=["\']video["\'][^>]*>Watch.*?<strong>\s*\((.+?)\)',
+            webpage, 'filesize', fatal=False))
 
-ModelName = Literal[
-    # OpenAI
-    "gpt-3.5-turbo",
-    "gpt-3.5-turbo-16k",
-    "gpt-4",
-    "gpt-3.5-turbo-0613",
-    "gpt-4-32k",
-    "gpt-4-1106-preview",
-    # Open-Source
-    "mistral-7b",
-    "llama2-7b",
-    "llama2-13b",
-    "codellama-7b",
-    "codellama-13b",
-    "codellama-34b",
-    "phind-codellama-34b",
-    "wizardcoder-7b",
-    "wizardcoder-13b",
-    "wizardcoder-34b",
-    "zephyr-7b",
-    "codeup-13b",
-    "deepseek-1b",
-    "deepseek-7b",
-    "deepseek-33b",
-    # Anthropic
-    "claude-2",
-    # Google PaLM
-    "chat-bison-001",
-]
+    def _extract_video_url(self, webpage, video_id, url):
+        def decode_url_old(encoded_url):
+            return compat_b64decode(encoded_url).decode('utf-8')
+
+        stream_url = self._search_regex(
+            r'data-stream\s*=\s*(["\'])(?P<url>(?:(?!\1).)+)\1', webpage,
+            'stream url', default=None, group='url')
+        if stream_url:
+            stream_url = url_or_none(decode_url_old(stream_url))
+        if stream_url:
+            return stream_url
+
+        def decode_url(encoded_url):
+            return rot47(compat_urllib_parse_unquote_plus(encoded_url))
+
+        return decode_url(self._parse_json(
+            self._search_regex(
+                r'(?s)InitializeStream\s*\(\s*({.+?})\s*\)\s*;', webpage,
+                'stream'),
+            video_id, transform_source=js_to_json)['source'])

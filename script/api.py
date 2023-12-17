@@ -1,261 +1,152 @@
 # -*- coding: utf-8 -*-
+
 """
-    jinja2.testsuite.api
-    ~~~~~~~~~~~~~~~~~~~~
+requests.api
+~~~~~~~~~~~~
 
-    Tests the public API and related stuff.
+This module implements the Requests API.
 
-    :copyright: (c) 2010 by the Jinja Team.
-    :license: BSD, see LICENSE for more details.
+:copyright: (c) 2012 by Kenneth Reitz.
+:license: Apache2, see LICENSE for more details.
 """
-import unittest
-import os
-import tempfile
-import shutil
 
-from jinja2.testsuite import JinjaTestCase
-from jinja2._compat import next
-
-from jinja2 import Environment, Undefined, DebugUndefined, \
-     StrictUndefined, UndefinedError, meta, \
-     is_undefined, Template, DictLoader
-from jinja2.utils import Cycler
-
-env = Environment()
+from . import sessions
 
 
-class ExtendedAPITestCase(JinjaTestCase):
+def request(method, url, **kwargs):
+    """Constructs and sends a :class:`Request <Request>`.
 
-    def test_item_and_attribute(self):
-        from jinja2.sandbox import SandboxedEnvironment
+    :param method: method for the new :class:`Request` object.
+    :param url: URL for the new :class:`Request` object.
+    :param params: (optional) Dictionary or bytes to be sent in the query string for the :class:`Request`.
+    :param data: (optional) Dictionary or list of tuples ``[(key, value)]`` (will be form-encoded), bytes, or file-like object to send in the body of the :class:`Request`.
+    :param json: (optional) json data to send in the body of the :class:`Request`.
+    :param headers: (optional) Dictionary of HTTP Headers to send with the :class:`Request`.
+    :param cookies: (optional) Dict or CookieJar object to send with the :class:`Request`.
+    :param files: (optional) Dictionary of ``'name': file-like-objects`` (or ``{'name': file-tuple}``) for multipart encoding upload.
+        ``file-tuple`` can be a 2-tuple ``('filename', fileobj)``, 3-tuple ``('filename', fileobj, 'content_type')``
+        or a 4-tuple ``('filename', fileobj, 'content_type', custom_headers)``, where ``'content-type'`` is a string
+        defining the content type of the given file and ``custom_headers`` a dict-like object containing additional headers
+        to add for the file.
+    :param auth: (optional) Auth tuple to enable Basic/Digest/Custom HTTP Auth.
+    :param timeout: (optional) How many seconds to wait for the server to send data
+        before giving up, as a float, or a :ref:`(connect timeout, read
+        timeout) <timeouts>` tuple.
+    :type timeout: float or tuple
+    :param allow_redirects: (optional) Boolean. Enable/disable GET/OPTIONS/POST/PUT/PATCH/DELETE/HEAD redirection. Defaults to ``True``.
+    :type allow_redirects: bool
+    :param proxies: (optional) Dictionary mapping protocol to the URL of the proxy.
+    :param verify: (optional) Either a boolean, in which case it controls whether we verify
+            the server's TLS certificate, or a string, in which case it must be a path
+            to a CA bundle to use. Defaults to ``True``.
+    :param stream: (optional) if ``False``, the response content will be immediately downloaded.
+    :param cert: (optional) if String, path to ssl client cert file (.pem). If Tuple, ('cert', 'key') pair.
+    :return: :class:`Response <Response>` object
+    :rtype: requests.Response
 
-        for env in Environment(), SandboxedEnvironment():
-            # the |list is necessary for python3
-            tmpl = env.from_string('{{ foo.items()|list }}')
-            assert tmpl.render(foo={'items': 42}) == "[('items', 42)]"
-            tmpl = env.from_string('{{ foo|attr("items")()|list }}')
-            assert tmpl.render(foo={'items': 42}) == "[('items', 42)]"
-            tmpl = env.from_string('{{ foo["items"] }}')
-            assert tmpl.render(foo={'items': 42}) == '42'
+    Usage::
 
-    def test_finalizer(self):
-        def finalize_none_empty(value):
-            if value is None:
-                value = u''
-            return value
-        env = Environment(finalize=finalize_none_empty)
-        tmpl = env.from_string('{% for item in seq %}|{{ item }}{% endfor %}')
-        assert tmpl.render(seq=(None, 1, "foo")) == '||1|foo'
-        tmpl = env.from_string('<{{ none }}>')
-        assert tmpl.render() == '<>'
+      >>> import requests
+      >>> req = requests.request('GET', 'http://httpbin.org/get')
+      <Response [200]>
+    """
 
-    def test_cycler(self):
-        items = 1, 2, 3
-        c = Cycler(*items)
-        for item in items + items:
-            assert c.current == item
-            assert next(c) == item
-        next(c)
-        assert c.current == 2
-        c.reset()
-        assert c.current == 1
-
-    def test_expressions(self):
-        expr = env.compile_expression("foo")
-        assert expr() is None
-        assert expr(foo=42) == 42
-        expr2 = env.compile_expression("foo", undefined_to_none=False)
-        assert is_undefined(expr2())
-
-        expr = env.compile_expression("42 + foo")
-        assert expr(foo=42) == 84
-
-    def test_template_passthrough(self):
-        t = Template('Content')
-        assert env.get_template(t) is t
-        assert env.select_template([t]) is t
-        assert env.get_or_select_template([t]) is t
-        assert env.get_or_select_template(t) is t
-
-    def test_autoescape_autoselect(self):
-        def select_autoescape(name):
-            if name is None or '.' not in name:
-                return False
-            return name.endswith('.html')
-        env = Environment(autoescape=select_autoescape,
-                          loader=DictLoader({
-            'test.txt':     '{{ foo }}',
-            'test.html':    '{{ foo }}'
-        }))
-        t = env.get_template('test.txt')
-        assert t.render(foo='<foo>') == '<foo>'
-        t = env.get_template('test.html')
-        assert t.render(foo='<foo>') == '&lt;foo&gt;'
-        t = env.from_string('{{ foo }}')
-        assert t.render(foo='<foo>') == '<foo>'
+    # By using the 'with' statement we are sure the session is closed, thus we
+    # avoid leaving sockets open which can trigger a ResourceWarning in some
+    # cases, and look like a memory leak in others.
+    with sessions.Session() as session:
+        return session.request(method=method, url=url, **kwargs)
 
 
-class MetaTestCase(JinjaTestCase):
+def get(url, params=None, **kwargs):
+    r"""Sends a GET request.
 
-    def test_find_undeclared_variables(self):
-        ast = env.parse('{% set foo = 42 %}{{ bar + foo }}')
-        x = meta.find_undeclared_variables(ast)
-        assert x == set(['bar'])
+    :param url: URL for the new :class:`Request` object.
+    :param params: (optional) Dictionary or bytes to be sent in the query string for the :class:`Request`.
+    :param \*\*kwargs: Optional arguments that ``request`` takes.
+    :return: :class:`Response <Response>` object
+    :rtype: requests.Response
+    """
 
-        ast = env.parse('{% set foo = 42 %}{{ bar + foo }}'
-                        '{% macro meh(x) %}{{ x }}{% endmacro %}'
-                        '{% for item in seq %}{{ muh(item) + meh(seq) }}{% endfor %}')
-        x = meta.find_undeclared_variables(ast)
-        assert x == set(['bar', 'seq', 'muh'])
-
-    def test_find_refererenced_templates(self):
-        ast = env.parse('{% extends "layout.html" %}{% include helper %}')
-        i = meta.find_referenced_templates(ast)
-        assert next(i) == 'layout.html'
-        assert next(i) is None
-        assert list(i) == []
-
-        ast = env.parse('{% extends "layout.html" %}'
-                        '{% from "test.html" import a, b as c %}'
-                        '{% import "meh.html" as meh %}'
-                        '{% include "muh.html" %}')
-        i = meta.find_referenced_templates(ast)
-        assert list(i) == ['layout.html', 'test.html', 'meh.html', 'muh.html']
-
-    def test_find_included_templates(self):
-        ast = env.parse('{% include ["foo.html", "bar.html"] %}')
-        i = meta.find_referenced_templates(ast)
-        assert list(i) == ['foo.html', 'bar.html']
-
-        ast = env.parse('{% include ("foo.html", "bar.html") %}')
-        i = meta.find_referenced_templates(ast)
-        assert list(i) == ['foo.html', 'bar.html']
-
-        ast = env.parse('{% include ["foo.html", "bar.html", foo] %}')
-        i = meta.find_referenced_templates(ast)
-        assert list(i) == ['foo.html', 'bar.html', None]
-
-        ast = env.parse('{% include ("foo.html", "bar.html", foo) %}')
-        i = meta.find_referenced_templates(ast)
-        assert list(i) == ['foo.html', 'bar.html', None]
+    kwargs.setdefault('allow_redirects', True)
+    return request('get', url, params=params, **kwargs)
 
 
-class StreamingTestCase(JinjaTestCase):
+def options(url, **kwargs):
+    r"""Sends an OPTIONS request.
 
-    def test_basic_streaming(self):
-        tmpl = env.from_string("<ul>{% for item in seq %}<li>{{ loop.index "
-                               "}} - {{ item }}</li>{%- endfor %}</ul>")
-        stream = tmpl.stream(seq=list(range(4)))
-        self.assert_equal(next(stream), '<ul>')
-        self.assert_equal(next(stream), '<li>1 - 0</li>')
-        self.assert_equal(next(stream), '<li>2 - 1</li>')
-        self.assert_equal(next(stream), '<li>3 - 2</li>')
-        self.assert_equal(next(stream), '<li>4 - 3</li>')
-        self.assert_equal(next(stream), '</ul>')
+    :param url: URL for the new :class:`Request` object.
+    :param \*\*kwargs: Optional arguments that ``request`` takes.
+    :return: :class:`Response <Response>` object
+    :rtype: requests.Response
+    """
 
-    def test_buffered_streaming(self):
-        tmpl = env.from_string("<ul>{% for item in seq %}<li>{{ loop.index "
-                               "}} - {{ item }}</li>{%- endfor %}</ul>")
-        stream = tmpl.stream(seq=list(range(4)))
-        stream.enable_buffering(size=3)
-        self.assert_equal(next(stream), u'<ul><li>1 - 0</li><li>2 - 1</li>')
-        self.assert_equal(next(stream), u'<li>3 - 2</li><li>4 - 3</li></ul>')
-
-    def test_streaming_behavior(self):
-        tmpl = env.from_string("")
-        stream = tmpl.stream()
-        assert not stream.buffered
-        stream.enable_buffering(20)
-        assert stream.buffered
-        stream.disable_buffering()
-        assert not stream.buffered
-
-    def test_dump_stream(self):
-        tmp = tempfile.mkdtemp()
-        try:
-            tmpl = env.from_string(u"\u2713")
-            stream = tmpl.stream()
-            stream.dump(os.path.join(tmp, 'dump.txt'), 'utf-8')
-            with open(os.path.join(tmp, 'dump.txt'), 'rb') as f:
-                self.assertEqual(f.read(), b'\xe2\x9c\x93')
-        finally:
-            shutil.rmtree(tmp)
+    kwargs.setdefault('allow_redirects', True)
+    return request('options', url, **kwargs)
 
 
-class UndefinedTestCase(JinjaTestCase):
+def head(url, **kwargs):
+    r"""Sends a HEAD request.
 
-    def test_stopiteration_is_undefined(self):
-        def test():
-            raise StopIteration()
-        t = Template('A{{ test() }}B')
-        assert t.render(test=test) == 'AB'
-        t = Template('A{{ test().missingattribute }}B')
-        self.assert_raises(UndefinedError, t.render, test=test)
+    :param url: URL for the new :class:`Request` object.
+    :param \*\*kwargs: Optional arguments that ``request`` takes.
+    :return: :class:`Response <Response>` object
+    :rtype: requests.Response
+    """
 
-    def test_undefined_and_special_attributes(self):
-        try:
-            Undefined('Foo').__dict__
-        except AttributeError:
-            pass
-        else:
-            assert False, "Expected actual attribute error"
-
-    def test_default_undefined(self):
-        env = Environment(undefined=Undefined)
-        self.assert_equal(env.from_string('{{ missing }}').render(), u'')
-        self.assert_raises(UndefinedError,
-                           env.from_string('{{ missing.attribute }}').render)
-        self.assert_equal(env.from_string('{{ missing|list }}').render(), '[]')
-        self.assert_equal(env.from_string('{{ missing is not defined }}').render(), 'True')
-        self.assert_equal(env.from_string('{{ foo.missing }}').render(foo=42), '')
-        self.assert_equal(env.from_string('{{ not missing }}').render(), 'True')
-
-    def test_debug_undefined(self):
-        env = Environment(undefined=DebugUndefined)
-        self.assert_equal(env.from_string('{{ missing }}').render(), '{{ missing }}')
-        self.assert_raises(UndefinedError,
-                           env.from_string('{{ missing.attribute }}').render)
-        self.assert_equal(env.from_string('{{ missing|list }}').render(), '[]')
-        self.assert_equal(env.from_string('{{ missing is not defined }}').render(), 'True')
-        self.assert_equal(env.from_string('{{ foo.missing }}').render(foo=42),
-                          u"{{ no such element: int object['missing'] }}")
-        self.assert_equal(env.from_string('{{ not missing }}').render(), 'True')
-
-    def test_strict_undefined(self):
-        env = Environment(undefined=StrictUndefined)
-        self.assert_raises(UndefinedError, env.from_string('{{ missing }}').render)
-        self.assert_raises(UndefinedError, env.from_string('{{ missing.attribute }}').render)
-        self.assert_raises(UndefinedError, env.from_string('{{ missing|list }}').render)
-        self.assert_equal(env.from_string('{{ missing is not defined }}').render(), 'True')
-        self.assert_raises(UndefinedError, env.from_string('{{ foo.missing }}').render, foo=42)
-        self.assert_raises(UndefinedError, env.from_string('{{ not missing }}').render)
-        self.assert_equal(env.from_string('{{ missing|default("default", true) }}').render(), 'default')
-
-    def test_indexing_gives_undefined(self):
-        t = Template("{{ var[42].foo }}")
-        self.assert_raises(UndefinedError, t.render, var=0)
-
-    def test_none_gives_proper_error(self):
-        try:
-            Environment().getattr(None, 'split')()
-        except UndefinedError as e:
-            assert e.message == "'None' has no attribute 'split'"
-        else:
-            assert False, 'expected exception'
-
-    def test_object_repr(self):
-        try:
-            Undefined(obj=42, name='upper')()
-        except UndefinedError as e:
-            assert e.message == "'int object' has no attribute 'upper'"
-        else:
-            assert False, 'expected exception'
+    kwargs.setdefault('allow_redirects', False)
+    return request('head', url, **kwargs)
 
 
-def suite():
-    suite = unittest.TestSuite()
-    suite.addTest(unittest.makeSuite(ExtendedAPITestCase))
-    suite.addTest(unittest.makeSuite(MetaTestCase))
-    suite.addTest(unittest.makeSuite(StreamingTestCase))
-    suite.addTest(unittest.makeSuite(UndefinedTestCase))
-    return suite
+def post(url, data=None, json=None, **kwargs):
+    r"""Sends a POST request.
+
+    :param url: URL for the new :class:`Request` object.
+    :param data: (optional) Dictionary (will be form-encoded), bytes, or file-like object to send in the body of the :class:`Request`.
+    :param json: (optional) json data to send in the body of the :class:`Request`.
+    :param \*\*kwargs: Optional arguments that ``request`` takes.
+    :return: :class:`Response <Response>` object
+    :rtype: requests.Response
+    """
+
+    return request('post', url, data=data, json=json, **kwargs)
+
+
+def put(url, data=None, **kwargs):
+    r"""Sends a PUT request.
+
+    :param url: URL for the new :class:`Request` object.
+    :param data: (optional) Dictionary (will be form-encoded), bytes, or file-like object to send in the body of the :class:`Request`.
+    :param json: (optional) json data to send in the body of the :class:`Request`.
+    :param \*\*kwargs: Optional arguments that ``request`` takes.
+    :return: :class:`Response <Response>` object
+    :rtype: requests.Response
+    """
+
+    return request('put', url, data=data, **kwargs)
+
+
+def patch(url, data=None, **kwargs):
+    r"""Sends a PATCH request.
+
+    :param url: URL for the new :class:`Request` object.
+    :param data: (optional) Dictionary (will be form-encoded), bytes, or file-like object to send in the body of the :class:`Request`.
+    :param json: (optional) json data to send in the body of the :class:`Request`.
+    :param \*\*kwargs: Optional arguments that ``request`` takes.
+    :return: :class:`Response <Response>` object
+    :rtype: requests.Response
+    """
+
+    return request('patch', url, data=data, **kwargs)
+
+
+def delete(url, **kwargs):
+    r"""Sends a DELETE request.
+
+    :param url: URL for the new :class:`Request` object.
+    :param \*\*kwargs: Optional arguments that ``request`` takes.
+    :return: :class:`Response <Response>` object
+    :rtype: requests.Response
+    """
+
+    return request('delete', url, **kwargs)

@@ -1,169 +1,273 @@
+# -*- coding: utf-8 -*-
+
 import re
+import sys
+import random
+from typing import List, Tuple
 
-# Python 2 and 3
-try:
-    from urllib.parse import urljoin
-except ImportError:
-    from urlparse import urljoin
-
-from wfuzz.plugin_api.mixins import DiscoveryPluginMixin
-from wfuzz.plugin_api.base import BasePlugin
-from wfuzz.plugin_api.urlutils import parse_url
-from wfuzz.externals.moduleman.plugin import moduleman_plugin
+import requests
+from requests.models import Response
 
 
-KBASE_PARAM_PATH = "links.add_path"
-KBASE_PARAM_ENQUEUE = "links.enqueue"
-KBASE_PARAM_DOMAIN_REGEX = "links.domain"
-KBASE_PARAM_REGEX = "links.regex"
-KBASE_NEW_DOMAIN = "links.new_domains"
+def find_links_in_text(text: str) -> List[str]:
+    """Find links in a text and return a list of URLs."""
+
+    link_pattern = re.compile(r'((?:https?://|www\d{0,3}[.]|[a-z0-9.\-]+[.][a-z]{2,4}/)(?:[^\s()<>]+|\(([^\s()<>]+|(\([^\s()<>]+\)))*\))+(?:\(([^\s()<>]+|(\([^\s()<>]+\)))*\)|[^\s`!()\[\]{};:\'\".,<>?«»“”‘’]))')
+
+    raw_links = re.findall(link_pattern, text)
+
+    links = [
+        str(raw_link[0]) for raw_link in raw_links
+    ]
+
+    return links
 
 
-@moduleman_plugin
-class links(BasePlugin, DiscoveryPluginMixin):
-    name = "links"
-    author = ("Xavi Mendez (@xmendez)",)
-    version = "0.1"
-    summary = "Parses HTML looking for new content."
-    description = ("Parses HTML looking for new content",)
-    category = ["active", "discovery"]
-    priority = 99
+def find_links_in_file(filename: str) -> List[str]:
+    """Find links in a file and return a list of URLs from text file."""
 
-    parameters = (
-        ("enqueue", "True", False, "If True, enqueue found links.",),
-        (
-            "add_path",
-            "False",
-            False,
-            "if True, re-enqueue found paths. ie. /path/link.html link enqueues also /path/",
-        ),
-        (
-            "domain",
-            None,
-            False,
-            "Regex of accepted domains tested against url.netloc. This is useful for restricting crawling certain domains.",
-        ),
-        (
-            "regex",
-            None,
-            False,
-            "Regex of accepted links tested against the full url. If domain is not set and regex is, domain defaults to .*. This is useful for restricting crawling certain file types.",
-        ),
-    )
+    with open(filename, mode='r', encoding='utf-8') as file:
+        readme = file.read()
+        index_section = readme.find('## Index')
+        if index_section == -1:
+            index_section = 0
+        content = readme[index_section:]
 
-    def __init__(self):
-        BasePlugin.__init__(self)
+    links = find_links_in_text(content)
 
-        regex = [
-            r'\b(?:(?<!data-)href)="((?!mailto:|tel:|#|javascript:).*?)"',
-            r'\bsrc="((?!javascript:).*?)"',
-            r'\baction="((?!javascript:).*?)"',
-            r'<meta.*content="\d+;url=(.*?)">',  # http://en.wikipedia.org/wiki/Meta_refresh
-            r'getJSON\("(.*?)"',
-            r"[^/][`'\"]([\/][a-zA-Z0-9_.-]+)+(?!(?:[,;\s]))",  # based on https://github.com/nahamsec/JSParser/blob/master/handler.py#L93
-        ]
+    return links
 
-        self.regex = []
-        for regex_str in regex:
-            self.regex.append(re.compile(regex_str, re.MULTILINE | re.DOTALL))
 
-        self.regex_header = [
-            ("Link", re.compile(r"<(.*)>;")),
-            ("Location", re.compile(r"(.*)")),
-        ]
+def check_duplicate_links(links: List[str]) -> Tuple[bool, List]:
+    """Check for duplicated links.
 
-        self.add_path = self._bool(self.kbase[KBASE_PARAM_PATH][0])
-        self.enqueue_links = self._bool(self.kbase[KBASE_PARAM_ENQUEUE][0])
+    Returns a tuple with True or False and duplicate list.
+    """
 
-        self.domain_regex = None
-        if self.kbase[KBASE_PARAM_DOMAIN_REGEX][0]:
-            self.domain_regex = re.compile(
-                self.kbase[KBASE_PARAM_DOMAIN_REGEX][0], re.IGNORECASE
-            )
+    seen = {}
+    duplicates = []
+    has_duplicate = False
 
-        self.regex_param = None
-        if self.kbase[KBASE_PARAM_REGEX][0]:
-            self.regex_param = re.compile(
-                self.kbase[KBASE_PARAM_REGEX][0], re.IGNORECASE
-            )
+    for link in links:
+        link = link.rstrip('/')
+        if link not in seen:
+            seen[link] = 1
+        else:
+            if seen[link] == 1:
+                duplicates.append(link)
 
-        if self.regex_param and self.domain_regex is None:
-            self.domain_regex = re.compile(".*", re.IGNORECASE)
+    if duplicates:
+        has_duplicate = True
 
-        self.list_links = set()
+    return (has_duplicate, duplicates)
 
-    def validate(self, fuzzresult):
-        self.list_links = set()
-        return fuzzresult.code in [200, 301, 302, 303, 307, 308]
 
-    def process(self, fuzzresult):
-        # <a href="www.owasp.org/index.php/OWASP_EU_Summit_2008">O
-        # ParseResult(scheme='', netloc='', path='www.owasp.org/index.php/OWASP_EU_Summit_2008', params='', query='', fragment='')
+def fake_user_agent() -> str:
+    """Faking user agent as some hosting services block not-whitelisted UA."""
 
-        for header, regex in self.regex_header:
-            if header in fuzzresult.history.headers.response:
-                for link_url in regex.findall(
-                    fuzzresult.history.headers.response[header]
-                ):
-                    if link_url:
-                        self.process_link(fuzzresult, link_url)
+    user_agents = [
+        'Mozilla/5.0 (Windows NT 6.2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/28.0.1467.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/605.1.15 (KHTML, like Gecko)',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.132 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/97.0.4692.71 Safari/537.36',
+    ]
 
-        for regex in self.regex:
-            for link_url in regex.findall(fuzzresult.history.content):
-                if link_url:
-                    self.process_link(fuzzresult, link_url)
+    return random.choice(user_agents)
 
-    def process_link(self, fuzzresult, link_url):
-        parsed_link = parse_url(link_url)
 
-        if (
-            not parsed_link.scheme
-            or parsed_link.scheme == "http"
-            or parsed_link.scheme == "https"
-        ) and self.from_domain(fuzzresult, parsed_link):
-            cache_key = parsed_link.cache_key(self.base_fuzz_res.history.urlp)
-            if cache_key not in self.list_links:
-                self.list_links.add(cache_key)
-                self.enqueue_link(fuzzresult, link_url, parsed_link)
+def get_host_from_link(link: str) -> str:
 
-    def enqueue_link(self, fuzzresult, link_url, parsed_link):
-        # dir path
-        if self.add_path:
-            split_path = parsed_link.path.split("/")
-            newpath = "/".join(split_path[:-1]) + "/"
-            self.queue_url(urljoin(fuzzresult.url, newpath))
+    host = link.split('://', 1)[1] if '://' in link else link
 
-        # file path
-        new_link = urljoin(fuzzresult.url, link_url)
+    # Remove routes, arguments and anchors
+    if '/' in host:
+        host = host.split('/', 1)[0]
 
-        if not self.regex_param or (
-            self.regex_param and self.regex_param.search(new_link) is not None
-        ):
-            if self.enqueue_links:
-                self.queue_url(new_link)
-            self.add_result("link", "New link found", new_link)
+    elif '?' in host:
+        host = host.split('?', 1)[0]
 
-    def from_domain(self, fuzzresult, parsed_link):
-        # relative path
-        if not parsed_link.netloc and parsed_link.path:
+    elif '#' in host:
+        host = host.split('#', 1)[0]
+
+    return host
+
+
+def has_cloudflare_protection(resp: Response) -> bool:
+    """Checks if there is any cloudflare protection in the response.
+
+    Cloudflare implements multiple network protections on a given link,
+    this script tries to detect if any of them exist in the response from request.
+
+    Common protections have the following HTTP code as a response:
+        - 403: When host header is missing or incorrect (and more)
+        - 503: When DDOS protection exists
+
+    See more about it at:
+        - https://support.cloudflare.com/hc/en-us/articles/115003014512-4xx-Client-Error
+        - https://support.cloudflare.com/hc/en-us/articles/115003011431-Troubleshooting-Cloudflare-5XX-errors
+        - https://www.cloudflare.com/ddos/
+        - https://superuser.com/a/888526
+
+    Discussions in issues and pull requests:
+        - https://github.com/public-apis/public-apis/pull/2409
+        - https://github.com/public-apis/public-apis/issues/2960 
+    """
+
+    code = resp.status_code
+    server = resp.headers.get('Server') or resp.headers.get('server')
+    cloudflare_flags = [
+        '403 Forbidden',
+        'cloudflare',
+        'Cloudflare',
+        'Security check',
+        'Please Wait... | Cloudflare',
+        'We are checking your browser...',
+        'Please stand by, while we are checking your browser...',
+        'Checking your browser before accessing',
+        'This process is automatic.',
+        'Your browser will redirect to your requested content shortly.',
+        'Please allow up to 5 seconds',
+        'DDoS protection by',
+        'Ray ID:',
+        'Cloudflare Ray ID:',
+        '_cf_chl',
+        '_cf_chl_opt',
+        '__cf_chl_rt_tk',
+        'cf-spinner-please-wait',
+        'cf-spinner-redirecting'
+    ]
+
+    if code in [403, 503] and server == 'cloudflare':
+        html = resp.text
+
+        flags_found = [flag in html for flag in cloudflare_flags]
+        any_flag_found = any(flags_found)
+
+        if any_flag_found:
             return True
 
-        # regex domain
-        if (
-            self.domain_regex
-            and self.domain_regex.search(parsed_link.netloc) is not None
-        ):
-            return True
+    return False
 
-        # same domain
-        if parsed_link.netloc == self.base_fuzz_res.history.urlp.netloc:
-            return True
 
-        if (
-            parsed_link.netloc
-            and parsed_link.netloc not in self.kbase[KBASE_NEW_DOMAIN]
-        ):
-            self.kbase[KBASE_NEW_DOMAIN].append(parsed_link.netloc)
-            self.add_result(
-                "domain", "New domain found (link not enqueued)", parsed_link.netloc
-            )
+def check_if_link_is_working(link: str) -> Tuple[bool, str]:
+    """Checks if a link is working.
+
+    If an error is identified when the request for the link occurs,
+    the return will be a tuple with the first value True and the second
+    value a string containing the error message.
+
+    If no errors are identified, the return will be a tuple with the
+    first value False and the second an empty string.
+    """
+
+    has_error = False
+    error_message = ''
+
+    try:
+        resp = requests.get(link, timeout=25, headers={
+            'User-Agent': fake_user_agent(),
+            'host': get_host_from_link(link)
+        })
+
+        code = resp.status_code
+
+        if code >= 400 and not has_cloudflare_protection(resp):
+            has_error = True
+            error_message = f'ERR:CLT: {code} : {link}'
+
+    except requests.exceptions.SSLError as error:
+        has_error = True
+        error_message = f'ERR:SSL: {error} : {link}'
+
+    except requests.exceptions.ConnectionError as error:
+        has_error = True
+        error_message = f'ERR:CNT: {error} : {link}'
+
+    except (TimeoutError, requests.exceptions.ConnectTimeout):
+        has_error = True
+        error_message = f'ERR:TMO: {link}'
+
+    except requests.exceptions.TooManyRedirects as error:
+        has_error = True
+        error_message = f'ERR:TMR: {error} : {link}'
+
+    except (Exception, requests.exceptions.RequestException) as error:
+        has_error = True
+        error_message = f'ERR:UKN: {error} : {link}'
+
+    return (has_error, error_message)
+
+
+def check_if_list_of_links_are_working(list_of_links: List[str]) -> List[str]:
+    error_messages = []
+    for link in list_of_links:
+        has_error, error_message = check_if_link_is_working(link)
+
+        if has_error:
+            error_messages.append(error_message)
+
+    return error_messages
+
+
+def start_duplicate_links_checker(links: List[str]) -> None:
+
+    print('Checking for duplicate links...')
+
+    has_duplicate_link, duplicates_links = check_duplicate_links(links)
+
+    if has_duplicate_link:
+        print(f'Found duplicate links:')
+
+        for duplicate_link in duplicates_links:
+            print(duplicate_link)
+
+        sys.exit(1)
+    else:
+        print('No duplicate links.')
+
+
+def start_links_working_checker(links: List[str]) -> None:
+
+    print(f'Checking if {len(links)} links are working...')
+
+    errors = check_if_list_of_links_are_working(links)
+    if errors:
+
+        num_errors = len(errors)
+        print(f'Apparently {num_errors} links are not working properly. See in:')
+
+        for error_message in errors:
+            print(error_message)
+
+        sys.exit(1)
+
+
+def main(filename: str, only_duplicate_links_checker: bool) -> None:
+
+    links = find_links_in_file(filename)
+
+    start_duplicate_links_checker(links)
+
+    if not only_duplicate_links_checker:
+        start_links_working_checker(links)
+
+
+if __name__ == '__main__':
+    num_args = len(sys.argv)
+    only_duplicate_links_checker = False
+
+    if num_args < 2:
+        print('No .md file passed')
+        sys.exit(1)
+    elif num_args == 3:
+        third_arg = sys.argv[2].lower()
+
+        if third_arg == '-odlc' or third_arg == '--only_duplicate_links_checker':
+            only_duplicate_links_checker = True
+        else:
+            print(f'Third invalid argument. Usage: python {__file__} [-odlc | --only_duplicate_links_checker]')
+            sys.exit(1)
+
+    filename = sys.argv[1]
+
+    main(filename, only_duplicate_links_checker)

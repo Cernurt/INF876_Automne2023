@@ -1,297 +1,143 @@
-from __future__ import absolute_import, unicode_literals
-from ..constants import PROXY, UTF8
-from ..converter import KnowledgePostConverter
-from ..mapping import SubstitutionMapper
-from markdown import Extension
-from markdown.blockprocessors import BlockProcessor
-from markdown.extensions import codehilite, toc
-from markdown.inlinepatterns import Pattern
-from markdown.preprocessors import Preprocessor
-from markdown.util import AtomicString, etree
-import base64
-import markdown
-import mimetypes
+# -*- coding: utf-8 -*-
+"""
+    wakatime.dependencies.html
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-MARKDOWN_EXTENSIONS = ['extra',
-                       'abbr',
-                       'attr_list',
-                       'def_list',
-                       'fenced_code',
-                       'footnotes',
-                       'tables',
-                       'admonition',
-                       codehilite.CodeHiliteExtension(guess_lang=False),
-                       'meta',
-                       'sane_lists',
-                       'smarty',
-                       toc.TocExtension(baselevel=1),
-                       'wikilinks',
-                       'knowledge_repo.converters.html:KnowledgeMetaExtension',
-                       'knowledge_repo.converters.html:MathJaxExtension',
-                       'knowledge_repo.converters.html:IndentsAsCellOutput',
-                       'knowledge_repo.converters.html:InlineSpanStyles']
+    Parse dependencies from HTML.
+
+    :copyright: (c) 2014 Alan Hamlett.
+    :license: BSD, see LICENSE for more details.
+"""
+
+from . import TokenParser
+from ..compat import u
 
 
-class InlineSpanStyles(Extension):
+""" If these keywords are found in the source file, treat them as a dependency.
+Must be lower-case strings.
+"""
+KEYWORDS = [
+    '_',
+    '$',
+    'angular',
+    'assert',  # probably mocha
+    'backbone',
+    'batman',
+    'c3',
+    'can',
+    'casper',
+    'chai',
+    'chaplin',
+    'd3',
+    'define',  # probably require
+    'describe',  # mocha or jasmine
+    'eco',
+    'ember',
+    'espresso',
+    'expect',  # probably jasmine
+    'exports',  # probably npm
+    'express',
+    'gulp',
+    'handlebars',
+    'highcharts',
+    'jasmine',
+    'jquery',
+    'jstz',
+    'ko',  # probably knockout
+    'm',  # probably mithril
+    'marionette',
+    'meteor',
+    'moment',
+    'monitorio',
+    'mustache',
+    'phantom',
+    'pickadate',
+    'pikaday',
+    'qunit',
+    'react',
+    'reactive',
+    'require',  # probably the commonjs spec
+    'ripple',
+    'rivets',
+    'socketio',
+    'spine',
+    'thorax',
+    'underscore',
+    'vue',
+    'way',
+    'zombie',
+]
 
-    SPAN_PATTERN = r'\[([\s\S]*?)\]\{((?:\ ?.[^\,\}]+?)*?)\}'
 
-    class SpanMatchHandler(Pattern):
-        def handleMatch(self, m):
-            # Extract information from markdown tag
-            text = m.group(2)
+class HtmlParser(TokenParser):
+    tags = []
+    opening_tag = False
+    getting_attrs = False
+    current_attr = None
+    current_attr_value = None
 
-            ids = [
-                id
-                for id in m.group(3).split(',')
-                if id.startswith('#')
-            ]
-            id = ids[0] if ids else None
+    def parse(self):
+        for index, token, content in self.tokens:
+            self._process_token(token, content)
+        return self.dependencies
 
-            class_names = [
-                class_name[1:] if class_name.startswith('.') else class_name
-                for class_name in m.group(3).split(' ')
-                if class_name.startswith('.')
-            ]
+    def _process_token(self, token, content):
+        if u(token) == 'Token.Punctuation':
+            self._process_punctuation(token, content)
+        elif u(token) == 'Token.Name.Tag':
+            self._process_tag(token, content)
+        elif u(token) == 'Token.Literal.String':
+            self._process_string(token, content)
+        elif u(token) == 'Token.Name.Attribute':
+            self._process_attribute(token, content)
 
-            # Generate HTML element for new span
-            el = etree.Element('span')
-            el.text = text
-            if id:
-                el.attrib['id'] = id
-            if class_names:
-                el.attrib['class'] = " ".join(class_names)
-            return el
+    @property
+    def current_tag(self):
+        return None if len(self.tags) == 0 else self.tags[0]
 
-    def extendMarkdown(self, md, md_globals):
-        span_matcher = self.SpanMatchHandler(self.SPAN_PATTERN)
-        md.inlinePatterns['inline_span'] = span_matcher
+    def _process_punctuation(self, token, content):
+        if content.startswith('</') or content.startswith('/'):
+            try:
+                self.tags.pop(0)
+            except IndexError:
+                # ignore errors from malformed markup
+                pass
+            self.opening_tag = False
+            self.getting_attrs = False
+        elif content.startswith('<'):
+            self.opening_tag = True
+        elif content.startswith('>'):
+            self.opening_tag = False
+            self.getting_attrs = False
 
+    def _process_tag(self, token, content):
+        if self.opening_tag:
+            self.tags.insert(0, content.replace('<', '', 1).strip().lower())
+            self.getting_attrs = True
+        self.current_attr = None
 
-class IndentsAsCellOutputPreprocessor(Preprocessor):
-    """
-    Ensure all indented blocks are followed by a blank line to allow html
-    preprocessors to extract html elements (like scripts) properly.
-    """
+    def _process_attribute(self, token, content):
+        if self.getting_attrs:
+            self.current_attr = content.lower().strip('=')
+        self.current_attr_value = None
 
-    def run(self, lines):
-        in_block = False
-        block_startable = True
-        for i, line in enumerate(lines):
-            if not line.startswith(' ' * self.markdown.tab_length):
-                if in_block:
-                    if line != "":
-                        lines.insert(i, "")
-                    in_block = False
+    def _process_string(self, token, content):
+        if self.getting_attrs and self.current_attr is not None:
+            if content.endswith('"') or content.endswith("'"):
+                if self.current_attr_value is not None:
+                    self.current_attr_value += content
+                    if self.current_tag == 'script' and self.current_attr == 'src':
+                        self.append(self.current_attr_value)
+                    self.current_attr = None
+                    self.current_attr_value = None
                 else:
-                    block_startable = True if line == "" else False
-            elif block_startable and not in_block:
-                in_block = True
-        return lines
-
-
-class IndentsAsCellOutputProcessor(BlockProcessor):
-    """ Process code blocks. """
-
-    def test(self, parent, block):
-        return block.startswith(' ' * self.tab_length)
-
-    def run(self, parent, blocks):
-        sibling = self.lastChild(parent)
-        block = blocks.pop(0)
-
-        block, theRest = self.detab(block)
-        block = block.rstrip()
-
-        block_is_html = False
-        if "<div " in block or "</" in block or "<span " in block:
-            block_is_html = True
-
-        if (sibling is not None and sibling.tag == "div"):
-            # The previous block was a code block. As blank lines do not start
-            # new code blocks, append this block to the previous, adding back
-            # linebreaks removed from the split into a list.
-
-            block_is_html = block_is_html and not isinstance(
-                sibling.text, AtomicString)
-
-            block = u'\n'.join([sibling.text, block])
-            output = sibling
-        else:
-            # This is a new codeblock. Create the elements and insert text.
-            output = markdown.util.etree.SubElement(
-                parent, 'div', {'class': 'code-output'})
-
-        # If not HTML, add the `pre` class
-        # so that we know to render output as raw text
-        if not block_is_html and 'pre' not in output.get(
-            'class', 'code-output'
-        ):
-            output.set('class', ' '.join([output.get('class', ''), 'pre']))
-
-        output.text = f'{block}\n' if block_is_html else AtomicString(
-            f'{block}\n')
-
-        if theRest:
-            # This block contained unindented line(s) after the first indented
-            # line. Insert these lines as the first block of the master blocks
-            # list for future processing.
-            blocks.insert(0, theRest)
-
-
-class IndentsAsCellOutput(Extension):
-
-    def extendMarkdown(self, md, md_globals=None):
-        md.preprocessors.add("code_isolation",
-                             IndentsAsCellOutputPreprocessor(md),
-                             "<html_block")
-        md.parser.blockprocessors['code'] = IndentsAsCellOutputProcessor(
-            md.parser)
-
-
-class KnowledgeMetaPreprocessor(Preprocessor):
-    """ Get Meta-Data. """
-
-    def run(self, lines):
-        """ Parse Meta-Data and store in Markdown.Meta. """
-        cnt = 0
-        for i, line in enumerate(lines):
-            if line.strip() == '---':
-                cnt = cnt + 1
-            if cnt == 2:
-                break
-        return lines[i + 1:]
-
-
-class KnowledgeMetaExtension(Extension):
-    """ Meta-Data extension for Python-Markdown. """
-
-    def extendMarkdown(self, md, md_globals=None):
-        """ Add MetaPreprocessor to Markdown instance. """
-        md.preprocessors.add("knowledge_meta",
-                             KnowledgeMetaPreprocessor(md),
-                             ">normalize_whitespace")
-
-
-class MathJaxPattern(markdown.inlinepatterns.Pattern):
-
-    def __init__(self):
-        markdown.inlinepatterns.Pattern.__init__(
-            self, r'(?<!\\)(\$\$?)(.+?)\2')
-
-    def handleMatch(self, m):
-        node = markdown.util.etree.Element('mathjax')
-        node.text = markdown.util.AtomicString(
-            m.group(2) + m.group(3) + m.group(2))
-        return node
-
-
-class MathJaxExtension(markdown.Extension):
-    def extendMarkdown(self, md, md_globals=None):
-        # Needs to come before escape matching because \ is
-        # pretty important in LaTeX
-        md.inlinePatterns.add('mathjax', MathJaxPattern(), '<escape')
-
-
-class HTMLConverter(KnowledgePostConverter):
-    '''
-    Use this as a template for new KnowledgePostConverters.
-    '''
-    _registry_keys = ['html']
-
-    def init(self):
-        self.kp_images = self.kp.read_images()
-
-    def _render_markdown(self,
-                         skip_headers=False,
-                         images_base64_encode=True,
-                         urlmappers=[]):
-        """
-        Returns the `Markdown` instance as well as the rendered html output
-        as a tuple: (`Markdown`, str).
-        """
-        # Copy urlmappers locally so we can modify it without affecting global
-        # state
-        urlmappers = urlmappers[:]
-        if images_base64_encode:
-            urlmappers.insert(0, self.base64_encode_image_mapper)
-
-        # proxy posts are assumed to be embeddable links
-        if PROXY in self.kp.headers:
-            proxy = self.kp.headers[PROXY].strip()
-            return None, (f'<a href="{proxy}">Linked Post</a>\n'
-                          f'<iframe width=100% height=1000 '
-                          f'src="{proxy}"></iframe>')
-
-        html = ''
-        if not skip_headers:
-            html += self.render_headers()
-
-        md = markdown.Markdown(extensions=MARKDOWN_EXTENSIONS)
-        html += md.convert(self.kp.read())
-
-        html = self.apply_url_remapping(html, urlmappers)
-
-        return md, html
-
-    def to_string(self,
-                  skip_headers=False,
-                  images_base64_encode=True,
-                  urlmappers=[]):
-        """
-        Renders the markdown as html
-        """
-        return self._render_markdown(
-            skip_headers=skip_headers,
-            images_base64_encode=images_base64_encode,
-            urlmappers=urlmappers
-        )[1]
-
-    def apply_url_remapping(self, html, urlmappers):
-        patterns = {
-            'img': '<img.*?src=[\'"](?P<url>.*?)[\'"].*?>',
-            'a': '<a.*?href=[\'"](?P<url>.*?)[\'"].*?>'
-        }
-
-        def urlmapper_proxy(name, match):
-            for urlmapper in urlmappers:
-                new_url = urlmapper(name, match.group('url'))
-                if new_url is not None:
-                    return match.group(0).replace(match.group('url'), new_url)
-            return None
-
-        return SubstitutionMapper(patterns=patterns,
-                                  mappers=[urlmapper_proxy]).apply(html)
-
-    # Utility methods
-    def render_headers(self):
-        headers = self.kp.headers
-
-        headers['authors_string'] = ', '.join(headers.get('authors'))
-        headers['tldr'] = markdown.Markdown(extensions=MARKDOWN_EXTENSIONS[
-                                            :-1]).convert(headers['tldr'])
-        headers['date_created'] = headers['created_at'].isoformat()
-        headers['date_updated'] = headers['updated_at'].isoformat()
-
-        header = """
-<h1>{title}</h1>
-<p id='metadata'>
-<strong>Author</strong>: {authors_string} <br>
-<strong>Date Created</strong>: {date_created}<br>
-<strong>Date Updated</strong>: {date_updated}<br>
-<strong>Tags</strong><text>: </text><br>
-<strong>TLDR</strong>: {tldr}<br>
-</p>
-""".format(**headers)
-
-        return header
-
-    def base64_encode_image_mapper(self, tag, url):
-        if tag == 'img':
-            if url in self.kp_images:
-                image_data = base64.b64encode(self.kp_images[url])
-                image_mimetype = mimetypes.guess_type(url)[0]
-                if image_mimetype is not None:
-                    return f'data:{image_mimetype};base64, ' + \
-                        image_data.decode(UTF8)
-        return None
+                    if len(content) == 1:
+                        self.current_attr_value = content
+                    else:
+                        if self.current_tag == 'script' and self.current_attr == 'src':
+                            self.append(content)
+                        self.current_attr = None
+                        self.current_attr_value = None
+            elif content.startswith('"') or content.startswith("'"):
+                if self.current_attr_value is None:
+                    self.current_attr_value = content

@@ -1,275 +1,424 @@
-# File modified by authors of InstructPix2Pix from original (https://github.com/CompVis/stable-diffusion).
-# See more details in LICENSE.
-
-from inspect import isfunction
-import math
-import torch
-import torch.nn.functional as F
-from torch import nn, einsum
-from einops import rearrange, repeat
-
-from ldm.modules.diffusionmodules.util import checkpoint
+## @package attention
+# Module caffe2.python.attention
 
 
-def exists(val):
-    return val is not None
 
 
-def uniq(arr):
-    return{el: True for el in arr}.keys()
+
+from caffe2.python import brew
 
 
-def default(val, d):
-    if exists(val):
-        return val
-    return d() if isfunction(d) else d
+class AttentionType:
+    Regular, Recurrent, Dot, SoftCoverage = tuple(range(4))
 
 
-def max_neg_value(t):
-    return -torch.finfo(t.dtype).max
+def s(scope, name):
+    # We have to manually scope due to our internal/external blob
+    # relationships.
+    return "{}/{}".format(str(scope), str(name))
 
 
-def init_(tensor):
-    dim = tensor.shape[-1]
-    std = 1 / math.sqrt(dim)
-    tensor.uniform_(-std, std)
-    return tensor
+# c_i = \sum_j w_{ij}\textbf{s}_j
+def _calc_weighted_context(
+    model,
+    encoder_outputs_transposed,
+    encoder_output_dim,
+    attention_weights_3d,
+    scope,
+):
+    # [batch_size, encoder_output_dim, 1]
+    attention_weighted_encoder_context = brew.batch_mat_mul(
+        model,
+        [encoder_outputs_transposed, attention_weights_3d],
+        s(scope, 'attention_weighted_encoder_context'),
+    )
+    # [batch_size, encoder_output_dim]
+    attention_weighted_encoder_context, _ = model.net.Reshape(
+        attention_weighted_encoder_context,
+        [
+            attention_weighted_encoder_context,
+            s(scope, 'attention_weighted_encoder_context_old_shape'),
+        ],
+        shape=[1, -1, encoder_output_dim],
+    )
+    return attention_weighted_encoder_context
 
 
-# feedforward
-class GEGLU(nn.Module):
-    def __init__(self, dim_in, dim_out):
-        super().__init__()
-        self.proj = nn.Linear(dim_in, dim_out * 2)
-
-    def forward(self, x):
-        x, gate = self.proj(x).chunk(2, dim=-1)
-        return x * F.gelu(gate)
-
-
-class FeedForward(nn.Module):
-    def __init__(self, dim, dim_out=None, mult=4, glu=False, dropout=0.):
-        super().__init__()
-        inner_dim = int(dim * mult)
-        dim_out = default(dim_out, dim)
-        project_in = nn.Sequential(
-            nn.Linear(dim, inner_dim),
-            nn.GELU()
-        ) if not glu else GEGLU(dim, inner_dim)
-
-        self.net = nn.Sequential(
-            project_in,
-            nn.Dropout(dropout),
-            nn.Linear(inner_dim, dim_out)
+# Calculate a softmax over the passed in attention energy logits
+def _calc_attention_weights(
+    model,
+    attention_logits_transposed,
+    scope,
+    encoder_lengths=None,
+):
+    if encoder_lengths is not None:
+        attention_logits_transposed = model.net.SequenceMask(
+            [attention_logits_transposed, encoder_lengths],
+            ['masked_attention_logits'],
+            mode='sequence',
         )
 
-    def forward(self, x):
-        return self.net(x)
+    # [batch_size, encoder_length, 1]
+    attention_weights_3d = brew.softmax(
+        model,
+        attention_logits_transposed,
+        s(scope, 'attention_weights_3d'),
+        engine='CUDNN',
+        axis=1,
+    )
+    return attention_weights_3d
 
 
-def zero_module(module):
-    """
-    Zero out the parameters of a module and return it.
-    """
-    for p in module.parameters():
-        p.detach().zero_()
-    return module
+# e_{ij} = \textbf{v}^T tanh \alpha(\textbf{h}_{i-1}, \textbf{s}_j)
+def _calc_attention_logits_from_sum_match(
+    model,
+    decoder_hidden_encoder_outputs_sum,
+    encoder_output_dim,
+    scope,
+):
+    # [encoder_length, batch_size, encoder_output_dim]
+    decoder_hidden_encoder_outputs_sum = model.net.Tanh(
+        decoder_hidden_encoder_outputs_sum,
+        decoder_hidden_encoder_outputs_sum,
+    )
+
+    # [encoder_length, batch_size, 1]
+    attention_logits = brew.fc(
+        model,
+        decoder_hidden_encoder_outputs_sum,
+        s(scope, 'attention_logits'),
+        dim_in=encoder_output_dim,
+        dim_out=1,
+        axis=2,
+        freeze_bias=True,
+    )
+
+    # [batch_size, encoder_length, 1]
+    attention_logits_transposed = brew.transpose(
+        model,
+        attention_logits,
+        s(scope, 'attention_logits_transposed'),
+        axes=[1, 0, 2],
+    )
+    return attention_logits_transposed
 
 
-def Normalize(in_channels):
-    return torch.nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+# \textbf{W}^\alpha used in the context of \alpha_{sum}(a,b)
+def _apply_fc_weight_for_sum_match(
+    model,
+    input,
+    dim_in,
+    dim_out,
+    scope,
+    name,
+):
+    output = brew.fc(
+        model,
+        input,
+        s(scope, name),
+        dim_in=dim_in,
+        dim_out=dim_out,
+        axis=2,
+    )
+    output = model.net.Squeeze(
+        output,
+        output,
+        dims=[0],
+    )
+    return output
 
 
-class LinearAttention(nn.Module):
-    def __init__(self, dim, heads=4, dim_head=32):
-        super().__init__()
-        self.heads = heads
-        hidden_dim = dim_head * heads
-        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias = False)
-        self.to_out = nn.Conv2d(hidden_dim, dim, 1)
+# Implement RecAtt due to section 4.1 in http://arxiv.org/abs/1601.03317
+def apply_recurrent_attention(
+    model,
+    encoder_output_dim,
+    encoder_outputs_transposed,
+    weighted_encoder_outputs,
+    decoder_hidden_state_t,
+    decoder_hidden_state_dim,
+    attention_weighted_encoder_context_t_prev,
+    scope,
+    encoder_lengths=None,
+):
+    weighted_prev_attention_context = _apply_fc_weight_for_sum_match(
+        model=model,
+        input=attention_weighted_encoder_context_t_prev,
+        dim_in=encoder_output_dim,
+        dim_out=encoder_output_dim,
+        scope=scope,
+        name='weighted_prev_attention_context',
+    )
 
-    def forward(self, x):
-        b, c, h, w = x.shape
-        qkv = self.to_qkv(x)
-        q, k, v = rearrange(qkv, 'b (qkv heads c) h w -> qkv b heads c (h w)', heads = self.heads, qkv=3)
-        k = k.softmax(dim=-1) 
-        context = torch.einsum('bhdn,bhen->bhde', k, v)
-        out = torch.einsum('bhde,bhdn->bhen', context, q)
-        out = rearrange(out, 'b heads c (h w) -> b (heads c) h w', heads=self.heads, h=h, w=w)
-        return self.to_out(out)
+    weighted_decoder_hidden_state = _apply_fc_weight_for_sum_match(
+        model=model,
+        input=decoder_hidden_state_t,
+        dim_in=decoder_hidden_state_dim,
+        dim_out=encoder_output_dim,
+        scope=scope,
+        name='weighted_decoder_hidden_state',
+    )
+    # [1, batch_size, encoder_output_dim]
+    decoder_hidden_encoder_outputs_sum_tmp = model.net.Add(
+        [
+            weighted_prev_attention_context,
+            weighted_decoder_hidden_state,
+        ],
+        s(scope, 'decoder_hidden_encoder_outputs_sum_tmp'),
+    )
+    # [encoder_length, batch_size, encoder_output_dim]
+    decoder_hidden_encoder_outputs_sum = model.net.Add(
+        [
+            weighted_encoder_outputs,
+            decoder_hidden_encoder_outputs_sum_tmp,
+        ],
+        s(scope, 'decoder_hidden_encoder_outputs_sum'),
+        broadcast=1,
+    )
+    attention_logits_transposed = _calc_attention_logits_from_sum_match(
+        model=model,
+        decoder_hidden_encoder_outputs_sum=decoder_hidden_encoder_outputs_sum,
+        encoder_output_dim=encoder_output_dim,
+        scope=scope,
+    )
+
+    # [batch_size, encoder_length, 1]
+    attention_weights_3d = _calc_attention_weights(
+        model=model,
+        attention_logits_transposed=attention_logits_transposed,
+        scope=scope,
+        encoder_lengths=encoder_lengths,
+    )
+
+    # [batch_size, encoder_output_dim, 1]
+    attention_weighted_encoder_context = _calc_weighted_context(
+        model=model,
+        encoder_outputs_transposed=encoder_outputs_transposed,
+        encoder_output_dim=encoder_output_dim,
+        attention_weights_3d=attention_weights_3d,
+        scope=scope,
+    )
+    return attention_weighted_encoder_context, attention_weights_3d, [
+        decoder_hidden_encoder_outputs_sum,
+    ]
 
 
-class SpatialSelfAttention(nn.Module):
-    def __init__(self, in_channels):
-        super().__init__()
-        self.in_channels = in_channels
+def apply_regular_attention(
+    model,
+    encoder_output_dim,
+    encoder_outputs_transposed,
+    weighted_encoder_outputs,
+    decoder_hidden_state_t,
+    decoder_hidden_state_dim,
+    scope,
+    encoder_lengths=None,
+):
+    weighted_decoder_hidden_state = _apply_fc_weight_for_sum_match(
+        model=model,
+        input=decoder_hidden_state_t,
+        dim_in=decoder_hidden_state_dim,
+        dim_out=encoder_output_dim,
+        scope=scope,
+        name='weighted_decoder_hidden_state',
+    )
 
-        self.norm = Normalize(in_channels)
-        self.q = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.k = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.v = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.proj_out = torch.nn.Conv2d(in_channels,
-                                        in_channels,
-                                        kernel_size=1,
-                                        stride=1,
-                                        padding=0)
+    # [encoder_length, batch_size, encoder_output_dim]
+    decoder_hidden_encoder_outputs_sum = model.net.Add(
+        [weighted_encoder_outputs, weighted_decoder_hidden_state],
+        s(scope, 'decoder_hidden_encoder_outputs_sum'),
+        broadcast=1,
+        use_grad_hack=1,
+    )
 
-    def forward(self, x):
-        h_ = x
-        h_ = self.norm(h_)
-        q = self.q(h_)
-        k = self.k(h_)
-        v = self.v(h_)
+    attention_logits_transposed = _calc_attention_logits_from_sum_match(
+        model=model,
+        decoder_hidden_encoder_outputs_sum=decoder_hidden_encoder_outputs_sum,
+        encoder_output_dim=encoder_output_dim,
+        scope=scope,
+    )
 
-        # compute attention
-        b,c,h,w = q.shape
-        q = rearrange(q, 'b c h w -> b (h w) c')
-        k = rearrange(k, 'b c h w -> b c (h w)')
-        w_ = torch.einsum('bij,bjk->bik', q, k)
+    # [batch_size, encoder_length, 1]
+    attention_weights_3d = _calc_attention_weights(
+        model=model,
+        attention_logits_transposed=attention_logits_transposed,
+        scope=scope,
+        encoder_lengths=encoder_lengths,
+    )
 
-        w_ = w_ * (int(c)**(-0.5))
-        w_ = torch.nn.functional.softmax(w_, dim=2)
-
-        # attend to values
-        v = rearrange(v, 'b c h w -> b c (h w)')
-        w_ = rearrange(w_, 'b i j -> b j i')
-        h_ = torch.einsum('bij,bjk->bik', v, w_)
-        h_ = rearrange(h_, 'b c (h w) -> b c h w', h=h)
-        h_ = self.proj_out(h_)
-
-        return x+h_
+    # [batch_size, encoder_output_dim, 1]
+    attention_weighted_encoder_context = _calc_weighted_context(
+        model=model,
+        encoder_outputs_transposed=encoder_outputs_transposed,
+        encoder_output_dim=encoder_output_dim,
+        attention_weights_3d=attention_weights_3d,
+        scope=scope,
+    )
+    return attention_weighted_encoder_context, attention_weights_3d, [
+        decoder_hidden_encoder_outputs_sum,
+    ]
 
 
-class CrossAttention(nn.Module):
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
-        super().__init__()
-        inner_dim = dim_head * heads
-        context_dim = default(context_dim, query_dim)
-
-        self.scale = dim_head ** -0.5
-        self.heads = heads
-
-        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
-        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
-        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
-
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, query_dim),
-            nn.Dropout(dropout)
+def apply_dot_attention(
+    model,
+    encoder_output_dim,
+    # [batch_size, encoder_output_dim, encoder_length]
+    encoder_outputs_transposed,
+    # [1, batch_size, decoder_state_dim]
+    decoder_hidden_state_t,
+    decoder_hidden_state_dim,
+    scope,
+    encoder_lengths=None,
+):
+    if decoder_hidden_state_dim != encoder_output_dim:
+        weighted_decoder_hidden_state = brew.fc(
+            model,
+            decoder_hidden_state_t,
+            s(scope, 'weighted_decoder_hidden_state'),
+            dim_in=decoder_hidden_state_dim,
+            dim_out=encoder_output_dim,
+            axis=2,
         )
+    else:
+        weighted_decoder_hidden_state = decoder_hidden_state_t
 
-        self.prompt_to_prompt = False
+    # [batch_size, decoder_state_dim]
+    squeezed_weighted_decoder_hidden_state = model.net.Squeeze(
+        weighted_decoder_hidden_state,
+        s(scope, 'squeezed_weighted_decoder_hidden_state'),
+        dims=[0],
+    )
 
-    def forward(self, x, context=None, mask=None):
-        is_self_attn = context is None
+    # [batch_size, decoder_state_dim, 1]
+    expanddims_squeezed_weighted_decoder_hidden_state = model.net.ExpandDims(
+        squeezed_weighted_decoder_hidden_state,
+        squeezed_weighted_decoder_hidden_state,
+        dims=[2],
+    )
 
-        h = self.heads
+    # [batch_size, encoder_output_dim, 1]
+    attention_logits_transposed = model.net.BatchMatMul(
+        [
+            encoder_outputs_transposed,
+            expanddims_squeezed_weighted_decoder_hidden_state,
+        ],
+        s(scope, 'attention_logits'),
+        trans_a=1,
+    )
 
-        q = self.to_q(x)
-        context = default(context, x)
-        k = self.to_k(context)
-        v = self.to_v(context)
+    # [batch_size, encoder_length, 1]
+    attention_weights_3d = _calc_attention_weights(
+        model=model,
+        attention_logits_transposed=attention_logits_transposed,
+        scope=scope,
+        encoder_lengths=encoder_lengths,
+    )
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
-
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
-
-        if self.prompt_to_prompt and is_self_attn:
-            # Unlike the original Prompt-to-Prompt which uses cross-attention layers, we copy attention maps for self-attention layers.
-            # There must be 4 elements in the batch: {conditional, unconditional} x {prompt 1, prompt 2}
-            assert x.size(0) == 4
-            sims = sim.chunk(4)
-            sim = torch.cat((sims[0], sims[0], sims[2], sims[2]))
-
-        if exists(mask):
-            mask = rearrange(mask, 'b ... -> b (...)')
-            max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h=h)
-            sim.masked_fill_(~mask, max_neg_value)
-
-        # attention, what we cannot get enough of
-        attn = sim.softmax(dim=-1)
-
-        out = einsum('b i j, b j d -> b i d', attn, v)
-        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
-        return self.to_out(out)
-
-
-class BasicTransformerBlock(nn.Module):
-    def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=True):
-        super().__init__()
-        self.attn1 = CrossAttention(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout)  # is a self-attention
-        self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
-        self.attn2 = CrossAttention(query_dim=dim, context_dim=context_dim,
-                                    heads=n_heads, dim_head=d_head, dropout=dropout)  # is self-attn if context is none
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.norm3 = nn.LayerNorm(dim)
-        self.checkpoint = checkpoint
-
-    def forward(self, x, context=None):
-        return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
-
-    def _forward(self, x, context=None):
-        x = self.attn1(self.norm1(x)) + x
-        x = self.attn2(self.norm2(x), context=context) + x
-        x = self.ff(self.norm3(x)) + x
-        return x
+    # [batch_size, encoder_output_dim, 1]
+    attention_weighted_encoder_context = _calc_weighted_context(
+        model=model,
+        encoder_outputs_transposed=encoder_outputs_transposed,
+        encoder_output_dim=encoder_output_dim,
+        attention_weights_3d=attention_weights_3d,
+        scope=scope,
+    )
+    return attention_weighted_encoder_context, attention_weights_3d, []
 
 
-class SpatialTransformer(nn.Module):
-    """
-    Transformer block for image-like data.
-    First, project the input (aka embedding)
-    and reshape to b, t, d.
-    Then apply standard transformer action.
-    Finally, reshape to image
-    """
-    def __init__(self, in_channels, n_heads, d_head,
-                 depth=1, dropout=0., context_dim=None):
-        super().__init__()
-        self.in_channels = in_channels
-        inner_dim = n_heads * d_head
-        self.norm = Normalize(in_channels)
+def apply_soft_coverage_attention(
+    model,
+    encoder_output_dim,
+    encoder_outputs_transposed,
+    weighted_encoder_outputs,
+    decoder_hidden_state_t,
+    decoder_hidden_state_dim,
+    scope,
+    encoder_lengths,
+    coverage_t_prev,
+    coverage_weights,
+):
 
-        self.proj_in = nn.Conv2d(in_channels,
-                                 inner_dim,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
+    weighted_decoder_hidden_state = _apply_fc_weight_for_sum_match(
+        model=model,
+        input=decoder_hidden_state_t,
+        dim_in=decoder_hidden_state_dim,
+        dim_out=encoder_output_dim,
+        scope=scope,
+        name='weighted_decoder_hidden_state',
+    )
 
-        self.transformer_blocks = nn.ModuleList(
-            [BasicTransformerBlock(inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim)
-                for d in range(depth)]
-        )
+    # [encoder_length, batch_size, encoder_output_dim]
+    decoder_hidden_encoder_outputs_sum_tmp = model.net.Add(
+        [weighted_encoder_outputs, weighted_decoder_hidden_state],
+        s(scope, 'decoder_hidden_encoder_outputs_sum_tmp'),
+        broadcast=1,
+    )
+    # [batch_size, encoder_length]
+    coverage_t_prev_2d = model.net.Squeeze(
+        coverage_t_prev,
+        s(scope, 'coverage_t_prev_2d'),
+        dims=[0],
+    )
+    # [encoder_length, batch_size]
+    coverage_t_prev_transposed = brew.transpose(
+        model,
+        coverage_t_prev_2d,
+        s(scope, 'coverage_t_prev_transposed'),
+    )
 
-        self.proj_out = zero_module(nn.Conv2d(inner_dim,
-                                              in_channels,
-                                              kernel_size=1,
-                                              stride=1,
-                                              padding=0))
+    # [encoder_length, batch_size, encoder_output_dim]
+    scaled_coverage_weights = model.net.Mul(
+        [coverage_weights, coverage_t_prev_transposed],
+        s(scope, 'scaled_coverage_weights'),
+        broadcast=1,
+        axis=0,
+    )
 
-    def forward(self, x, context=None):
-        # note: if no context is given, cross-attention defaults to self-attention
-        b, c, h, w = x.shape
-        x_in = x
-        x = self.norm(x)
-        x = self.proj_in(x)
-        x = rearrange(x, 'b c h w -> b (h w) c')
-        for block in self.transformer_blocks:
-            x = block(x, context=context)
-        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
-        x = self.proj_out(x)
-        return x + x_in
+    # [encoder_length, batch_size, encoder_output_dim]
+    decoder_hidden_encoder_outputs_sum = model.net.Add(
+        [decoder_hidden_encoder_outputs_sum_tmp, scaled_coverage_weights],
+        s(scope, 'decoder_hidden_encoder_outputs_sum'),
+    )
+
+    # [batch_size, encoder_length, 1]
+    attention_logits_transposed = _calc_attention_logits_from_sum_match(
+        model=model,
+        decoder_hidden_encoder_outputs_sum=decoder_hidden_encoder_outputs_sum,
+        encoder_output_dim=encoder_output_dim,
+        scope=scope,
+    )
+
+    # [batch_size, encoder_length, 1]
+    attention_weights_3d = _calc_attention_weights(
+        model=model,
+        attention_logits_transposed=attention_logits_transposed,
+        scope=scope,
+        encoder_lengths=encoder_lengths,
+    )
+
+    # [batch_size, encoder_output_dim, 1]
+    attention_weighted_encoder_context = _calc_weighted_context(
+        model=model,
+        encoder_outputs_transposed=encoder_outputs_transposed,
+        encoder_output_dim=encoder_output_dim,
+        attention_weights_3d=attention_weights_3d,
+        scope=scope,
+    )
+
+    # [batch_size, encoder_length]
+    attention_weights_2d = model.net.Squeeze(
+        attention_weights_3d,
+        s(scope, 'attention_weights_2d'),
+        dims=[2],
+    )
+
+    coverage_t = model.net.Add(
+        [coverage_t_prev, attention_weights_2d],
+        s(scope, 'coverage_t'),
+        broadcast=1,
+    )
+
+    return (
+        attention_weighted_encoder_context,
+        attention_weights_3d,
+        [decoder_hidden_encoder_outputs_sum],
+        coverage_t,
+    )

@@ -1,199 +1,145 @@
-from datetime import date
-from enum import Enum
-from typing import List, Optional
+#-----------------------------------------------------------------------------
+# Copyright (c) 2012 - 2023, Anaconda, Inc., and Bokeh Contributors.
+# All rights reserved.
+#
+# The full license is in the file LICENSE.txt, distributed with this software.
+#-----------------------------------------------------------------------------
 
-from pydantic import BaseModel
+#-----------------------------------------------------------------------------
+# Boilerplate
+#-----------------------------------------------------------------------------
+from __future__ import annotations # isort:skip
 
-from ninja import NinjaAPI, Query
-from ninja.testing import TestClient
+import pytest ; pytest
 
+#-----------------------------------------------------------------------------
+# Imports
+#-----------------------------------------------------------------------------
 
-class RoomEnum(str, Enum):
-    double = "double"
-    twin = "twin"
-    single = "single"
+# Bokeh imports
+from bokeh.core.enums import LineJoin, NamedColor
+from tests.support.util.api import verify_all
 
+from _util_property import _TestHasProps, _TestModel
 
-class ExtraEnum(str, Enum):
-    a = "a"
-    b = "b"
+# Module under test
+import bokeh.core.property.enum as bcpe # isort:skip
 
+#-----------------------------------------------------------------------------
+# Setup
+#-----------------------------------------------------------------------------
 
-class Booking(BaseModel):
-    start: date
-    end: date
-    room: RoomEnum = RoomEnum.double
+ALL = (
+    'Enum',
+)
 
-
-api = NinjaAPI()
-
-
-@api.post("/book")
-def create_booking(request, booking: Booking):
-    return booking
-
-
-@api.get("/search")
-def booking_search(request, room: RoomEnum):
-    return {"room": room}
-
-
-@api.get("/optional")
-def enum_optional(
-    request, room: Optional[RoomEnum] = Query(None, description="description")
-):
-    return {"room": room}
+#-----------------------------------------------------------------------------
+# General API
+#-----------------------------------------------------------------------------
 
 
-@api.get("/optional2")
-def enum_optional2(request, extra: Optional[ExtraEnum] = None):
-    return {"extra": extra}
+class Test_Enum:
+    def test_init(self) -> None:
+        with pytest.raises(TypeError):
+            bcpe.Enum()
 
+        with pytest.raises(ValueError):
+            bcpe.Enum("red", "green", 1)
 
-@api.get("/list")
-def enum_list(request, rooms: List[RoomEnum] = Query(None, description="description")):
-    return {"rooms": rooms}
+        with pytest.raises(ValueError):
+            bcpe.Enum("red", "green", "red")
 
+    def test_from_values_valid(self) -> None:
+        prop = bcpe.Enum("red", "green", "blue")
 
-class QueryOnlyEnum(str, Enum):
-    one = "one"
-    two = "two"
+        assert prop.is_valid("red")
+        assert prop.is_valid("green")
+        assert prop.is_valid("blue")
 
+    def test_from_values_invalid(self) -> None:
+        prop = bcpe.Enum("red", "green", "blue")
 
-@api.get("/new-list")
-def new_enum_list(
-    request, q: List[QueryOnlyEnum] = Query(None, description="description")
-):
-    return {"q": q}
+        assert not prop.is_valid(None)
+        assert not prop.is_valid(False)
+        assert not prop.is_valid(True)
+        assert not prop.is_valid(0)
+        assert not prop.is_valid(1)
+        assert not prop.is_valid(0.0)
+        assert not prop.is_valid(1.0)
+        assert not prop.is_valid(1.0+1.0j)
+        assert not prop.is_valid("")
+        assert not prop.is_valid(())
+        assert not prop.is_valid([])
+        assert not prop.is_valid({})
+        assert not prop.is_valid(_TestHasProps())
+        assert not prop.is_valid(_TestModel())
 
+        assert not prop.is_valid("RED")
+        assert not prop.is_valid("GREEN")
+        assert not prop.is_valid("BLUE")
 
-client = TestClient(api)
+        assert not prop.is_valid(" red")
+        assert not prop.is_valid(" green")
+        assert not prop.is_valid(" blue")
 
+    def test_from_enum_valid(self) -> None:
+        prop = bcpe.Enum(LineJoin)
 
-def test_enums():
-    response = client.post(
-        "/book", json={"start": "2020-01-01", "end": "2020-01-02", "room": "double"}
-    )
-    assert response.status_code == 200, response.content
-    assert response.json() == {
-        "start": "2020-01-01",
-        "end": "2020-01-02",
-        "room": "double",
-    }
+        assert prop.is_valid("miter")
+        assert prop.is_valid("round")
+        assert prop.is_valid("bevel")
 
-    response = client.post(
-        "/book", json={"start": "2020-01-01", "end": "2020-01-02", "room": "triple"}
-    )
-    assert response.status_code == 422
+    def test_from_enum_invalid(self) -> None:
+        prop = bcpe.Enum(LineJoin)
 
-    response = client.get("/search?room=twin")
-    assert response.status_code == 200
-    assert response.json() == {"room": "twin"}
+        assert not prop.is_valid(None)
+        assert not prop.is_valid(False)
+        assert not prop.is_valid(True)
+        assert not prop.is_valid(0)
+        assert not prop.is_valid(1)
+        assert not prop.is_valid(0.0)
+        assert not prop.is_valid(1.0)
+        assert not prop.is_valid(1.0+1.0j)
+        assert not prop.is_valid("")
+        assert not prop.is_valid(())
+        assert not prop.is_valid([])
+        assert not prop.is_valid({})
+        assert not prop.is_valid(_TestHasProps())
+        assert not prop.is_valid(_TestModel())
 
-    response = client.get("/search?room=other")
-    assert response.status_code == 422
+        assert not prop.is_valid("MITER")
+        assert not prop.is_valid("ROUND")
+        assert not prop.is_valid("BEVEL")
 
-    response = client.get("/optional?room=twin")
-    assert response.status_code == 200
+        assert not prop.is_valid(" miter")
+        assert not prop.is_valid(" round")
+        assert not prop.is_valid(" bevel")
 
-    response = client.get("/optional")
-    assert response.status_code == 200
-    assert response.json() == {"room": None}
+    def test_case_insensitive_enum_valid(self) -> None:
+        prop = bcpe.Enum(NamedColor)
 
-    response = client.get("/optional2?extra=a")
-    assert response.status_code == 200
-    assert response.json() == {"extra": "a"}
+        assert prop.is_valid("red")
+        assert prop.is_valid("Red")
+        assert prop.is_valid("RED")
 
-    response = client.get("/optional2")
-    assert response.json() == {"extra": None}
+    def test_has_ref(self) -> None:
+        prop = bcpe.Enum("foo")
+        assert not prop.has_ref
 
-    response = client.get("/list?rooms=twin&rooms=single")
-    assert response.status_code == 200
-    assert response.json() == {"rooms": ["twin", "single"]}
+    def test_str(self) -> None:
+        prop = bcpe.Enum("foo")
+        assert str(prop).startswith("Enum(")
 
-    response = client.get("/new-list?q=one&q=one")
-    assert response.status_code == 200
-    assert response.json() == {"q": ["one", "one"]}
+#-----------------------------------------------------------------------------
+# Dev API
+#-----------------------------------------------------------------------------
 
+#-----------------------------------------------------------------------------
+# Private API
+#-----------------------------------------------------------------------------
 
-def test_schema():
-    schema = api.get_openapi_schema()
+#-----------------------------------------------------------------------------
+# Code
+#-----------------------------------------------------------------------------
 
-    booking_schema = schema["components"]["schemas"]["Booking"]
-    room_prop = booking_schema["properties"]["room"]
-
-    if "allOf" in room_prop:
-        # pydantic 1.7+ change:
-        assert room_prop["allOf"] == [{"$ref": "#/components/schemas/RoomEnum"}]
-    else:
-        assert room_prop == {"$ref": "#/components/schemas/RoomEnum"}
-
-    assert schema["components"]["schemas"]["RoomEnum"] == {
-        "enum": ["double", "twin", "single"],
-        "title": "RoomEnum",
-        "type": "string",
-    }
-
-    book_operation = schema["paths"]["/api/book"]["post"]
-    assert book_operation["requestBody"]["content"]["application/json"]["schema"] == {
-        "$ref": "#/components/schemas/Booking"
-    }
-
-    search_operation = schema["paths"]["/api/search"]["get"]
-    room_param = search_operation["parameters"][0]
-    assert room_param == {
-        "in": "query",
-        "name": "room",
-        "required": True,
-        "schema": {
-            "title": "RoomEnum",
-            "enum": ["double", "twin", "single"],
-            "type": "string",
-        },
-    }
-
-    optional_operation = schema["paths"]["/api/optional"]["get"]
-    room_param = optional_operation["parameters"][0]
-    assert room_param == {
-        "in": "query",
-        "name": "room",
-        "schema": {
-            "anyOf": [{"$ref": "#/components/schemas/RoomEnum"}, {"type": "null"}],
-            "description": "description",
-        },
-        "required": False,
-        "description": "description",
-    }
-
-    assert schema["paths"]["/api/new-list"]["get"]["parameters"][0] == {
-        "description": "description",
-        "in": "query",
-        "name": "q",
-        "required": False,
-        "schema": {
-            "description": "description",
-            "title": "Q",
-            "items": {
-                "enum": ["one", "two"],
-                "title": "QueryOnlyEnum",
-                "type": "string",
-            },
-            "type": "array",
-        },
-    }
-
-
-def test_optional_get_schema():
-    "This tests that enum that is only used in GET operation puts a that enum into schema.components"
-    schema = api.get_openapi_schema()
-
-    op = schema["paths"]["/api/optional2"]["get"]
-    print(op)
-    assert op["parameters"][0]["schema"]["anyOf"] == [
-        {"$ref": "#/components/schemas/ExtraEnum"},
-        {"type": "null"},
-    ]
-
-    components = schema["components"]["schemas"]
-    print(components)
-    assert "ExtraEnum" in components
+Test___all__ = verify_all(bcpe, ALL)

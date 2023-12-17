@@ -1,267 +1,422 @@
-import os
+import argparse
+import math
+import pickle
+import random
+from dataclasses import dataclass
+from itertools import chain
+from pathlib import Path
+from typing import Dict, List
+
+import common
+import pandas as pd
 import torch
-import pytorch_lightning as pl
-from omegaconf import OmegaConf
-from torch.nn import functional as F
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
-from copy import deepcopy
-from einops import rearrange
-from glob import glob
-from natsort import natsorted
-
-from ldm.modules.diffusionmodules.openaimodel import EncoderUNetModel, UNetModel
-from ldm.util import log_txt_as_img, default, ismap, instantiate_from_config
-
-__models__ = {
-    'class_label': EncoderUNetModel,
-    'segmentation': UNetModel
-}
+import torch.nn as nn
+import torch.nn.functional as F
+import torchtext
+from torchtext.functional import to_tensor
+from tqdm import tqdm
 
 
-def disabled_train(self, mode=True):
-    """Overwrite model.train with this function to make sure train/eval mode
-    does not change anymore."""
-    return self
+XLMR_BASE = torchtext.models.XLMR_BASE_ENCODER
+# This should not be here but it works for now
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+HAS_IMBLEARN = False
+try:
+    import imblearn
+
+    HAS_IMBLEARN = True
+except ImportError:
+    HAS_IMBLEARN = False
+
+# 94% of all files are captured at len 5, good hyperparameter to play around with.
+MAX_LEN_FILE = 6
+
+UNKNOWN_TOKEN = "<Unknown>"
+
+# Utilities for working with a truncated file graph
 
 
-class NoisyLatentImageClassifier(pl.LightningModule):
+def truncate_file(file: Path, max_len: int = 5):
+    return ("/").join(file.parts[:max_len])
 
-    def __init__(self,
-                 diffusion_path,
-                 num_classes,
-                 ckpt_path=None,
-                 pool='attention',
-                 label_key=None,
-                 diffusion_ckpt_path=None,
-                 scheduler_config=None,
-                 weight_decay=1.e-2,
-                 log_steps=10,
-                 monitor='val/loss',
-                 *args,
-                 **kwargs):
-        super().__init__(*args, **kwargs)
-        self.num_classes = num_classes
-        # get latest config of diffusion model
-        diffusion_config = natsorted(glob(os.path.join(diffusion_path, 'configs', '*-project.yaml')))[-1]
-        self.diffusion_config = OmegaConf.load(diffusion_config).model
-        self.diffusion_config.params.ckpt_path = diffusion_ckpt_path
-        self.load_diffusion()
 
-        self.monitor = monitor
-        self.numd = self.diffusion_model.first_stage_model.encoder.num_resolutions - 1
-        self.log_time_interval = self.diffusion_model.num_timesteps // log_steps
-        self.log_steps = log_steps
+def build_file_set(all_files: List[Path], max_len: int):
+    truncated_files = [truncate_file(file, max_len) for file in all_files]
+    return set(truncated_files)
 
-        self.label_key = label_key if not hasattr(self.diffusion_model, 'cond_stage_key') \
-            else self.diffusion_model.cond_stage_key
 
-        assert self.label_key is not None, 'label_key neither in diffusion model nor in model.params'
+@dataclass
+class CommitClassifierInputs:
+    title: List[str]
+    files: List[str]
+    author: List[str]
 
-        if self.label_key not in __models__:
-            raise NotImplementedError()
 
-        self.load_classifier(ckpt_path, pool)
+@dataclass
+class CategoryConfig:
+    categories: List[str]
+    input_dim: int = 768
+    inner_dim: int = 128
+    dropout: float = 0.1
+    activation = nn.ReLU
+    embedding_dim: int = 8
+    file_embedding_dim: int = 32
 
-        self.scheduler_config = scheduler_config
-        self.use_scheduler = self.scheduler_config is not None
-        self.weight_decay = weight_decay
 
-    def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
-        sd = torch.load(path, map_location="cpu")
-        if "state_dict" in list(sd.keys()):
-            sd = sd["state_dict"]
-        keys = list(sd.keys())
-        for k in keys:
-            for ik in ignore_keys:
-                if k.startswith(ik):
-                    print("Deleting key {} from state_dict.".format(k))
-                    del sd[k]
-        missing, unexpected = self.load_state_dict(sd, strict=False) if not only_model else self.model.load_state_dict(
-            sd, strict=False)
-        print(f"Restored from {path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
-        if len(missing) > 0:
-            print(f"Missing Keys: {missing}")
-        if len(unexpected) > 0:
-            print(f"Unexpected Keys: {unexpected}")
-
-    def load_diffusion(self):
-        model = instantiate_from_config(self.diffusion_config)
-        self.diffusion_model = model.eval()
-        self.diffusion_model.train = disabled_train
-        for param in self.diffusion_model.parameters():
-            param.requires_grad = False
-
-    def load_classifier(self, ckpt_path, pool):
-        model_config = deepcopy(self.diffusion_config.params.unet_config.params)
-        model_config.in_channels = self.diffusion_config.params.unet_config.params.out_channels
-        model_config.out_channels = self.num_classes
-        if self.label_key == 'class_label':
-            model_config.pool = pool
-
-        self.model = __models__[self.label_key](**model_config)
-        if ckpt_path is not None:
-            print('#####################################################################')
-            print(f'load from ckpt "{ckpt_path}"')
-            print('#####################################################################')
-            self.init_from_ckpt(ckpt_path)
-
-    @torch.no_grad()
-    def get_x_noisy(self, x, t, noise=None):
-        noise = default(noise, lambda: torch.randn_like(x))
-        continuous_sqrt_alpha_cumprod = None
-        if self.diffusion_model.use_continuous_noise:
-            continuous_sqrt_alpha_cumprod = self.diffusion_model.sample_continuous_noise_level(x.shape[0], t + 1)
-            # todo: make sure t+1 is correct here
-
-        return self.diffusion_model.q_sample(x_start=x, t=t, noise=noise,
-                                             continuous_sqrt_alpha_cumprod=continuous_sqrt_alpha_cumprod)
-
-    def forward(self, x_noisy, t, *args, **kwargs):
-        return self.model(x_noisy, t)
-
-    @torch.no_grad()
-    def get_input(self, batch, k):
-        x = batch[k]
-        if len(x.shape) == 3:
-            x = x[..., None]
-        x = rearrange(x, 'b h w c -> b c h w')
-        x = x.to(memory_format=torch.contiguous_format).float()
-        return x
-
-    @torch.no_grad()
-    def get_conditioning(self, batch, k=None):
-        if k is None:
-            k = self.label_key
-        assert k is not None, 'Needs to provide label key'
-
-        targets = batch[k].to(self.device)
-
-        if self.label_key == 'segmentation':
-            targets = rearrange(targets, 'b h w c -> b c h w')
-            for down in range(self.numd):
-                h, w = targets.shape[-2:]
-                targets = F.interpolate(targets, size=(h // 2, w // 2), mode='nearest')
-
-            # targets = rearrange(targets,'b c h w -> b h w c')
-
-        return targets
-
-    def compute_top_k(self, logits, labels, k, reduction="mean"):
-        _, top_ks = torch.topk(logits, k, dim=1)
-        if reduction == "mean":
-            return (top_ks == labels[:, None]).float().sum(dim=-1).mean().item()
-        elif reduction == "none":
-            return (top_ks == labels[:, None]).float().sum(dim=-1)
-
-    def on_train_epoch_start(self):
-        # save some memory
-        self.diffusion_model.model.to('cpu')
-
-    @torch.no_grad()
-    def write_logs(self, loss, logits, targets):
-        log_prefix = 'train' if self.training else 'val'
-        log = {}
-        log[f"{log_prefix}/loss"] = loss.mean()
-        log[f"{log_prefix}/acc@1"] = self.compute_top_k(
-            logits, targets, k=1, reduction="mean"
+class CommitClassifier(nn.Module):
+    def __init__(
+        self,
+        encoder_base: torchtext.models.XLMR_BASE_ENCODER,
+        author_map: Dict[str, int],
+        file_map: [str, int],
+        config: CategoryConfig,
+    ):
+        super().__init__()
+        self.encoder = encoder_base.get_model().requires_grad_(False)
+        self.transform = encoder_base.transform()
+        self.author_map = author_map
+        self.file_map = file_map
+        self.categories = config.categories
+        self.num_authors = len(author_map)
+        self.num_files = len(file_map)
+        self.embedding_table = nn.Embedding(self.num_authors, config.embedding_dim)
+        self.file_embedding_bag = nn.EmbeddingBag(
+            self.num_files, config.file_embedding_dim, mode="sum"
         )
-        log[f"{log_prefix}/acc@5"] = self.compute_top_k(
-            logits, targets, k=5, reduction="mean"
+        self.dense_title = nn.Linear(config.input_dim, config.inner_dim)
+        self.dense_files = nn.Linear(config.file_embedding_dim, config.inner_dim)
+        self.dense_author = nn.Linear(config.embedding_dim, config.inner_dim)
+        self.dropout = nn.Dropout(config.dropout)
+        self.out_proj_title = nn.Linear(config.inner_dim, len(self.categories))
+        self.out_proj_files = nn.Linear(config.inner_dim, len(self.categories))
+        self.out_proj_author = nn.Linear(config.inner_dim, len(self.categories))
+        self.activation_fn = config.activation()
+
+    def forward(self, input_batch: CommitClassifierInputs):
+        # Encode input title
+        title: List[str] = input_batch.title
+        model_input = to_tensor(self.transform(title), padding_value=1).to(device)
+        title_features = self.encoder(model_input)
+        title_embed = title_features[:, 0, :]
+        title_embed = self.dropout(title_embed)
+        title_embed = self.dense_title(title_embed)
+        title_embed = self.activation_fn(title_embed)
+        title_embed = self.dropout(title_embed)
+        title_embed = self.out_proj_title(title_embed)
+
+        files: list[str] = input_batch.files
+        batch_file_indexes = []
+        for file in files:
+            paths = [
+                truncate_file(Path(file_part), MAX_LEN_FILE)
+                for file_part in file.split(" ")
+            ]
+            batch_file_indexes.append(
+                [
+                    self.file_map.get(file, self.file_map[UNKNOWN_TOKEN])
+                    for file in paths
+                ]
+            )
+
+        flat_indexes = torch.tensor(
+            list(chain.from_iterable(batch_file_indexes)),
+            dtype=torch.long,
+            device=device,
+        )
+        offsets = [0]
+        offsets.extend(len(files) for files in batch_file_indexes[:-1])
+        offsets = torch.tensor(offsets, dtype=torch.long, device=device)
+        offsets = offsets.cumsum(dim=0)
+
+        files_embed = self.file_embedding_bag(flat_indexes, offsets)
+        files_embed = self.dense_files(files_embed)
+        files_embed = self.activation_fn(files_embed)
+        files_embed = self.dropout(files_embed)
+        files_embed = self.out_proj_files(files_embed)
+
+        # Add author embedding
+        authors: List[str] = input_batch.author
+        author_ids = [
+            self.author_map.get(author, self.author_map[UNKNOWN_TOKEN])
+            for author in authors
+        ]
+        author_ids = torch.tensor(author_ids).to(device)
+        author_embed = self.embedding_table(author_ids)
+        author_embed = self.dense_author(author_embed)
+        author_embed = self.activation_fn(author_embed)
+        author_embed = self.dropout(author_embed)
+        author_embed = self.out_proj_author(author_embed)
+
+        return title_embed + files_embed + author_embed
+
+    def convert_index_to_category_name(self, most_likely_index):
+        if isinstance(most_likely_index, int):
+            return self.categories[most_likely_index]
+        elif isinstance(most_likely_index, torch.Tensor):
+            return [self.categories[i] for i in most_likely_index]
+
+    def get_most_likely_category_name(self, inpt):
+        # Input will be a dict with title and author keys
+        logits = self.forward(inpt)
+        most_likely_index = torch.argmax(logits, dim=1)
+        return self.convert_index_to_category_name(most_likely_index)
+
+
+def get_train_val_data(data_folder: Path, regen_data: bool, train_percentage=0.95):
+    if (
+        not regen_data
+        and Path(data_folder / "train_df.csv").exists()
+        and Path(data_folder / "val_df.csv").exists()
+    ):
+        train_data = pd.read_csv(data_folder / "train_df.csv")
+        val_data = pd.read_csv(data_folder / "val_df.csv")
+        return train_data, val_data
+    else:
+        print("Train, Val, Test Split not found generating from scratch.")
+        commit_list_df = pd.read_csv(data_folder / "commitlist.csv")
+        test_df = commit_list_df[commit_list_df["category"] == "Uncategorized"]
+        all_train_df = commit_list_df[commit_list_df["category"] != "Uncategorized"]
+        # We are going to drop skip from training set since it is so imbalanced
+        print(
+            "We are removing skip categories, YOU MIGHT WANT TO CHANGE THIS, BUT THIS IS A MORE HELPFUL CLASSIFIER FOR LABELING."
+        )
+        all_train_df = all_train_df[all_train_df["category"] != "skip"]
+        all_train_df = all_train_df.sample(frac=1).reset_index(drop=True)
+        split_index = math.floor(train_percentage * len(all_train_df))
+        train_df = all_train_df[:split_index]
+        val_df = all_train_df[split_index:]
+        print("Train data size: ", len(train_df))
+        print("Val data size: ", len(val_df))
+
+        test_df.to_csv(data_folder / "test_df.csv", index=False)
+        train_df.to_csv(data_folder / "train_df.csv", index=False)
+        val_df.to_csv(data_folder / "val_df.csv", index=False)
+        return train_df, val_df
+
+
+def get_author_map(data_folder: Path, regen_data, assert_stored=False):
+    if not regen_data and Path(data_folder / "author_map.pkl").exists():
+        with open(data_folder / "author_map.pkl", "rb") as f:
+            return pickle.load(f)
+    else:
+        if assert_stored:
+            raise FileNotFoundError(
+                "Author map not found, you are loading for inference you need to have an author map!"
+            )
+        print("Regenerating Author Map")
+        all_data = pd.read_csv(data_folder / "commitlist.csv")
+        authors = all_data.author.unique().tolist()
+        authors.append(UNKNOWN_TOKEN)
+        author_map = {author: i for i, author in enumerate(authors)}
+        with open(data_folder / "author_map.pkl", "wb") as f:
+            pickle.dump(author_map, f)
+        return author_map
+
+
+def get_file_map(data_folder: Path, regen_data, assert_stored=False):
+    if not regen_data and Path(data_folder / "file_map.pkl").exists():
+        with open(data_folder / "file_map.pkl", "rb") as f:
+            return pickle.load(f)
+    else:
+        if assert_stored:
+            raise FileNotFoundError(
+                "File map not found, you are loading for inference you need to have a file map!"
+            )
+        print("Regenerating File Map")
+        all_data = pd.read_csv(data_folder / "commitlist.csv")
+        # Lets explore files
+        files = all_data.files_changed.to_list()
+
+        all_files = []
+        for file in files:
+            paths = [Path(file_part) for file_part in file.split(" ")]
+            all_files.extend(paths)
+        all_files.append(Path(UNKNOWN_TOKEN))
+        file_set = build_file_set(all_files, MAX_LEN_FILE)
+        file_map = {file: i for i, file in enumerate(file_set)}
+        with open(data_folder / "file_map.pkl", "wb") as f:
+            pickle.dump(file_map, f)
+        return file_map
+
+
+#  Generate a dataset for training
+
+
+def get_title_files_author_categories_zip_list(dataframe: pd.DataFrame):
+    title = dataframe.title.to_list()
+    files_str = dataframe.files_changed.to_list()
+    author = dataframe.author.fillna(UNKNOWN_TOKEN).to_list()
+    category = dataframe.category.to_list()
+    return list(zip(title, files_str, author, category))
+
+
+def generate_batch(batch):
+    title, files, author, category = zip(*batch)
+    title = list(title)
+    files = list(files)
+    author = list(author)
+    category = list(category)
+    targets = torch.tensor([common.categories.index(cat) for cat in category]).to(
+        device
+    )
+    return CommitClassifierInputs(title, files, author), targets
+
+
+def train_step(batch, model, optimizer, loss):
+    inpt, targets = batch
+    optimizer.zero_grad()
+    output = model(inpt)
+    l = loss(output, targets)
+    l.backward()
+    optimizer.step()
+    return l
+
+
+@torch.no_grad()
+def eval_step(batch, model, loss):
+    inpt, targets = batch
+    output = model(inpt)
+    l = loss(output, targets)
+    return l
+
+
+def balance_dataset(dataset: List):
+    if not HAS_IMBLEARN:
+        return dataset
+    title, files, author, category = zip(*dataset)
+    category = [common.categories.index(cat) for cat in category]
+    inpt_data = list(zip(title, files, author))
+    from imblearn.over_sampling import RandomOverSampler
+
+    # from imblearn.under_sampling import RandomUnderSampler
+    rus = RandomOverSampler(random_state=42)
+    X, y = rus.fit_resample(inpt_data, category)
+    merged = list(zip(X, y))
+    merged = random.sample(merged, k=2 * len(dataset))
+    X, y = zip(*merged)
+    rebuilt_dataset = []
+    for i in range(len(X)):
+        rebuilt_dataset.append((*X[i], common.categories[y[i]]))
+    return rebuilt_dataset
+
+
+def gen_class_weights(dataset: List):
+    from collections import Counter
+
+    epsilon = 1e-1
+    title, files, author, category = zip(*dataset)
+    category = [common.categories.index(cat) for cat in category]
+    counter = Counter(category)
+    percentile_33 = len(category) // 3
+    most_common = counter.most_common(percentile_33)
+    least_common = counter.most_common()[-percentile_33:]
+    smoothed_top = sum(i[1] + epsilon for i in most_common) / len(most_common)
+    smoothed_bottom = sum(i[1] + epsilon for i in least_common) / len(least_common) // 3
+    class_weights = torch.tensor(
+        [
+            1.0 / (min(max(counter[i], smoothed_bottom), smoothed_top) + epsilon)
+            for i in range(len(common.categories))
+        ],
+        device=device,
+    )
+    return class_weights
+
+
+def train(save_path: Path, data_folder: Path, regen_data: bool, resample: bool):
+    train_data, val_data = get_train_val_data(data_folder, regen_data)
+    train_zip_list = get_title_files_author_categories_zip_list(train_data)
+    val_zip_list = get_title_files_author_categories_zip_list(val_data)
+
+    classifier_config = CategoryConfig(common.categories)
+    author_map = get_author_map(data_folder, regen_data)
+    file_map = get_file_map(data_folder, regen_data)
+    commit_classifier = CommitClassifier(
+        XLMR_BASE, author_map, file_map, classifier_config
+    ).to(device)
+
+    # Lets train this bag of bits
+    class_weights = gen_class_weights(train_zip_list)
+    loss = torch.nn.CrossEntropyLoss(weight=class_weights)
+    optimizer = torch.optim.Adam(commit_classifier.parameters(), lr=3e-3)
+
+    num_epochs = 25
+    batch_size = 256
+
+    if resample:
+        # Lets not use this
+        train_zip_list = balance_dataset(train_zip_list)
+    data_size = len(train_zip_list)
+
+    print(f"Training on {data_size} examples.")
+    # We can fit all of val into one batch
+    val_batch = generate_batch(val_zip_list)
+
+    for i in tqdm(range(num_epochs), desc="Epochs"):
+        start = 0
+        random.shuffle(train_zip_list)
+        while start < data_size:
+            end = start + batch_size
+            # make the last batch bigger if needed
+            if end > data_size:
+                end = data_size
+            train_batch = train_zip_list[start:end]
+            train_batch = generate_batch(train_batch)
+            l = train_step(train_batch, commit_classifier, optimizer, loss)
+            start = end
+
+        val_l = eval_step(val_batch, commit_classifier, loss)
+        tqdm.write(
+            f"Finished epoch {i} with a train loss of: {l.item()} and a val_loss of: {val_l.item()}"
         )
 
-        self.log_dict(log, prog_bar=False, logger=True, on_step=self.training, on_epoch=True)
-        self.log('loss', log[f"{log_prefix}/loss"], prog_bar=True, logger=False)
-        self.log('global_step', self.global_step, logger=False, on_epoch=False, prog_bar=True)
-        lr = self.optimizers().param_groups[0]['lr']
-        self.log('lr_abs', lr, on_step=True, logger=True, on_epoch=False, prog_bar=True)
+    with torch.no_grad():
+        commit_classifier.eval()
+        val_inpts, val_targets = val_batch
+        val_output = commit_classifier(val_inpts)
+        val_preds = torch.argmax(val_output, dim=1)
+        val_acc = torch.sum(val_preds == val_targets).item() / len(val_preds)
+        print(f"Final Validation accuracy is {val_acc}")
 
-    def shared_step(self, batch, t=None):
-        x, *_ = self.diffusion_model.get_input(batch, k=self.diffusion_model.first_stage_key)
-        targets = self.get_conditioning(batch)
-        if targets.dim() == 4:
-            targets = targets.argmax(dim=1)
-        if t is None:
-            t = torch.randint(0, self.diffusion_model.num_timesteps, (x.shape[0],), device=self.device).long()
-        else:
-            t = torch.full(size=(x.shape[0],), fill_value=t, device=self.device).long()
-        x_noisy = self.get_x_noisy(x, t)
-        logits = self(x_noisy, t)
+    print(f"Jobs done! Saving to {save_path}")
+    torch.save(commit_classifier.state_dict(), save_path)
 
-        loss = F.cross_entropy(logits, targets, reduction='none')
 
-        self.write_logs(loss.detach(), logits.detach(), targets.detach())
+def main():
+    parser = argparse.ArgumentParser(
+        description="Tool to create a classifier for helping to categorize commits"
+    )
 
-        loss = loss.mean()
-        return loss, logits, x_noisy, targets
+    parser.add_argument("--train", action="store_true", help="Train a new classifier")
+    parser.add_argument("--commit_data_folder", default="results/classifier/")
+    parser.add_argument(
+        "--save_path", default="results/classifier/commit_classifier.pt"
+    )
+    parser.add_argument(
+        "--regen_data",
+        action="store_true",
+        help="Regenerate the training data, helps if labeled more examples and want to re-train.",
+    )
+    parser.add_argument(
+        "--resample",
+        action="store_true",
+        help="Resample the training data to be balanced. (Only works if imblearn is installed.)",
+    )
+    args = parser.parse_args()
 
-    def training_step(self, batch, batch_idx):
-        loss, *_ = self.shared_step(batch)
-        return loss
+    if args.train:
+        train(
+            Path(args.save_path),
+            Path(args.commit_data_folder),
+            args.regen_data,
+            args.resample,
+        )
+        return
 
-    def reset_noise_accs(self):
-        self.noisy_acc = {t: {'acc@1': [], 'acc@5': []} for t in
-                          range(0, self.diffusion_model.num_timesteps, self.diffusion_model.log_every_t)}
+    print(
+        "Currently this file only trains a new classifier please pass in --train to train a new classifier"
+    )
 
-    def on_validation_start(self):
-        self.reset_noise_accs()
 
-    @torch.no_grad()
-    def validation_step(self, batch, batch_idx):
-        loss, *_ = self.shared_step(batch)
-
-        for t in self.noisy_acc:
-            _, logits, _, targets = self.shared_step(batch, t)
-            self.noisy_acc[t]['acc@1'].append(self.compute_top_k(logits, targets, k=1, reduction='mean'))
-            self.noisy_acc[t]['acc@5'].append(self.compute_top_k(logits, targets, k=5, reduction='mean'))
-
-        return loss
-
-    def configure_optimizers(self):
-        optimizer = AdamW(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
-
-        if self.use_scheduler:
-            scheduler = instantiate_from_config(self.scheduler_config)
-
-            print("Setting up LambdaLR scheduler...")
-            scheduler = [
-                {
-                    'scheduler': LambdaLR(optimizer, lr_lambda=scheduler.schedule),
-                    'interval': 'step',
-                    'frequency': 1
-                }]
-            return [optimizer], scheduler
-
-        return optimizer
-
-    @torch.no_grad()
-    def log_images(self, batch, N=8, *args, **kwargs):
-        log = dict()
-        x = self.get_input(batch, self.diffusion_model.first_stage_key)
-        log['inputs'] = x
-
-        y = self.get_conditioning(batch)
-
-        if self.label_key == 'class_label':
-            y = log_txt_as_img((x.shape[2], x.shape[3]), batch["human_label"])
-            log['labels'] = y
-
-        if ismap(y):
-            log['labels'] = self.diffusion_model.to_rgb(y)
-
-            for step in range(self.log_steps):
-                current_time = step * self.log_time_interval
-
-                _, logits, x_noisy, _ = self.shared_step(batch, t=current_time)
-
-                log[f'inputs@t{current_time}'] = x_noisy
-
-                pred = F.one_hot(logits.argmax(dim=1), num_classes=self.num_classes)
-                pred = rearrange(pred, 'b h w c -> b c h w')
-
-                log[f'pred@t{current_time}'] = self.diffusion_model.to_rgb(pred)
-
-        for key in log:
-            log[key] = log[key][:N]
-
-        return log
+if __name__ == "__main__":
+    main()

@@ -1,176 +1,211 @@
-from __future__ import absolute_import
+# Copyright 2004-2005 Elemental Security, Inc. All Rights Reserved.
+# Licensed to PSF under a Contributor Agreement.
 
-import collections
-import logging
+# Modifications:
+# Copyright David Halter and Contributors
+# Modifications are dual-licensed: MIT and PSF.
+# 99% of the code is different from pgen2, now.
 
-import kafka.errors as Errors
-from kafka.protocol.commit import GroupCoordinatorResponse
-from kafka.protocol.frame import KafkaBytes
-from kafka.protocol.types import Int32, TaggedFields
-from kafka.version import __version__
+"""
+The ``Parser`` tries to convert the available Python code in an easy to read
+format, something like an abstract syntax tree. The classes who represent this
+tree, are sitting in the :mod:`parso.tree` module.
 
-log = logging.getLogger(__name__)
+The Python module ``tokenize`` is a very important part in the ``Parser``,
+because it splits the code into different words (tokens).  Sometimes it looks a
+bit messy. Sorry for that! You might ask now: "Why didn't you use the ``ast``
+module for this? Well, ``ast`` does a very good job understanding proper Python
+code, but fails to work as soon as there's a single line of broken code.
+
+There's one important optimization that needs to be known: Statements are not
+being parsed completely. ``Statement`` is just a representation of the tokens
+within the statement. This lowers memory usage and cpu time and reduces the
+complexity of the ``Parser`` (there's another parser sitting inside
+``Statement``, which produces ``Array`` and ``Call``).
+"""
+from parso import tree
+from parso.pgen2.generator import ReservedString
 
 
-class KafkaProtocol(object):
-    """Manage the kafka network protocol
-
-    Use an instance of KafkaProtocol to manage bytes send/recv'd
-    from a network socket to a broker.
-
-    Arguments:
-        client_id (str): identifier string to be included in each request
-        api_version (tuple): Optional tuple to specify api_version to use.
-            Currently only used to check for 0.8.2 protocol quirks, but
-            may be used for more in the future.
+class ParserSyntaxError(Exception):
     """
-    def __init__(self, client_id=None, api_version=None):
-        if client_id is None:
-            client_id = self._gen_client_id()
-        self._client_id = client_id
-        self._api_version = api_version
-        self._correlation_id = 0
-        self._header = KafkaBytes(4)
-        self._rbuffer = None
-        self._receiving = False
-        self.in_flight_requests = collections.deque()
-        self.bytes_to_send = []
+    Contains error information about the parser tree.
 
-    def _next_correlation_id(self):
-        self._correlation_id = (self._correlation_id + 1) % 2**31
-        return self._correlation_id
+    May be raised as an exception.
+    """
+    def __init__(self, message, error_leaf):
+        self.message = message
+        self.error_leaf = error_leaf
 
-    def _gen_client_id(self):
-        return 'kafka-python' + __version__
 
-    def send_request(self, request, correlation_id=None):
-        """Encode and queue a kafka api request for sending.
+class InternalParseError(Exception):
+    """
+    Exception to signal the parser is stuck and error recovery didn't help.
+    Basically this shouldn't happen. It's a sign that something is really
+    wrong.
+    """
 
-        Arguments:
-            request (object): An un-encoded kafka request.
-            correlation_id (int, optional): Optionally specify an ID to
-                correlate requests with responses. If not provided, an ID will
-                be generated automatically.
+    def __init__(self, msg, type_, value, start_pos):
+        Exception.__init__(self, "%s: type=%r, value=%r, start_pos=%r" %
+                           (msg, type_.name, value, start_pos))
+        self.msg = msg
+        self.type = type
+        self.value = value
+        self.start_pos = start_pos
 
-        Returns:
-            correlation_id
-        """
-        log.debug('Sending request %s', request)
-        if correlation_id is None:
-            correlation_id = self._next_correlation_id()
 
-        header = request.build_request_header(correlation_id=correlation_id, client_id=self._client_id)
-        message = b''.join([header.encode(), request.encode()])
-        size = Int32.encode(len(message))
-        data = size + message
-        self.bytes_to_send.append(data)
-        if request.expect_response():
-            ifr = (correlation_id, request)
-            self.in_flight_requests.append(ifr)
-        return correlation_id
+class Stack(list):
+    def _allowed_transition_names_and_token_types(self):
+        def iterate():
+            # An API just for Jedi.
+            for stack_node in reversed(self):
+                for transition in stack_node.dfa.transitions:
+                    if isinstance(transition, ReservedString):
+                        yield transition.value
+                    else:
+                        yield transition  # A token type
 
-    def send_bytes(self):
-        """Retrieve all pending bytes to send on the network"""
-        data = b''.join(self.bytes_to_send)
-        self.bytes_to_send = []
-        return data
-
-    def receive_bytes(self, data):
-        """Process bytes received from the network.
-
-        Arguments:
-            data (bytes): any length bytes received from a network connection
-                to a kafka broker.
-
-        Returns:
-            responses (list of (correlation_id, response)): any/all completed
-                responses, decoded from bytes to python objects.
-
-        Raises:
-             KafkaProtocolError: if the bytes received could not be decoded.
-             CorrelationIdError: if the response does not match the request
-                 correlation id.
-        """
-        i = 0
-        n = len(data)
-        responses = []
-        while i < n:
-
-            # Not receiving is the state of reading the payload header
-            if not self._receiving:
-                bytes_to_read = min(4 - self._header.tell(), n - i)
-                self._header.write(data[i:i+bytes_to_read])
-                i += bytes_to_read
-
-                if self._header.tell() == 4:
-                    self._header.seek(0)
-                    nbytes = Int32.decode(self._header)
-                    # reset buffer and switch state to receiving payload bytes
-                    self._rbuffer = KafkaBytes(nbytes)
-                    self._receiving = True
-                elif self._header.tell() > 4:
-                    raise Errors.KafkaError('this should not happen - are you threading?')
-
-            if self._receiving:
-                total_bytes = len(self._rbuffer)
-                staged_bytes = self._rbuffer.tell()
-                bytes_to_read = min(total_bytes - staged_bytes, n - i)
-                self._rbuffer.write(data[i:i+bytes_to_read])
-                i += bytes_to_read
-
-                staged_bytes = self._rbuffer.tell()
-                if staged_bytes > total_bytes:
-                    raise Errors.KafkaError('Receive buffer has more bytes than expected?')
-
-                if staged_bytes != total_bytes:
+                if not stack_node.dfa.is_final:
                     break
 
-                self._receiving = False
-                self._rbuffer.seek(0)
-                resp = self._process_response(self._rbuffer)
-                responses.append(resp)
-                self._reset_buffer()
-        return responses
+        return list(iterate())
 
-    def _process_response(self, read_buffer):
-        if not self.in_flight_requests:
-            raise Errors.CorrelationIdError('No in-flight-request found for server response')
-        (correlation_id, request) = self.in_flight_requests.popleft()
-        response_header = request.parse_response_header(read_buffer)
-        recv_correlation_id = response_header.correlation_id
-        log.debug('Received correlation id: %d', recv_correlation_id)
-        # 0.8.2 quirk
-        if (recv_correlation_id == 0 and
-            correlation_id != 0 and
-            request.RESPONSE_TYPE is GroupCoordinatorResponse[0] and
-            (self._api_version == (0, 8, 2) or self._api_version is None)):
-            log.warning('Kafka 0.8.2 quirk -- GroupCoordinatorResponse'
-                        ' Correlation ID does not match request. This'
-                        ' should go away once at least one topic has been'
-                        ' initialized on the broker.')
 
-        elif correlation_id != recv_correlation_id:
-            # return or raise?
-            raise Errors.CorrelationIdError(
-                'Correlation IDs do not match: sent %d, recv %d'
-                % (correlation_id, recv_correlation_id))
+class StackNode(object):
+    def __init__(self, dfa):
+        self.dfa = dfa
+        self.nodes = []
 
-        # decode response
-        log.debug('Processing response %s', request.RESPONSE_TYPE.__name__)
+    @property
+    def nonterminal(self):
+        return self.dfa.from_rule
+
+    def __repr__(self):
+        return '%s(%s, %s)' % (self.__class__.__name__, self.dfa, self.nodes)
+
+
+def _token_to_transition(grammar, type_, value):
+    # Map from token to label
+    if type_.contains_syntax:
+        # Check for reserved words (keywords)
         try:
-            response = request.RESPONSE_TYPE.decode(read_buffer)
-        except ValueError:
-            read_buffer.seek(0)
-            buf = read_buffer.read()
-            log.error('Response %d [ResponseType: %s Request: %s]:'
-                      ' Unable to decode %d-byte buffer: %r',
-                      correlation_id, request.RESPONSE_TYPE,
-                      request, len(buf), buf)
-            raise Errors.KafkaProtocolError('Unable to decode response')
+            return grammar.reserved_syntax_strings[value]
+        except KeyError:
+            pass
 
-        return (correlation_id, response)
+    return type_
 
-    def _reset_buffer(self):
-        self._receiving = False
-        self._header.seek(0)
-        self._rbuffer = None
+
+class BaseParser(object):
+    """Parser engine.
+
+    A Parser instance contains state pertaining to the current token
+    sequence, and should not be used concurrently by different threads
+    to parse separate token sequences.
+
+    See python/tokenize.py for how to get input tokens by a string.
+
+    When a syntax error occurs, error_recovery() is called.
+    """
+
+    node_map = {}
+    default_node = tree.Node
+
+    leaf_map = {
+    }
+    default_leaf = tree.Leaf
+
+    def __init__(self, pgen_grammar, start_nonterminal='file_input', error_recovery=False):
+        self._pgen_grammar = pgen_grammar
+        self._start_nonterminal = start_nonterminal
+        self._error_recovery = error_recovery
+
+    def parse(self, tokens):
+        first_dfa = self._pgen_grammar.nonterminal_to_dfas[self._start_nonterminal][0]
+        self.stack = Stack([StackNode(first_dfa)])
+
+        for token in tokens:
+            self._add_token(token)
+
+        while True:
+            tos = self.stack[-1]
+            if not tos.dfa.is_final:
+                # We never broke out -- EOF is too soon -- Unfinished statement.
+                # However, the error recovery might have added the token again, if
+                # the stack is empty, we're fine.
+                raise InternalParseError(
+                    "incomplete input", token.type, token.string, token.start_pos
+                )
+
+            if len(self.stack) > 1:
+                self._pop()
+            else:
+                return self.convert_node(tos.nonterminal, tos.nodes)
+
+    def error_recovery(self, token):
+        if self._error_recovery:
+            raise NotImplementedError("Error Recovery is not implemented")
+        else:
+            type_, value, start_pos, prefix = token
+            error_leaf = tree.ErrorLeaf(type_, value, start_pos, prefix)
+            raise ParserSyntaxError('SyntaxError: invalid syntax', error_leaf)
+
+    def convert_node(self, nonterminal, children):
+        try:
+            node = self.node_map[nonterminal](children)
+        except KeyError:
+            node = self.default_node(nonterminal, children)
+        for c in children:
+            c.parent = node
+        return node
+
+    def convert_leaf(self, type_, value, prefix, start_pos):
+        try:
+            return self.leaf_map[type_](value, start_pos, prefix)
+        except KeyError:
+            return self.default_leaf(value, start_pos, prefix)
+
+    def _add_token(self, token):
+        """
+        This is the only core function for parsing. Here happens basically
+        everything. Everything is well prepared by the parser generator and we
+        only apply the necessary steps here.
+        """
+        grammar = self._pgen_grammar
+        stack = self.stack
+        type_, value, start_pos, prefix = token
+        transition = _token_to_transition(grammar, type_, value)
+
+        while True:
+            try:
+                plan = stack[-1].dfa.transitions[transition]
+                break
+            except KeyError:
+                if stack[-1].dfa.is_final:
+                    self._pop()
+                else:
+                    self.error_recovery(token)
+                    return
+            except IndexError:
+                raise InternalParseError("too much input", type_, value, start_pos)
+
+        stack[-1].dfa = plan.next_dfa
+
+        for push in plan.dfa_pushes:
+            stack.append(StackNode(push))
+
+        leaf = self.convert_leaf(type_, value, prefix, start_pos)
+        stack[-1].nodes.append(leaf)
+
+    def _pop(self):
+        tos = self.stack.pop()
+        # If there's exactly one child, return that child instead of
+        # creating a new node.  We still create expr_stmt and
+        # file_input though, because a lot of Jedi depends on its
+        # logic.
+        if len(tos.nodes) == 1:
+            new_node = tos.nodes[0]
+        else:
+            new_node = self.convert_node(tos.dfa.from_rule, tos.nodes)
+
+        self.stack[-1].nodes.append(new_node)

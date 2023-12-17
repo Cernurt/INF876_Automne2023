@@ -1,426 +1,192 @@
-#!/usr/bin/env python
+from __future__ import unicode_literals
 
-"""
-Copyright (c) 2014-2023 Maltrail developers (https://github.com/stamparm/maltrail/)
-See the file 'LICENSE' for copying permission
-"""
-from __future__ import print_function
-
-import codecs
-import csv
-import glob
-import inspect
+import json
+import traceback
+import hashlib
 import os
-import re
-import sqlite3
+import subprocess
 import sys
-import time
+from zipimport import zipimporter
 
-sys.dont_write_bytecode = True
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))  # to enable calling from current directory too
+from .compat import (
+    compat_open as open,
+    compat_realpath,
+)
+from .utils import encode_compat_str
 
-from core.addr import addr_to_int
-from core.addr import int_to_addr
-from core.addr import make_mask
-from core.common import bogon_ip
-from core.common import cdn_ip
-from core.common import check_whitelisted
-from core.common import load_trails
-from core.common import retrieve_content
-from core.compat import xrange
-from core.settings import config
-from core.settings import read_config
-from core.settings import read_whitelist
-from core.settings import BAD_TRAIL_PREFIXES
-from core.settings import FRESH_IPCAT_DELTA_DAYS
-from core.settings import LOW_PRIORITY_INFO_KEYWORDS
-from core.settings import HIGH_PRIORITY_INFO_KEYWORDS
-from core.settings import HIGH_PRIORITY_REFERENCES
-from core.settings import IPCAT_CSV_FILE
-from core.settings import IPCAT_SQLITE_FILE
-from core.settings import IPCAT_URL
-from core.settings import IS_WIN
-from core.settings import ROOT_DIR
-from core.settings import UNICODE_ENCODING
-from core.settings import USERS_DIR
-from core.trailsdict import TrailsDict
-from thirdparty import six
-from thirdparty.six.moves import urllib as _urllib
+from .version import __version__
 
-# patch for self-signed certificates (e.g. CUSTOM_TRAILS_URL)
-try:
-    import ssl
-    ssl._create_default_https_context = ssl._create_unverified_context
-except (ImportError, AttributeError):
-    pass
 
-def _chown(filepath):
-    if not IS_WIN and os.path.exists(filepath):
-        try:
-            os.chown(filepath, int(os.environ.get("SUDO_UID", -1)), int(os.environ.get("SUDO_GID", -1)))
-        except Exception as ex:
-            print("[!] chown problem with '%s' ('%s')" % (filepath, ex))
+def rsa_verify(message, signature, key):
+    from hashlib import sha256
+    assert isinstance(message, bytes)
+    byte_size = (len(bin(key[0])) - 2 + 8 - 1) // 8
+    signature = ('%x' % pow(int(signature, 16), key[1], key[0])).encode()
+    signature = (byte_size * 2 - len(signature)) * b'0' + signature
+    asn1 = b'3031300d060960864801650304020105000420'
+    asn1 += sha256(message).hexdigest().encode()
+    if byte_size < len(asn1) // 2 + 11:
+        return False
+    expected = b'0001' + (byte_size - len(asn1) // 2 - 3) * b'ff' + b'00' + asn1
+    return expected == signature
 
-def _fopen(filepath, mode="rb", opener=open):
-    retval = opener(filepath, mode)
-    if "w+" in mode:
-        _chown(filepath)
-    return retval
 
-def update_trails(force=False, offline=False):
-    """
-    Update trails from feeds
-    """
+def update_self(to_screen, verbose, opener):
+    """Update the program file with the latest version from the repository"""
 
-    success = False
-    trails = TrailsDict()
-    duplicates = {}
+    UPDATE_URL = 'https://yt-dl.org/update/'
+    VERSION_URL = UPDATE_URL + 'LATEST_VERSION'
+    JSON_URL = UPDATE_URL + 'versions.json'
+    UPDATES_RSA_KEY = (0x9d60ee4d8f805312fdb15a62f87b95bd66177b91df176765d13514a0f1754bcd2057295c5b6f1d35daa6742c3ffc9a82d3e118861c207995a8031e151d863c9927e304576bc80692bc8e094896fcf11b66f3e29e04e3a71e9a11558558acea1840aec37fc396fb6b65dc81a1c4144e03bd1c011de62e3f1357b327d08426fe93, 65537)
 
+    if not isinstance(globals().get('__loader__'), zipimporter) and not hasattr(sys, 'frozen'):
+        to_screen('It looks like you installed youtube-dl with a package manager, pip, setup.py or a tarball. Please use that to update.')
+        return
+
+    # Check if there is a new version
     try:
-        if not os.path.isdir(USERS_DIR):
-            os.makedirs(USERS_DIR, 0o755)
-    except Exception as ex:
-        sys.exit("[!] something went wrong during creation of directory '%s' ('%s')" % (USERS_DIR, ex))
+        newversion = opener.open(VERSION_URL).read().decode('utf-8').strip()
+    except Exception:
+        if verbose:
+            to_screen(encode_compat_str(traceback.format_exc()))
+        to_screen('ERROR: can\'t find the current version. Please try again later.')
+        return
+    if newversion == __version__:
+        to_screen('youtube-dl is up-to-date (' + __version__ + ')')
+        return
 
-    _chown(USERS_DIR)
-
-    if config.UPDATE_SERVER:
-        print("[i] retrieving trails from provided 'UPDATE_SERVER' server...")
-        content = retrieve_content(config.UPDATE_SERVER)
-        if not content or content.count(',') < 2:
-            print("[x] unable to retrieve data from '%s'" % config.UPDATE_SERVER)
-        else:
-            with _fopen(config.TRAILS_FILE, "w+b" if six.PY2 else "w+", open if six.PY2 else codecs.open) as f:
-                f.write(content)
-            trails = load_trails()
-
-    else:
-        trail_files = set()
-        for dirpath, dirnames, filenames in os.walk(os.path.abspath(os.path.join(ROOT_DIR, "trails"))):
-            for filename in filenames:
-                trail_files.add(os.path.abspath(os.path.join(dirpath, filename)))
-
-        if config.CUSTOM_TRAILS_DIR:
-            for dirpath, dirnames, filenames in os.walk(os.path.abspath(os.path.join(ROOT_DIR, os.path.expanduser(config.CUSTOM_TRAILS_DIR)))):
-                for filename in filenames:
-                    trail_files.add(os.path.abspath(os.path.join(dirpath, filename)))
-
-        if not trails and (force or not os.path.isfile(config.TRAILS_FILE) or (time.time() - os.stat(config.TRAILS_FILE).st_mtime) >= config.UPDATE_PERIOD or os.stat(config.TRAILS_FILE).st_size == 0 or any(os.stat(_).st_mtime > os.stat(config.TRAILS_FILE).st_mtime for _ in trail_files)):
-            if not config.offline:
-                print("[i] updating trails (this might take a while)...")
-            else:
-                print("[i] checking trails...")
-
-            if not offline and (force or config.USE_FEED_UPDATES):
-                _ = os.path.abspath(os.path.join(ROOT_DIR, "trails", "feeds"))
-                if _ not in sys.path:
-                    sys.path.append(_)
-
-                filenames = sorted(glob.glob(os.path.join(_, "*.py")))
-            else:
-                filenames = []
-
-            _ = os.path.abspath(os.path.join(ROOT_DIR, "trails"))
-            if _ not in sys.path:
-                sys.path.append(_)
-
-            filenames += [os.path.join(_, "custom")]
-            filenames += [os.path.join(_, "static")]    # Note: higher priority than previous one because of dummy user trails (FE)
-
-            filenames = [_ for _ in filenames if "__init__.py" not in _]
-
-            if config.DISABLED_FEEDS:
-                filenames = [filename for filename in filenames if os.path.splitext(os.path.split(filename)[-1])[0] not in re.split(r"[^\w]+", config.DISABLED_FEEDS)]
-
-            for i in xrange(len(filenames)):
-                filename = filenames[i]
-
-                try:
-                    module = __import__(os.path.basename(filename).split(".py")[0])
-                except (ImportError, SyntaxError) as ex:
-                    print("[x] something went wrong during import of feed file '%s' ('%s')" % (filename, ex))
-                    continue
-
-                for name, function in inspect.getmembers(module, inspect.isfunction):
-                    if name == "fetch":
-                        url = module.__url__  # Note: to prevent "SyntaxError: can not delete variable 'module' referenced in nested scope"
-
-                        print(" [o] '%s'%s" % (url, " " * 20 if len(url) < 20 else ""))
-                        sys.stdout.write("[?] progress: %d/%d (%d%%)\r" % (i, len(filenames), i * 100 // len(filenames)))
-                        sys.stdout.flush()
-
-                        if config.DISABLED_TRAILS_INFO_REGEX and re.search(config.DISABLED_TRAILS_INFO_REGEX, getattr(module, "__info__", "")):
-                            continue
-
-                        try:
-                            results = function()
-                            for item in results.items():
-                                if item[0].startswith("www.") and '/' not in item[0]:
-                                    item = [item[0][len("www."):], item[1]]
-                                if item[0] in trails:
-                                    if item[0] not in duplicates:
-                                        duplicates[item[0]] = set((trails[item[0]][1],))
-                                    duplicates[item[0]].add(item[1][1])
-                                if not (item[0] in trails and (any(_ in item[1][0] for _ in LOW_PRIORITY_INFO_KEYWORDS) or trails[item[0]][1] in HIGH_PRIORITY_REFERENCES)) or (item[1][1] in HIGH_PRIORITY_REFERENCES and "history" not in item[1][0]) or any(_ in item[1][0] for _ in HIGH_PRIORITY_INFO_KEYWORDS):
-                                    trails[item[0]] = item[1]
-                            if not results and not any(_ in url for _ in ("abuse.ch", "cobaltstrike")):
-                                print("[x] something went wrong during remote data retrieval ('%s')" % url)
-                        except Exception as ex:
-                            print("[x] something went wrong during processing of feed file '%s' ('%s')" % (filename, ex))
-
-                try:
-                    sys.modules.pop(module.__name__)
-                    del module
-                except Exception:
-                    pass
-
-            # custom trails from remote location
-            if config.CUSTOM_TRAILS_URL:
-                print(" [o] '(remote custom)'%s" % (" " * 20))
-                for url in re.split(r"[;,]", config.CUSTOM_TRAILS_URL):
-                    url = url.strip()
-                    if not url:
-                        continue
-
-                    url = ("http://%s" % url) if "//" not in url else url
-                    content = retrieve_content(url)
-
-                    if not content:
-                        print("[x] unable to retrieve data (or empty response) from '%s'" % url)
-                    else:
-                        __info__ = "blacklisted"
-                        __reference__ = "(remote custom)"  # urlparse.urlsplit(url).netloc
-                        for line in content.split('\n'):
-                            line = line.strip()
-                            if not line or line.startswith('#'):
-                                continue
-                            line = re.sub(r"\s*#.*", "", line)
-                            if '://' in line:
-                                line = re.search(r"://(.*)", line).group(1)
-                            line = line.rstrip('/')
-
-                            if line in trails and any(_ in trails[line][1] for _ in ("custom", "static")):
-                                continue
-
-                            if '/' in line:
-                                trails[line] = (__info__, __reference__)
-                                line = line.split('/')[0]
-                            elif re.search(r"\A\d+\.\d+\.\d+\.\d+\Z", line):
-                                trails[line] = (__info__, __reference__)
-                            else:
-                                trails[line.strip('.')] = (__info__, __reference__)
-
-                        for match in re.finditer(r"(\d+\.\d+\.\d+\.\d+)/(\d+)", content):
-                            prefix, mask = match.groups()
-                            mask = int(mask)
-                            if mask > 32:
-                                continue
-                            start_int = addr_to_int(prefix) & make_mask(mask)
-                            end_int = start_int | ((1 << 32 - mask) - 1)
-                            if 0 <= end_int - start_int <= 1024:
-                                address = start_int
-                                while start_int <= address <= end_int:
-                                    trails[int_to_addr(address)] = (__info__, __reference__)
-                                    address += 1
-
-            print("[i] post-processing trails (this might take a while)...")
-
-            # basic cleanup
-            for key in list(trails.keys()):
-                if key not in trails:
-                    continue
-
-                if config.DISABLED_TRAILS_INFO_REGEX:
-                    if re.search(config.DISABLED_TRAILS_INFO_REGEX, trails[key][0]):
-                        del trails[key]
-                        continue
-
-                try:
-                    _key = key.decode(UNICODE_ENCODING) if isinstance(key, bytes) else key
-                    _key = _key.encode("idna")
-                    if six.PY3:
-                        _key = _key.decode(UNICODE_ENCODING)
-                    if _key != key:  # for domains with non-ASCII letters (e.g. phishing)
-                        trails[_key] = trails[key]
-                        del trails[key]
-                        key = _key
-                except:
-                    pass
-
-                if not key or re.search(r"(?i)\A\.?[a-z]+\Z", key) and not any(_ in trails[key][1] for _ in ("custom", "static")):
-                    del trails[key]
-                    continue
-
-                if re.search(r"\A\d+\.\d+\.\d+\.\d+\Z", key):
-                    if any(_ in trails[key][0] for _ in ("parking site", "sinkhole")) and key in duplicates:    # Note: delete (e.g.) junk custom trails if static trail is a sinkhole
-                        del duplicates[key]
-
-                    if trails[key][0] == "malware":
-                        trails[key] = ("potential malware site", trails[key][1])
-
-                    if config.get("IP_MINIMUM_FEEDS", 3) > 1:
-                        if (key not in duplicates or len(duplicates[key]) < config.get("IP_MINIMUM_FEEDS", 3)) and re.search(r"\b(custom|static)\b", trails[key][1]) is None:
-                            del trails[key]
-                            continue
-
-                    if any(int(_) > 255 for _ in key.split('.')):
-                        del trails[key]
-                        continue
-
-                if trails[key][0] == "ransomware":
-                    trails[key] = ("ransomware (malware)", trails[key][1])
-
-                if key.startswith("www.") and '/' not in key:
-                    _ = trails[key]
-                    del trails[key]
-                    key = key[len("www."):]
-                    if key:
-                        trails[key] = _
-
-                if '?' in key and not key.startswith('/'):
-                    _ = trails[key]
-                    del trails[key]
-                    key = key.split('?')[0]
-                    if key:
-                        trails[key] = _
-
-                if '//' in key:
-                    _ = trails[key]
-                    del trails[key]
-                    key = key.replace('//', '/')
-                    trails[key] = _
-
-                if key != key.lower():
-                    _ = trails[key]
-                    del trails[key]
-                    key = key.lower()
-                    trails[key] = _
-
-                if key in duplicates:
-                    _ = trails[key]
-                    others = sorted(duplicates[key] - set((_[1],)))
-                    if others and " (+" not in _[1]:
-                        trails[key] = (_[0], "%s (+%s)" % (_[1], ','.join(others)))
-
-            read_whitelist()
-
-            for key in list(trails.keys()):
-                match = re.search(r"\A(\d+\.\d+\.\d+\.\d+)\b", key)
-                if check_whitelisted(key) or any(key.startswith(_) for _ in BAD_TRAIL_PREFIXES):
-                    del trails[key]
-                elif match and (bogon_ip(match.group(1)) or cdn_ip(match.group(1))) and not any(_ in trails[key][0] for _ in ("parking", "sinkhole")):
-                    del trails[key]
-                else:
-                    try:
-                        key.decode("utf8") if hasattr(key, "decode") else key.encode("utf8")
-                        trails[key][0].decode("utf8") if hasattr(trails[key][0], "decode") else trails[key][0].encode("utf8")
-                        trails[key][1].decode("utf8") if hasattr(trails[key][1], "decode") else trails[key][1].encode("utf8")
-                    except UnicodeError:
-                        del trails[key]
-
-            try:
-                if trails:
-                    with _fopen(config.TRAILS_FILE, "w+b" if six.PY2 else "w+", open if six.PY2 else codecs.open) as f:
-                        writer = csv.writer(f, delimiter=',', quotechar='\"', quoting=csv.QUOTE_MINIMAL)
-                        for trail in trails:
-                            row = (trail, trails[trail][0], trails[trail][1])
-                            writer.writerow(row)
-
-                    success = True
-            except Exception as ex:
-                print("[x] something went wrong during trails file write '%s' ('%s')" % (config.TRAILS_FILE, ex))
-
-            print("[i] update finished%s" % (40 * " "))
-
-            if success:
-                print("[i] trails stored to '%s'" % config.TRAILS_FILE)
-
-    return trails
-
-def update_ipcat(force=False):
+    # Download and check versions info
     try:
-        if not os.path.isdir(USERS_DIR):
-            os.makedirs(USERS_DIR, 0o755)
-    except Exception as ex:
-        sys.exit("[!] something went wrong during creation of directory '%s' ('%s')" % (USERS_DIR, ex))
+        versions_info = opener.open(JSON_URL).read().decode('utf-8')
+        versions_info = json.loads(versions_info)
+    except Exception:
+        if verbose:
+            to_screen(encode_compat_str(traceback.format_exc()))
+        to_screen('ERROR: can\'t obtain versions info. Please try again later.')
+        return
+    if 'signature' not in versions_info:
+        to_screen('ERROR: the versions file is not signed or corrupted. Aborting.')
+        return
+    signature = versions_info['signature']
+    del versions_info['signature']
+    if not rsa_verify(json.dumps(versions_info, sort_keys=True).encode('utf-8'), signature, UPDATES_RSA_KEY):
+        to_screen('ERROR: the versions file signature is invalid. Aborting.')
+        return
 
-    _chown(USERS_DIR)
+    version_id = versions_info['latest']
 
-    if force or not os.path.isfile(IPCAT_CSV_FILE) or not os.path.isfile(IPCAT_SQLITE_FILE) or (time.time() - os.stat(IPCAT_CSV_FILE).st_mtime) >= FRESH_IPCAT_DELTA_DAYS * 24 * 3600 or os.stat(IPCAT_SQLITE_FILE).st_size == 0:
-        print("[i] updating ipcat database...")
+    def version_tuple(version_str):
+        return tuple(map(int, version_str.split('.')))
+    if version_tuple(__version__) >= version_tuple(version_id):
+        to_screen('youtube-dl is up to date (%s)' % __version__)
+        return
+
+    to_screen('Updating to version ' + version_id + ' ...')
+    version = versions_info['versions'][version_id]
+
+    print_notes(to_screen, versions_info['versions'])
+
+    # sys.executable is set to the full pathname of the exe-file for py2exe
+    # though symlinks are not followed so that we need to do this manually
+    # with help of realpath
+    filename = compat_realpath(sys.executable if hasattr(sys, 'frozen') else sys.argv[0])
+
+    if not os.access(filename, os.W_OK):
+        to_screen('ERROR: no write permissions on %s' % filename)
+        return
+
+    # Py2EXE
+    if hasattr(sys, 'frozen'):
+        exe = filename
+        directory = os.path.dirname(exe)
+        if not os.access(directory, os.W_OK):
+            to_screen('ERROR: no write permissions on %s' % directory)
+            return
 
         try:
-            with open(IPCAT_CSV_FILE, "w+b") as f:
-                f.write(_urllib.request.urlopen(IPCAT_URL).read())
-        except Exception as ex:
-            print("[x] something went wrong during retrieval of '%s' ('%s')" % (IPCAT_URL, ex))
+            urlh = opener.open(version['exe'][0])
+            newcontent = urlh.read()
+            urlh.close()
+        except (IOError, OSError):
+            if verbose:
+                to_screen(encode_compat_str(traceback.format_exc()))
+            to_screen('ERROR: unable to download latest version')
+            return
 
-        else:
-            try:
-                if os.path.exists(IPCAT_SQLITE_FILE):
-                    os.remove(IPCAT_SQLITE_FILE)
+        newcontent_hash = hashlib.sha256(newcontent).hexdigest()
+        if newcontent_hash != version['exe'][1]:
+            to_screen('ERROR: the downloaded file hash does not match. Aborting.')
+            return
 
-                with sqlite3.connect(IPCAT_SQLITE_FILE, isolation_level=None, check_same_thread=False) as con:
-                    cur = con.cursor()
-                    cur.execute("BEGIN TRANSACTION")
-                    cur.execute("CREATE TABLE ranges (start_int INT, end_int INT, name TEXT)")
+        try:
+            with open(exe + '.new', 'wb') as outf:
+                outf.write(newcontent)
+        except (IOError, OSError):
+            if verbose:
+                to_screen(encode_compat_str(traceback.format_exc()))
+            to_screen('ERROR: unable to write the new version')
+            return
 
-                    with open(IPCAT_CSV_FILE) as f:
-                        for row in f:
-                            if not row.startswith('#') and not row.startswith('start'):
-                                row = row.strip().split(",")
-                                cur.execute("INSERT INTO ranges VALUES (?, ?, ?)", (addr_to_int(row[0]), addr_to_int(row[1]), row[2]))
+        try:
+            bat = os.path.join(directory, 'youtube-dl-updater.bat')
+            with open(bat, 'w') as batfile:
+                batfile.write('''
+@echo off
+echo Waiting for file handle to be closed ...
+ping 127.0.0.1 -n 5 -w 1000 > NUL
+move /Y "%s.new" "%s" > NUL
+echo Updated youtube-dl to version %s.
+start /b "" cmd /c del "%%~f0"&exit /b"
+                \n''' % (exe, exe, version_id))
 
-                    cur.execute("COMMIT")
-                    cur.close()
-                    con.commit()
-            except Exception as ex:
-                print("[x] something went wrong during ipcat database update ('%s')" % ex)
+            subprocess.Popen([bat])  # Continues to run in the background
+            return  # Do not show premature success messages
+        except (IOError, OSError):
+            if verbose:
+                to_screen(encode_compat_str(traceback.format_exc()))
+            to_screen('ERROR: unable to overwrite current version')
+            return
 
-    _chown(IPCAT_CSV_FILE)
-    _chown(IPCAT_SQLITE_FILE)
+    # Zip unix package
+    elif isinstance(globals().get('__loader__'), zipimporter):
+        try:
+            urlh = opener.open(version['bin'][0])
+            newcontent = urlh.read()
+            urlh.close()
+        except (IOError, OSError):
+            if verbose:
+                to_screen(encode_compat_str(traceback.format_exc()))
+            to_screen('ERROR: unable to download latest version')
+            return
 
-def main():
-    if "-c" in sys.argv:
-        read_config(sys.argv[sys.argv.index("-c") + 1])
+        newcontent_hash = hashlib.sha256(newcontent).hexdigest()
+        if newcontent_hash != version['bin'][1]:
+            to_screen('ERROR: the downloaded file hash does not match. Aborting.')
+            return
 
-    try:
-        offline = "--offline" in sys.argv
-        update_trails(force=True, offline=offline)
-        if not offline:
-            update_ipcat()
-    except KeyboardInterrupt:
-        print("\r[x] Ctrl-C pressed")
-    else:
-        if "-r" in sys.argv:
-            results = []
-            with _fopen(config.TRAILS_FILE, "rb" if six.PY2 else 'r', open if six.PY2 else codecs.open) as f:
-                for line in f:
-                    if line and line[0].isdigit():
-                        items = line.split(',', 2)
-                        if re.search(r"\A[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\Z", items[0]):
-                            ip = items[0]
-                            reputation = 1
-                            lists = items[-1]
-                            if '+' in lists:
-                                reputation = 2 + lists.count(',')
-                            if "(custom)" in lists:
-                                reputation -= 1
-                            if "(static)" in lists:
-                                reputation -= 1
-                            reputation -= max(0, lists.count("prox") + lists.count("maxmind") + lists.count("spys.ru") + lists.count("rosinstrument") - 1)      # remove duplicate proxy hits
-                            reputation -= max(0, lists.count("blutmagie") + lists.count("torproject") - 1)                                                      # remove duplicate tor hits
-                            if reputation > 0:
-                                results.append((ip, reputation))
-            results = sorted(results, key=lambda _: _[1], reverse=True)
-            for result in results:
-                sys.stderr.write("%s\t%s\n" % (result[0], result[1]))
-                sys.stderr.flush()
+        try:
+            with open(filename, 'wb') as outf:
+                outf.write(newcontent)
+        except (IOError, OSError):
+            if verbose:
+                to_screen(encode_compat_str(traceback.format_exc()))
+            to_screen('ERROR: unable to overwrite current version')
+            return
 
-        if "--console" in sys.argv:
-            with _fopen(config.TRAILS_FILE, "rb" if six.PY2 else 'r', open if six.PY2 else codecs.open) as f:
-                for line in f:
-                    sys.stdout.write(line)
+    to_screen('Updated youtube-dl. Restart youtube-dl to use the new version.')
 
-if __name__ == "__main__":
-    main()
+
+def get_notes(versions, fromVersion):
+    notes = []
+    for v, vdata in sorted(versions.items()):
+        if v > fromVersion:
+            notes.extend(vdata.get('notes', []))
+    return notes
+
+
+def print_notes(to_screen, versions, fromVersion=__version__):
+    notes = get_notes(versions, fromVersion)
+    if notes:
+        to_screen('PLEASE NOTE:')
+        for note in notes:
+            to_screen(note)

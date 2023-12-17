@@ -1,471 +1,391 @@
-import os
-
-import pytest
-
-from flask import Flask, request, abort, url_for
-from flask.views import MethodView
-
-from flask_admin import base
-
-
-class MockView(base.BaseView):
-    # Various properties
-    allow_call = True
-    allow_access = True
-    visible = True
-
-    @base.expose('/')
-    def index(self):
-        return 'Success!'
-
-    @base.expose('/test/')
-    def test(self):
-        return self.render('mock.html')
-
-    def _handle_view(self, name, **kwargs):
-        if self.allow_call:
-            return super(MockView, self)._handle_view(name, **kwargs)
-        else:
-            return 'Failure!'
-
-    def is_accessible(self):
-        if self.allow_access:
-            return super(MockView, self).is_accessible()
-
-        return False
-
-    def is_visible(self):
-        if self.visible:
-            return super(MockView, self).is_visible()
-
-        return False
-
-
-class MockMethodView(base.BaseView):
-    @base.expose('/')
-    def index(self):
-        return 'Success!'
-
-    @base.expose_plugview('/_api/1')
-    class API1(MethodView):
-        def get(self, cls):
-            return cls.render('method.html', request=request, name='API1')
-
-        def post(self, cls):
-            return cls.render('method.html', request=request, name='API1')
-
-        def put(self, cls):
-            return cls.render('method.html', request=request, name='API1')
-
-        def delete(self, cls):
-            return cls.render('method.html', request=request, name='API1')
-
-    @base.expose_plugview('/_api/2')
-    class API2(MethodView):
-        def get(self, cls):
-            return cls.render('method.html', request=request, name='API2')
-
-        def post(self, cls):
-            return cls.render('method.html', request=request, name='API2')
-
-    @base.expose_plugview('/_api/3')
-    @base.expose_plugview('/_api/4')
-    class DoubleExpose(MethodView):
-        def get(self, cls):
-            return cls.render('method.html', request=request, name='API3')
-
-
-def test_baseview_defaults():
-    view = MockView()
-    assert view.name is None
-    assert view.category is None
-    assert view.endpoint == 'mockview'
-    assert view.url is None
-    assert view.static_folder is None
-    assert view.admin is None
-    assert view.blueprint is None
-
-
-def test_base_defaults():
-    admin = base.Admin()
-    assert admin.name == 'Admin'
-    assert admin.url == '/admin'
-    assert admin.endpoint == 'admin'
-    assert admin.app is None
-    assert admin.index_view is not None
-    assert admin.index_view._template == 'admin/index.html'
-
-    # Check if default view was added
-    assert len(admin._views) == 1
-    assert admin._views[0] == admin.index_view
-
-
-def test_custom_index_view():
-    view = base.AdminIndexView(name='a', category='b', endpoint='c',
-                               url='/d', template='e')
-    admin = base.Admin(index_view=view)
-
-    assert admin.endpoint == 'c'
-    assert admin.url == '/d'
-    assert admin.index_view is view
-    assert view.name == 'a'
-    assert view.category == 'b'
-    assert view._template == 'e'
-
-    # Check if view was added
-    assert len(admin._views) == 1
-    assert admin._views[0] == view
-
-
-def test_custom_index_view_in_init_app():
-    view = base.AdminIndexView(name='a', category='b', endpoint='c',
-                               url='/d', template='e')
-    app = Flask(__name__)
-    admin = base.Admin()
-    admin.init_app(app, index_view=view)
-
-    assert admin.endpoint == 'c'
-    assert admin.url == '/d'
-    assert admin.index_view is view
-    assert view.name == 'a'
-    assert view.category == 'b'
-    assert view._template == 'e'
-
-    # Check if view was added
-    assert len(admin._views) == 1
-    assert admin._views[0] == view
-
-
-def test_base_registration():
-    app = Flask(__name__)
-    admin = base.Admin(app)
-
-    assert admin.app == app
-    assert admin.index_view.blueprint is not None
-
-
-def test_admin_customizations():
-    app = Flask(__name__)
-    admin = base.Admin(app, name='Test', url='/foobar', static_url_path='/static/my/admin')
-    assert admin.name == 'Test'
-    assert admin.url == '/foobar'
-    assert admin.index_view.blueprint.static_url_path == '/static/my/admin'
-
-    client = app.test_client()
-    rv = client.get('/foobar/')
-    assert rv.status_code == 200
-
-    # test custom static_url_path
-    with app.test_request_context('/'):
-        rv = client.get(url_for('admin.static', filename='bootstrap/bootstrap2/css/bootstrap.css'))
-    assert rv.status_code == 200
-
-
-def test_baseview_registration():
-    admin = base.Admin()
-
-    view = MockView()
-    bp = view.create_blueprint(admin)
-
-    # Base properties
-    assert view.admin == admin
-    assert view.blueprint is not None
-
-    # Calculated properties
-    assert view.endpoint == 'mockview'
-    assert view.url == '/admin/mockview'
-    assert view.name == 'Mock View'
-
-    # Verify generated blueprint properties
-    assert bp.name == view.endpoint
-    assert bp.url_prefix == view.url
-    assert bp.template_folder == os.path.join('templates', 'bootstrap2')
-    assert bp.static_folder == view.static_folder
-
-    # Verify customizations
-    view = MockView(name='Test', endpoint='foobar')
-    view.create_blueprint(base.Admin())
-
-    assert view.name == 'Test'
-    assert view.endpoint == 'foobar'
-    assert view.url == '/admin/foobar'
-
-    view = MockView(url='test')
-    view.create_blueprint(base.Admin())
-    assert view.url == '/admin/test'
-
-    view = MockView(url='/test/test')
-    view.create_blueprint(base.Admin())
-    assert view.url == '/test/test'
-
-    view = MockView(endpoint='test')
-    view.create_blueprint(base.Admin(url='/'))
-    assert view.url == '/test'
-
-    view = MockView(static_url_path='/static/my/test')
-    view.create_blueprint(base.Admin())
-    assert view.blueprint.static_url_path == '/static/my/test'
-
-
-def test_baseview_urls():
-    app = Flask(__name__)
-    admin = base.Admin(app)
-
-    view = MockView()
-    admin.add_view(view)
-
-    assert len(view._urls) == 2
-
-
-def test_add_views():
-    app = Flask(__name__)
-    admin = base.Admin(app)
-
-    admin.add_views(MockView(endpoint='test1'), MockView(endpoint='test2'))
-
-    assert len(admin.menu()) == 3
-
-
-def test_add_category():
-    app = Flask(__name__)
-    admin = base.Admin(app)
-
-    admin.add_category('Category1', 'class-name', 'icon-type', 'icon-value')
-    admin.add_view(MockView(name='Test 1', endpoint='test1', category='Category1'))
-    admin.add_view(MockView(name='Test 2', endpoint='test2', category='Category2'))
-
-    assert len(admin.menu()) == 3
-
-    # Test 1 should be underneath Category1
-    assert admin.menu()[1].name == 'Category1'
-    assert admin.menu()[1].get_class_name() == 'class-name'
-    assert admin.menu()[1].get_icon_type() == 'icon-type'
-    assert admin.menu()[1].get_icon_value() == 'icon-value'
-    assert len(admin.menu()[1].get_children()) == 1
-    assert admin.menu()[1].get_children()[0].name == 'Test 1'
-
-    # Test 2 should be underneath Category2
-    assert admin.menu()[2].name == 'Category2'
-    assert admin.menu()[2].get_class_name() is None
-    assert admin.menu()[2].get_icon_type() is None
-    assert admin.menu()[2].get_icon_value() is None
-    assert len(admin.menu()[2].get_children()) == 1
-    assert admin.menu()[2].get_children()[0].name == 'Test 2'
-
-
-@pytest.mark.xfail(raises=Exception)
-def test_no_default():
-    app = Flask(__name__)
-    admin = base.Admin(app)
-    admin.add_view(base.BaseView())
-
-
-def test_call():
-    app = Flask(__name__)
-    admin = base.Admin(app)
-    view = MockView()
-    admin.add_view(view)
-    client = app.test_client()
-
-    rv = client.get('/admin/')
-    assert rv.status_code == 200
-
-    rv = client.get('/admin/mockview/')
-    assert rv.data == b'Success!'
-
-    rv = client.get('/admin/mockview/test/')
-    assert rv.data == b'Success!'
-
-    # Check authentication failure
-    view.allow_call = False
-    rv = client.get('/admin/mockview/')
-    assert rv.data == b'Failure!'
-
-
-def test_permissions():
-    app = Flask(__name__)
-    admin = base.Admin(app)
-    view = MockView()
-    admin.add_view(view)
-    client = app.test_client()
-
-    view.allow_access = False
-
-    rv = client.get('/admin/mockview/')
-    assert rv.status_code == 403
-
-
-def test_inaccessible_callback():
-    app = Flask(__name__)
-    admin = base.Admin(app)
-    view = MockView()
-    admin.add_view(view)
-    client = app.test_client()
-
-    view.allow_access = False
-    view.inaccessible_callback = lambda *args, **kwargs: abort(418)
-
-    rv = client.get('/admin/mockview/')
-    assert rv.status_code == 418
-
-
-def get_visibility():
-    app = Flask(__name__)
-    admin = base.Admin(app)
-
-    view = MockView(name='TestMenuItem')
-    view.visible = False
-
-    admin.add_view(view)
-
-    client = app.test_client()
-
-    rv = client.get('/admin/mockview/')
-    assert 'TestMenuItem' not in rv.data.decode('utf-8')
-
-
-def test_submenu():
-    app = Flask(__name__)
-    admin = base.Admin(app)
-    admin.add_view(MockView(name='Test 1', category='Test', endpoint='test1'))
-
-    # Second view is not normally accessible
-    view = MockView(name='Test 2', category='Test', endpoint='test2')
-    view.allow_access = False
-    admin.add_view(view)
-
-    assert 'Test' in admin._menu_categories
-    assert len(admin._menu) == 2
-    assert admin._menu[1].name == 'Test'
-    assert len(admin._menu[1]._children) == 2
-
-    # Categories don't have URLs
-    assert admin._menu[1].get_url() is None
-
-    # Categories are only accessible if there is at least one accessible child
-    assert admin._menu[1].is_accessible()
-
-    children = admin._menu[1].get_children()
-    assert len(children) == 1
-
-    assert children[0].is_accessible()
-
-
-def test_delayed_init():
-    app = Flask(__name__)
-    admin = base.Admin()
-    admin.add_view(MockView())
-    admin.init_app(app)
-
-    client = app.test_client()
-
-    rv = client.get('/admin/mockview/')
-    assert rv.data == b'Success!'
-
-
-def test_multi_instances_init():
-    app = Flask(__name__)
-    _ = base.Admin(app)
-
-    class ManageIndex(base.AdminIndexView):
-        pass
-
-    _ = base.Admin(app, index_view=ManageIndex(url='/manage', endpoint='manage'))  # noqa: F841
-
-
-@pytest.mark.xfail(raises=Exception)
-def test_double_init():
-    app = Flask(__name__)
-    admin = base.Admin(app)
-    admin.init_app(app)
-
-
-def test_nested_flask_views():
-    app = Flask(__name__)
-    admin = base.Admin(app)
-
-    view = MockMethodView()
-    admin.add_view(view)
-
-    client = app.test_client()
-
-    rv = client.get('/admin/mockmethodview/_api/1')
-    print('"', rv.data, '"')
-    assert rv.data == b'GET - API1'
-    rv = client.put('/admin/mockmethodview/_api/1')
-    assert rv.data == b'PUT - API1'
-    rv = client.post('/admin/mockmethodview/_api/1')
-    assert rv.data == b'POST - API1'
-    rv = client.delete('/admin/mockmethodview/_api/1')
-    assert rv.data == b'DELETE - API1'
-
-    rv = client.get('/admin/mockmethodview/_api/2')
-    assert rv.data == b'GET - API2'
-    rv = client.post('/admin/mockmethodview/_api/2')
-    assert rv.data == b'POST - API2'
-    rv = client.delete('/admin/mockmethodview/_api/2')
-    assert rv.status_code == 405
-    rv = client.put('/admin/mockmethodview/_api/2')
-    assert rv.status_code == 405
-
-    rv = client.get('/admin/mockmethodview/_api/3')
-    assert rv.data == b'GET - API3'
-    rv = client.get('/admin/mockmethodview/_api/4')
-    assert rv.data == b'GET - API3'
-
-
-def test_root_mount():
-    app = Flask(__name__)
-    admin = base.Admin(app, url='/')
-    admin.add_view(MockView())
-
-    client = app.test_client()
-    rv = client.get('/mockview/')
-    assert rv.data == b'Success!'
-
-    # test static files when url='/'
-    with app.test_request_context('/'):
-        rv = client.get(url_for('admin.static', filename='bootstrap/bootstrap2/css/bootstrap.css'))
-    assert rv.status_code == 200
-
-
-def test_menu_links():
-    app = Flask(__name__)
-    admin = base.Admin(app)
-    admin.add_link(base.MenuLink('TestMenuLink1', endpoint='.index'))
-    admin.add_link(base.MenuLink('TestMenuLink2', url='http://python.org/'))
-
-    client = app.test_client()
-    rv = client.get('/admin/')
-
-    data = rv.data.decode('utf-8')
-    assert 'TestMenuLink1' in data
-    assert 'TestMenuLink2' in data
-
-
-def test_add_links():
-    app = Flask(__name__)
-    admin = base.Admin(app)
-    admin.add_links(base.MenuLink('TestMenuLink1', endpoint='.index'),
-                    base.MenuLink('TestMenuLink2', url='http://python.org/'))
-
-    client = app.test_client()
-    rv = client.get('/admin/')
-
-    data = rv.data.decode('utf-8')
-    assert 'TestMenuLink1' in data
-    assert 'TestMenuLink2' in data
-
-
-def check_class_name():
-    view = MockView()
-    assert view.name == 'Mock View'
-
-
-def check_endpoint():
-    class CustomView(MockView):
-        def _get_endpoint(self, endpoint):
-            return 'admin.' + super(CustomView, self)._get_endpoint(endpoint)
-
-    view = CustomView()
-    assert view.endpoint == 'admin.customview'
+from unittest.mock import MagicMock, patch
+
+from django.db import DEFAULT_DB_ALIAS, connection, connections, transaction
+from django.db.backends.base.base import BaseDatabaseWrapper
+from django.test import (
+    SimpleTestCase,
+    TestCase,
+    TransactionTestCase,
+    skipUnlessDBFeature,
+)
+from django.test.utils import CaptureQueriesContext, override_settings
+
+from ..models import Person, Square
+
+
+class DatabaseWrapperTests(SimpleTestCase):
+    def test_repr(self):
+        conn = connections[DEFAULT_DB_ALIAS]
+        self.assertEqual(
+            repr(conn),
+            f"<DatabaseWrapper vendor={connection.vendor!r} alias='default'>",
+        )
+
+    def test_initialization_class_attributes(self):
+        """
+        The "initialization" class attributes like client_class and
+        creation_class should be set on the class and reflected in the
+        corresponding instance attributes of the instantiated backend.
+        """
+        conn = connections[DEFAULT_DB_ALIAS]
+        conn_class = type(conn)
+        attr_names = [
+            ("client_class", "client"),
+            ("creation_class", "creation"),
+            ("features_class", "features"),
+            ("introspection_class", "introspection"),
+            ("ops_class", "ops"),
+            ("validation_class", "validation"),
+        ]
+        for class_attr_name, instance_attr_name in attr_names:
+            class_attr_value = getattr(conn_class, class_attr_name)
+            self.assertIsNotNone(class_attr_value)
+            instance_attr_value = getattr(conn, instance_attr_name)
+            self.assertIsInstance(instance_attr_value, class_attr_value)
+
+    def test_initialization_display_name(self):
+        self.assertEqual(BaseDatabaseWrapper.display_name, "unknown")
+        self.assertNotEqual(connection.display_name, "unknown")
+
+    def test_get_database_version(self):
+        with patch.object(BaseDatabaseWrapper, "__init__", return_value=None):
+            msg = (
+                "subclasses of BaseDatabaseWrapper may require a "
+                "get_database_version() method."
+            )
+            with self.assertRaisesMessage(NotImplementedError, msg):
+                BaseDatabaseWrapper().get_database_version()
+
+    def test_check_database_version_supported_with_none_as_database_version(self):
+        with patch.object(connection.features, "minimum_database_version", None):
+            connection.check_database_version_supported()
+
+
+class DatabaseWrapperLoggingTests(TransactionTestCase):
+    available_apps = ["backends"]
+
+    @override_settings(DEBUG=True)
+    def test_commit_debug_log(self):
+        conn = connections[DEFAULT_DB_ALIAS]
+        with CaptureQueriesContext(conn):
+            with self.assertLogs("django.db.backends", "DEBUG") as cm:
+                with transaction.atomic():
+                    Person.objects.create(first_name="first", last_name="last")
+
+                self.assertGreaterEqual(len(conn.queries_log), 3)
+                self.assertEqual(conn.queries_log[-3]["sql"], "BEGIN")
+                self.assertRegex(
+                    cm.output[0],
+                    r"DEBUG:django.db.backends:\(\d+.\d{3}\) "
+                    rf"BEGIN; args=None; alias={DEFAULT_DB_ALIAS}",
+                )
+                self.assertEqual(conn.queries_log[-1]["sql"], "COMMIT")
+                self.assertRegex(
+                    cm.output[-1],
+                    r"DEBUG:django.db.backends:\(\d+.\d{3}\) "
+                    rf"COMMIT; args=None; alias={DEFAULT_DB_ALIAS}",
+                )
+
+    @override_settings(DEBUG=True)
+    def test_rollback_debug_log(self):
+        conn = connections[DEFAULT_DB_ALIAS]
+        with CaptureQueriesContext(conn):
+            with self.assertLogs("django.db.backends", "DEBUG") as cm:
+                with self.assertRaises(Exception), transaction.atomic():
+                    Person.objects.create(first_name="first", last_name="last")
+                    raise Exception("Force rollback")
+
+                self.assertEqual(conn.queries_log[-1]["sql"], "ROLLBACK")
+                self.assertRegex(
+                    cm.output[-1],
+                    r"DEBUG:django.db.backends:\(\d+.\d{3}\) "
+                    rf"ROLLBACK; args=None; alias={DEFAULT_DB_ALIAS}",
+                )
+
+    def test_no_logs_without_debug(self):
+        with self.assertNoLogs("django.db.backends", "DEBUG"):
+            with self.assertRaises(Exception), transaction.atomic():
+                Person.objects.create(first_name="first", last_name="last")
+                raise Exception("Force rollback")
+
+            conn = connections[DEFAULT_DB_ALIAS]
+            self.assertEqual(len(conn.queries_log), 0)
+
+
+class ExecuteWrapperTests(TestCase):
+    @staticmethod
+    def call_execute(connection, params=None):
+        ret_val = "1" if params is None else "%s"
+        sql = "SELECT " + ret_val + connection.features.bare_select_suffix
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+
+    def call_executemany(self, connection, params=None):
+        # executemany() must use an update query. Make sure it does nothing
+        # by putting a false condition in the WHERE clause.
+        sql = "DELETE FROM {} WHERE 0=1 AND 0=%s".format(Square._meta.db_table)
+        if params is None:
+            params = [(i,) for i in range(3)]
+        with connection.cursor() as cursor:
+            cursor.executemany(sql, params)
+
+    @staticmethod
+    def mock_wrapper():
+        return MagicMock(side_effect=lambda execute, *args: execute(*args))
+
+    def test_wrapper_invoked(self):
+        wrapper = self.mock_wrapper()
+        with connection.execute_wrapper(wrapper):
+            self.call_execute(connection)
+        self.assertTrue(wrapper.called)
+        (_, sql, params, many, context), _ = wrapper.call_args
+        self.assertIn("SELECT", sql)
+        self.assertIsNone(params)
+        self.assertIs(many, False)
+        self.assertEqual(context["connection"], connection)
+
+    def test_wrapper_invoked_many(self):
+        wrapper = self.mock_wrapper()
+        with connection.execute_wrapper(wrapper):
+            self.call_executemany(connection)
+        self.assertTrue(wrapper.called)
+        (_, sql, param_list, many, context), _ = wrapper.call_args
+        self.assertIn("DELETE", sql)
+        self.assertIsInstance(param_list, (list, tuple))
+        self.assertIs(many, True)
+        self.assertEqual(context["connection"], connection)
+
+    def test_database_queried(self):
+        wrapper = self.mock_wrapper()
+        with connection.execute_wrapper(wrapper):
+            with connection.cursor() as cursor:
+                sql = "SELECT 17" + connection.features.bare_select_suffix
+                cursor.execute(sql)
+                seventeen = cursor.fetchall()
+                self.assertEqual(list(seventeen), [(17,)])
+            self.call_executemany(connection)
+
+    def test_nested_wrapper_invoked(self):
+        outer_wrapper = self.mock_wrapper()
+        inner_wrapper = self.mock_wrapper()
+        with connection.execute_wrapper(outer_wrapper), connection.execute_wrapper(
+            inner_wrapper
+        ):
+            self.call_execute(connection)
+            self.assertEqual(inner_wrapper.call_count, 1)
+            self.call_executemany(connection)
+            self.assertEqual(inner_wrapper.call_count, 2)
+
+    def test_outer_wrapper_blocks(self):
+        def blocker(*args):
+            pass
+
+        wrapper = self.mock_wrapper()
+        c = connection  # This alias shortens the next line.
+        with c.execute_wrapper(wrapper), c.execute_wrapper(blocker), c.execute_wrapper(
+            wrapper
+        ):
+            with c.cursor() as cursor:
+                cursor.execute("The database never sees this")
+                self.assertEqual(wrapper.call_count, 1)
+                cursor.executemany("The database never sees this %s", [("either",)])
+                self.assertEqual(wrapper.call_count, 2)
+
+    def test_wrapper_gets_sql(self):
+        wrapper = self.mock_wrapper()
+        sql = "SELECT 'aloha'" + connection.features.bare_select_suffix
+        with connection.execute_wrapper(wrapper), connection.cursor() as cursor:
+            cursor.execute(sql)
+        (_, reported_sql, _, _, _), _ = wrapper.call_args
+        self.assertEqual(reported_sql, sql)
+
+    def test_wrapper_connection_specific(self):
+        wrapper = self.mock_wrapper()
+        with connections["other"].execute_wrapper(wrapper):
+            self.assertEqual(connections["other"].execute_wrappers, [wrapper])
+            self.call_execute(connection)
+        self.assertFalse(wrapper.called)
+        self.assertEqual(connection.execute_wrappers, [])
+        self.assertEqual(connections["other"].execute_wrappers, [])
+
+
+class ConnectionHealthChecksTests(SimpleTestCase):
+    databases = {"default"}
+
+    def setUp(self):
+        # All test cases here need newly configured and created connections.
+        # Use the default db connection for convenience.
+        connection.close()
+        self.addCleanup(connection.close)
+
+    def patch_settings_dict(self, conn_health_checks):
+        self.settings_dict_patcher = patch.dict(
+            connection.settings_dict,
+            {
+                **connection.settings_dict,
+                "CONN_MAX_AGE": None,
+                "CONN_HEALTH_CHECKS": conn_health_checks,
+            },
+        )
+        self.settings_dict_patcher.start()
+        self.addCleanup(self.settings_dict_patcher.stop)
+
+    def run_query(self):
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 42" + connection.features.bare_select_suffix)
+
+    @skipUnlessDBFeature("test_db_allows_multiple_connections")
+    def test_health_checks_enabled(self):
+        self.patch_settings_dict(conn_health_checks=True)
+        self.assertIsNone(connection.connection)
+        # Newly created connections are considered healthy without performing
+        # the health check.
+        with patch.object(connection, "is_usable", side_effect=AssertionError):
+            self.run_query()
+
+        old_connection = connection.connection
+        # Simulate request_finished.
+        connection.close_if_unusable_or_obsolete()
+        self.assertIs(old_connection, connection.connection)
+
+        # Simulate connection health check failing.
+        with patch.object(
+            connection, "is_usable", return_value=False
+        ) as mocked_is_usable:
+            self.run_query()
+            new_connection = connection.connection
+            # A new connection is established.
+            self.assertIsNot(new_connection, old_connection)
+            # Only one health check per "request" is performed, so the next
+            # query will carry on even if the health check fails. Next query
+            # succeeds because the real connection is healthy and only the
+            # health check failure is mocked.
+            self.run_query()
+            self.assertIs(new_connection, connection.connection)
+        self.assertEqual(mocked_is_usable.call_count, 1)
+
+        # Simulate request_finished.
+        connection.close_if_unusable_or_obsolete()
+        # The underlying connection is being reused further with health checks
+        # succeeding.
+        self.run_query()
+        self.run_query()
+        self.assertIs(new_connection, connection.connection)
+
+    @skipUnlessDBFeature("test_db_allows_multiple_connections")
+    def test_health_checks_enabled_errors_occurred(self):
+        self.patch_settings_dict(conn_health_checks=True)
+        self.assertIsNone(connection.connection)
+        # Newly created connections are considered healthy without performing
+        # the health check.
+        with patch.object(connection, "is_usable", side_effect=AssertionError):
+            self.run_query()
+
+        old_connection = connection.connection
+        # Simulate errors_occurred.
+        connection.errors_occurred = True
+        # Simulate request_started (the connection is healthy).
+        connection.close_if_unusable_or_obsolete()
+        # Persistent connections are enabled.
+        self.assertIs(old_connection, connection.connection)
+        # No additional health checks after the one in
+        # close_if_unusable_or_obsolete() are executed during this "request"
+        # when running queries.
+        with patch.object(connection, "is_usable", side_effect=AssertionError):
+            self.run_query()
+
+    @skipUnlessDBFeature("test_db_allows_multiple_connections")
+    def test_health_checks_disabled(self):
+        self.patch_settings_dict(conn_health_checks=False)
+        self.assertIsNone(connection.connection)
+        # Newly created connections are considered healthy without performing
+        # the health check.
+        with patch.object(connection, "is_usable", side_effect=AssertionError):
+            self.run_query()
+
+        old_connection = connection.connection
+        # Simulate request_finished.
+        connection.close_if_unusable_or_obsolete()
+        # Persistent connections are enabled (connection is not).
+        self.assertIs(old_connection, connection.connection)
+        # Health checks are not performed.
+        with patch.object(connection, "is_usable", side_effect=AssertionError):
+            self.run_query()
+            # Health check wasn't performed and the connection is unchanged.
+            self.assertIs(old_connection, connection.connection)
+            self.run_query()
+            # The connection is unchanged after the next query either during
+            # the current "request".
+            self.assertIs(old_connection, connection.connection)
+
+    @skipUnlessDBFeature("test_db_allows_multiple_connections")
+    def test_set_autocommit_health_checks_enabled(self):
+        self.patch_settings_dict(conn_health_checks=True)
+        self.assertIsNone(connection.connection)
+        # Newly created connections are considered healthy without performing
+        # the health check.
+        with patch.object(connection, "is_usable", side_effect=AssertionError):
+            # Simulate outermost atomic block: changing autocommit for
+            # a connection.
+            connection.set_autocommit(False)
+            self.run_query()
+            connection.commit()
+            connection.set_autocommit(True)
+
+        old_connection = connection.connection
+        # Simulate request_finished.
+        connection.close_if_unusable_or_obsolete()
+        # Persistent connections are enabled.
+        self.assertIs(old_connection, connection.connection)
+
+        # Simulate connection health check failing.
+        with patch.object(
+            connection, "is_usable", return_value=False
+        ) as mocked_is_usable:
+            # Simulate outermost atomic block: changing autocommit for
+            # a connection.
+            connection.set_autocommit(False)
+            new_connection = connection.connection
+            self.assertIsNot(new_connection, old_connection)
+            # Only one health check per "request" is performed, so a query will
+            # carry on even if the health check fails. This query succeeds
+            # because the real connection is healthy and only the health check
+            # failure is mocked.
+            self.run_query()
+            connection.commit()
+            connection.set_autocommit(True)
+            # The connection is unchanged.
+            self.assertIs(new_connection, connection.connection)
+        self.assertEqual(mocked_is_usable.call_count, 1)
+
+        # Simulate request_finished.
+        connection.close_if_unusable_or_obsolete()
+        # The underlying connection is being reused further with health checks
+        # succeeding.
+        connection.set_autocommit(False)
+        self.run_query()
+        connection.commit()
+        connection.set_autocommit(True)
+        self.assertIs(new_connection, connection.connection)
+
+
+class MultiDatabaseTests(TestCase):
+    databases = {"default", "other"}
+
+    def test_multi_database_init_connection_state_called_once(self):
+        for db in self.databases:
+            with self.subTest(database=db):
+                with patch.object(connections[db], "commit", return_value=None):
+                    with patch.object(
+                        connections[db],
+                        "check_database_version_supported",
+                    ) as mocked_check_database_version_supported:
+                        connections[db].init_connection_state()
+                        after_first_calls = len(
+                            mocked_check_database_version_supported.mock_calls
+                        )
+                        connections[db].init_connection_state()
+                        self.assertEqual(
+                            len(mocked_check_database_version_supported.mock_calls),
+                            after_first_calls,
+                        )

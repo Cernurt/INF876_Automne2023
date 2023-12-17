@@ -1,117 +1,86 @@
-import pytest
+# Copyright 2020 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# tests directory-specific settings - this file is run automatically
+# by pytest before any tests are run
+
+import doctest
+import sys
+import warnings
+from os.path import abspath, dirname, join
+
+import _pytest
+
+from transformers.testing_utils import HfDoctestModule, HfDocTestParser
 
 
-from wfuzz.fuzzrequest import FuzzRequest
-from wfuzz.fuzzobjects import FuzzResult
-from wfuzz.fuzzobjects import FPayloadManager
-from wfuzz.filters.ppfilter import FuzzResFilter
-from wfuzz.facade import Facade
+# allow having multiple repository checkouts and not needing to remember to rerun
+# 'pip install -e .[dev]' when switching between checkouts and running tests.
+git_repo_path = abspath(join(dirname(__file__), "src"))
+sys.path.insert(1, git_repo_path)
+
+# silence FutureWarning warnings in tests since often we can't act on them until
+# they become normal warnings - i.e. the tests still need to test the current functionality
+warnings.simplefilter(action="ignore", category=FutureWarning)
 
 
-@pytest.fixture
-def full_fuzzres(request):
-    raw_req, raw_resp = request.param
-    fr = FuzzRequest()
-    fr.update_from_raw_http(raw_req, "http", raw_resp, None)
-
-    return FuzzResult(history=fr)
-
-
-@pytest.fixture
-def full_fuzzreq(request):
-    raw_req, raw_resp = request.param
-    fr = FuzzRequest()
-    fr.update_from_raw_http(raw_req, "http", raw_resp, None)
-
-    return fr
-
-
-@pytest.fixture
-def fuzzres_from_url(request):
-    fr = FuzzRequest()
-    fr.url = request.param
-
-    return FuzzResult(history=fr)
-
-
-@pytest.fixture
-def filter_obj():
-    return FuzzResFilter()
-
-
-@pytest.fixture
-def example_full_fuzzres():
-    raw_req, raw_resp = (
-        "GET /path?param1=1&param2=2 HTTP/1.1\n"
-        "Host: www.wfuzz.org\n"
-        "User-Agent: curl/7.58.0\n"
-        "Accept: */*\n"
-        "Cookie: cookie1=1\n",
-        "HTTP/1.1 302 Found\n"
-        "Content-Type: text/html; charset=utf-8\n"
-        "Content-Language: en\n"
-        "Location: https://wfuzz.readthedocs.io/en/latest/\n"
-        "Vary: Accept-Language, Cookie\n"
-        "Server: nginx/1.14.0 (Ubuntu)\n"
-        "X-Fallback: True\n"
-        "X-Served: Django\n"
-        "X-Deity: web01\n"
-        "Date: Wed, 23 Jan 2019 21:43:59 GMT\n"
-        "Content-Length: 0\n"
-        "Set-Cookie: name=Nicholas; expires=Sat, 02 May 2009 23:38:25 GMT\n",
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "is_pt_tf_cross_test: mark test to run only when PT and TF interactions are tested"
     )
-    fr = FuzzRequest()
-    fr.update_from_raw_http(
-        raw_req, "http", raw_resp, b"Some line\n and words\nasdsdas"
+    config.addinivalue_line(
+        "markers", "is_pt_flax_cross_test: mark test to run only when PT and FLAX interactions are tested"
     )
-
-    return FuzzResult(history=fr)
-
-
-@pytest.fixture
-def example_full_fuzzres_content(request):
-    raw_content = request.param
-
-    raw_req, raw_resp = (
-        "GET /path?param1=1&param2=2 HTTP/1.1\n"
-        "Host: www.wfuzz.org\n"
-        "User-Agent: curl/7.58.0\n"
-        "Accept: */*\n"
-        "Cookie: cookie1=1\n",
-        "HTTP/1.1 200 OK\n"
-        "Content-Type: text/html; charset=utf-8\n"
-        "Content-Language: en\n"
-        "Vary: Accept-Language, Cookie\n"
-        "Server: nginx/1.14.0 (Ubuntu)\n"
-        "X-Fallback: True\n"
-        "X-Served: Django\n"
-        "X-Deity: web01\n"
-        "Date: Wed, 23 Jan 2019 21:43:59 GMT\n"
-        "Content-Length: 0\n"
-        "Set-Cookie: name=Nicholas; expires=Sat, 02 May 2009 23:38:25 GMT\n",
-    )
-    fr = FuzzRequest()
-    fr.update_from_raw_http(raw_req, "http", raw_resp, raw_content)
-
-    fuzzres = FuzzResult(history=fr)
-    fuzzres.payload_man = FPayloadManager()
-
-    return fuzzres
+    config.addinivalue_line("markers", "is_pipeline_test: mark test to run only when pipelines are tested")
+    config.addinivalue_line("markers", "is_staging_test: mark test to run only in the staging environment")
+    config.addinivalue_line("markers", "accelerate_tests: mark test that require accelerate")
+    config.addinivalue_line("markers", "tool_tests: mark the tool tests that are run on their specific schedule")
 
 
-@pytest.fixture
-def example_full_fuzzres_no_response():
-    raw_req = "GET /path?param1=1&param2=2 HTTP/1.1\nHost: www.wfuzz.org\nUser-Agent: curl/7.58.0\nAccept: */*\n"
+def pytest_addoption(parser):
+    from transformers.testing_utils import pytest_addoption_shared
 
-    fr = FuzzRequest()
-    fr.update_from_raw_http(raw_req, "http", None, None)
-
-    return FuzzResult(history=fr)
+    pytest_addoption_shared(parser)
 
 
-@pytest.fixture
-def get_plugin():
-    def _get_customer_plugin(name):
-        return [x() for x in Facade().scripts.get_plugins(name)]
+def pytest_terminal_summary(terminalreporter):
+    from transformers.testing_utils import pytest_terminal_summary_main
 
-    return _get_customer_plugin
+    make_reports = terminalreporter.config.getoption("--make-reports")
+    if make_reports:
+        pytest_terminal_summary_main(terminalreporter, id=make_reports)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    # If no tests are collected, pytest exists with code 5, which makes the CI fail.
+    if exitstatus == 5:
+        session.exitstatus = 0
+
+
+# Doctest custom flag to ignore output.
+IGNORE_RESULT = doctest.register_optionflag("IGNORE_RESULT")
+
+OutputChecker = doctest.OutputChecker
+
+
+class CustomOutputChecker(OutputChecker):
+    def check_output(self, want, got, optionflags):
+        if IGNORE_RESULT & optionflags:
+            return True
+        return OutputChecker.check_output(self, want, got, optionflags)
+
+
+doctest.OutputChecker = CustomOutputChecker
+_pytest.doctest.DoctestModule = HfDoctestModule
+doctest.DocTestParser = HfDocTestParser

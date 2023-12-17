@@ -1,163 +1,235 @@
-from wfuzz.fuzzobjects import FuzzWord, FuzzPlugin
-from wfuzz.exception import (
-    FuzzExceptBadFile,
-    FuzzExceptBadOptions,
-    FuzzExceptPluginError,
+# This file is dual licensed under the terms of the Apache License, Version
+# 2.0, and the BSD License. See the LICENSE file in the root of this repository
+# for complete details.
+
+from __future__ import absolute_import, division, print_function
+
+import abc
+
+import six
+
+from cryptography import utils
+from cryptography.exceptions import (
+    AlreadyFinalized, AlreadyUpdated, NotYetFinalized, UnsupportedAlgorithm,
+    _Reasons
 )
-from wfuzz.facade import Facade
-from wfuzz.factories.plugin_factory import plugin_factory
-from wfuzz.helpers.file_func import find_file_in_paths
-
-import sys
-import os
-from distutils import util
-
-# python 2 and 3: iterator
-from builtins import object
+from cryptography.hazmat.backends.interfaces import CipherBackend
+from cryptography.hazmat.primitives.ciphers import modes
 
 
-# Util methods for accessing search results
-class BasePlugin:
-    def __init__(self):
-        self.results_queue = None
-        self.base_fuzz_res = None
+@six.add_metaclass(abc.ABCMeta)
+class CipherAlgorithm(object):
+    @abc.abstractproperty
+    def name(self):
+        """
+        A string naming this mode (e.g. "AES", "Camellia").
+        """
 
-        # check mandatory params, assign default values
-        for name, default_value, required, description in self.parameters:
-            param_name = "{}.{}".format(self.name, name)
+    @abc.abstractproperty
+    def key_size(self):
+        """
+        The size of the key being used as an integer in bits (e.g. 128, 256).
+        """
 
-            if required and param_name not in list(self.kbase.keys()):
-                raise FuzzExceptBadOptions(
-                    "Plugins, missing parameter %s!" % (param_name,)
+
+@six.add_metaclass(abc.ABCMeta)
+class BlockCipherAlgorithm(object):
+    @abc.abstractproperty
+    def block_size(self):
+        """
+        The size of a block as an integer in bits (e.g. 64, 128).
+        """
+
+
+@six.add_metaclass(abc.ABCMeta)
+class CipherContext(object):
+    @abc.abstractmethod
+    def update(self, data):
+        """
+        Processes the provided bytes through the cipher and returns the results
+        as bytes.
+        """
+
+    @abc.abstractmethod
+    def update_into(self, data, buf):
+        """
+        Processes the provided bytes and writes the resulting data into the
+        provided buffer. Returns the number of bytes written.
+        """
+
+    @abc.abstractmethod
+    def finalize(self):
+        """
+        Returns the results of processing the final block as bytes.
+        """
+
+
+@six.add_metaclass(abc.ABCMeta)
+class AEADCipherContext(object):
+    @abc.abstractmethod
+    def authenticate_additional_data(self, data):
+        """
+        Authenticates the provided bytes.
+        """
+
+
+@six.add_metaclass(abc.ABCMeta)
+class AEADDecryptionContext(object):
+    @abc.abstractmethod
+    def finalize_with_tag(self, tag):
+        """
+        Returns the results of processing the final block as bytes and allows
+        delayed passing of the authentication tag.
+        """
+
+
+@six.add_metaclass(abc.ABCMeta)
+class AEADEncryptionContext(object):
+    @abc.abstractproperty
+    def tag(self):
+        """
+        Returns tag bytes. This is only available after encryption is
+        finalized.
+        """
+
+
+class Cipher(object):
+    def __init__(self, algorithm, mode, backend):
+        if not isinstance(backend, CipherBackend):
+            raise UnsupportedAlgorithm(
+                "Backend object does not implement CipherBackend.",
+                _Reasons.BACKEND_MISSING_INTERFACE
+            )
+
+        if not isinstance(algorithm, CipherAlgorithm):
+            raise TypeError("Expected interface of CipherAlgorithm.")
+
+        if mode is not None:
+            mode.validate_for_algorithm(algorithm)
+
+        self.algorithm = algorithm
+        self.mode = mode
+        self._backend = backend
+
+    def encryptor(self):
+        if isinstance(self.mode, modes.ModeWithAuthenticationTag):
+            if self.mode.tag is not None:
+                raise ValueError(
+                    "Authentication tag must be None when encrypting."
                 )
-
-            if param_name not in list(self.kbase.keys()):
-                self.kbase[param_name] = default_value
-
-    def run(self, fuzzresult, control_queue, results_queue):
-        try:
-            self.results_queue = results_queue
-            self.base_fuzz_res = fuzzresult
-            self.process(fuzzresult)
-        except Exception as e:
-            results_queue.put(plugin_factory.create("plugin_from_error", self.name, e))
-        finally:
-            control_queue.get()
-            control_queue.task_done()
-            return
-
-    def process(self, fuzzresult):
-        """
-        This is were the plugin processing is done. Any wfuzz plugin must implement this method, do its job with the fuzzresult received and:
-        - queue_url: if it is a discovery plugin enqueing more HTTP request that at some point will generate more results
-        - add_result: Add information about the obtained results after the processing with an accurate description
-
-        A kbase (get_kbase, has_kbase, add_kbase) is shared between all plugins. this can be used to store and retrieve relevant "collaborative" information.
-        """
-        raise NotImplementedError
-
-    def validate(self):
-        raise FuzzExceptPluginError("Method count not implemented")
-
-    def add_result(self, itype, issue, data, severity=FuzzPlugin.INFO):
-        self.results_queue.put(
-            plugin_factory.create(
-                "plugin_from_finding", self.name, itype, issue, data, severity
-            )
+        ctx = self._backend.create_symmetric_encryption_ctx(
+            self.algorithm, self.mode
         )
+        return self._wrap_ctx(ctx, encrypt=True)
 
-    def queue_url(self, url):
-        self.results_queue.put(
-            plugin_factory.create(
-                "plugin_from_recursion", self.name, self.base_fuzz_res, url
-            )
+    def decryptor(self):
+        ctx = self._backend.create_symmetric_decryption_ctx(
+            self.algorithm, self.mode
         )
+        return self._wrap_ctx(ctx, encrypt=False)
 
-    def _bool(self, value):
-        return bool(util.strtobool(value))
-
-
-class BasePrinter:
-    def __init__(self, output):
-        self.f = None
-        if output:
-            try:
-                self.f = open(output, "w")
-            except IOError as e:
-                raise FuzzExceptBadFile("Error opening file. %s" % str(e))
+    def _wrap_ctx(self, ctx, encrypt):
+        if isinstance(self.mode, modes.ModeWithAuthenticationTag):
+            if encrypt:
+                return _AEADEncryptionContext(ctx)
+            else:
+                return _AEADCipherContext(ctx)
         else:
-            self.f = sys.stdout
-
-        self.verbose = Facade().printers.kbase["verbose"]
-
-    def header(self):
-        raise FuzzExceptPluginError("Method header not implemented")
-
-    def footer(self):
-        raise FuzzExceptPluginError("Method footer not implemented")
-
-    def result(self):
-        raise FuzzExceptPluginError("Method result not implemented")
+            return _CipherContext(ctx)
 
 
-class BasePayload(object):
-    def __init__(self, params):
-        self.params = params
+@utils.register_interface(CipherContext)
+class _CipherContext(object):
+    def __init__(self, ctx):
+        self._ctx = ctx
 
-        # default params
-        if "default" in self.params:
-            self.params[self.default_parameter] = self.params["default"]
+    def update(self, data):
+        if self._ctx is None:
+            raise AlreadyFinalized("Context was already finalized.")
+        return self._ctx.update(data)
 
-            if not self.default_parameter:
-                raise FuzzExceptBadOptions("Too many plugin parameters specified")
+    def update_into(self, data, buf):
+        if self._ctx is None:
+            raise AlreadyFinalized("Context was already finalized.")
+        return self._ctx.update_into(data, buf)
 
-        # Check for allowed parameters
-        if [
-            k
-            for k in list(self.params.keys())
-            if k not in [x[0] for x in self.parameters]
-            and k not in ["encoder", "default"]
-        ]:
-            raise FuzzExceptBadOptions(
-                "Plugin %s, unknown parameter specified!" % (self.name)
+    def finalize(self):
+        if self._ctx is None:
+            raise AlreadyFinalized("Context was already finalized.")
+        data = self._ctx.finalize()
+        self._ctx = None
+        return data
+
+
+@utils.register_interface(AEADCipherContext)
+@utils.register_interface(CipherContext)
+@utils.register_interface(AEADDecryptionContext)
+class _AEADCipherContext(object):
+    def __init__(self, ctx):
+        self._ctx = ctx
+        self._bytes_processed = 0
+        self._aad_bytes_processed = 0
+        self._tag = None
+        self._updated = False
+
+    def _check_limit(self, data_size):
+        if self._ctx is None:
+            raise AlreadyFinalized("Context was already finalized.")
+        self._updated = True
+        self._bytes_processed += data_size
+        if self._bytes_processed > self._ctx._mode._MAX_ENCRYPTED_BYTES:
+            raise ValueError(
+                "{} has a maximum encrypted byte limit of {}".format(
+                    self._ctx._mode.name, self._ctx._mode._MAX_ENCRYPTED_BYTES
+                )
             )
 
-        # check mandatory params, assign default values
-        for name, default_value, required, description in self.parameters:
-            if required and name not in self.params:
-                raise FuzzExceptBadOptions(
-                    "Plugin %s, missing parameter %s!" % (self.name, name)
+    def update(self, data):
+        self._check_limit(len(data))
+        return self._ctx.update(data)
+
+    def update_into(self, data, buf):
+        self._check_limit(len(data))
+        return self._ctx.update_into(data, buf)
+
+    def finalize(self):
+        if self._ctx is None:
+            raise AlreadyFinalized("Context was already finalized.")
+        data = self._ctx.finalize()
+        self._tag = self._ctx.tag
+        self._ctx = None
+        return data
+
+    def finalize_with_tag(self, tag):
+        if self._ctx is None:
+            raise AlreadyFinalized("Context was already finalized.")
+        data = self._ctx.finalize_with_tag(tag)
+        self._tag = self._ctx.tag
+        self._ctx = None
+        return data
+
+    def authenticate_additional_data(self, data):
+        if self._ctx is None:
+            raise AlreadyFinalized("Context was already finalized.")
+        if self._updated:
+            raise AlreadyUpdated("Update has been called on this context.")
+
+        self._aad_bytes_processed += len(data)
+        if self._aad_bytes_processed > self._ctx._mode._MAX_AAD_BYTES:
+            raise ValueError(
+                "{} has a maximum AAD byte limit of {}".format(
+                    self._ctx._mode.name, self._ctx._mode._MAX_AAD_BYTES
                 )
+            )
 
-            if name not in self.params:
-                self.params[name] = default_value
+        self._ctx.authenticate_additional_data(data)
 
-    def get_type(self):
-        raise FuzzExceptPluginError("Method get_type not implemented")
 
-    def get_next(self):
-        raise FuzzExceptPluginError("Method get_next not implemented")
-
-    def __next__(self):
-        return FuzzWord(self.get_next(), self.get_type())
-
-    def count(self):
-        raise FuzzExceptPluginError("Method count not implemented")
-
-    def __iter__(self):
-        return self
-
-    def close(self):
-        pass
-
-    def find_file(self, name):
-        if os.path.exists(name):
-            return name
-
-        for pa in Facade().sett.get("general", "lookup_dirs").split(","):
-            fn = find_file_in_paths(name, pa)
-
-            if fn is not None:
-                return fn
-
-        return name
+@utils.register_interface(AEADEncryptionContext)
+class _AEADEncryptionContext(_AEADCipherContext):
+    @property
+    def tag(self):
+        if self._ctx is not None:
+            raise NotYetFinalized("You must finalize encryption before "
+                                  "getting the tag.")
+        return self._tag

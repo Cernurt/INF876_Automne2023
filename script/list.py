@@ -1,258 +1,177 @@
-# list.py
+# Copyright The Lightning AI team.
 #
-# Copyright 2022 brombinmirko <send@mirko.pm>
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, in version 3 of the License.
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
-#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-from datetime import datetime
-from gettext import gettext as _
+import typing as t
 
-from gi.repository import Gtk, GLib, Adw
+from lightning.app.utilities.app_helpers import _LightningAppRef, _set_child_name
 
-from bottles.backend.models.config import BottleConfig
-from bottles.backend.models.result import Result
-from bottles.backend.state import Signals, SignalManager
-from bottles.backend.utils.threading import RunAsync
-from bottles.backend.wine.executor import WineExecutor
-from bottles.frontend.utils.filters import add_executable_filters, add_all_filters
+T = t.TypeVar("T")
+
+if t.TYPE_CHECKING:
+    from lightning.app.utilities.types import Component
 
 
-@Gtk.Template(resource_path='/com/usebottles/bottles/list-entry.ui')
-class BottleViewEntry(Adw.ActionRow):
-    __gtype_name__ = 'BottleViewEntry'
-
-    Adw.init()
-
-    # region Widgets
-    btn_run = Gtk.Template.Child()
-    btn_repair = Gtk.Template.Child()
-    btn_run_executable = Gtk.Template.Child()
-    details_image = Gtk.Template.Child()
-    label_env = Gtk.Template.Child()
-    label_state = Gtk.Template.Child()
-    icon_damaged = Gtk.Template.Child()
-    grid_versioning = Gtk.Template.Child()
-    spinner = Gtk.Template.Child()
-
-    # endregion
-
-    def __init__(self, window, config: BottleConfig, **kwargs):
-        super().__init__(**kwargs)
-
-        # common variables and references
-        self.window = window
-        self.manager = window.manager
-        self.config = config
-        self.label_env_context = self.label_env.get_style_context()
-
-        '''Format update date'''
-        update_date = _("N/A")
-        if self.config.Update_Date:
-            try:
-                temp_date = datetime.strptime(self.config.Update_Date, "%Y-%m-%d %H:%M:%S.%f")
-                update_date = temp_date.strftime("%d %B, %Y %H:%M:%S")
-            except ValueError:
-                update_date = _("N/A")
-
-        '''Check runner type by name'''
-        if self.config.Runner.startswith("lutris"):
-            self.runner_type = "wine"
-        else:
-            self.runner_type = "proton"
-
-        # connect signals
-        activate_handler = self.connect('activated', self.show_details)
-        self.btn_run.connect("clicked", self.run_executable)
-        self.btn_repair.connect("clicked", self.repair)
-        self.btn_run_executable.connect("clicked", self.run_executable)
-
-        # populate widgets
-        self.grid_versioning.set_visible(self.config.Versioning)
-        self.label_state.set_text(str(self.config.State))
-        self.set_title(self.config.Name)
-        if self.window.settings.get_boolean("update-date"):
-            self.set_subtitle(update_date)
-        self.label_env.set_text(_(self.config.Environment))
-        self.label_env_context.add_class(
-            "tag-%s" % self.config.Environment.lower())
-
-        # Set tooltip text
-        self.btn_run.set_tooltip_text(_(f"Run executable in \"{self.config.Name}\""))
-
-        '''If config is broken'''
-        if self.config.get("Broken"):
-            for w in [self.btn_repair, self.icon_damaged]:
-                w.set_visible(True)
-                w.set_sensitive(True)
-
-            self.btn_run.set_sensitive(False)
-            self.handler_block_by_func(self.show_details)
-
-    '''Repair bottle'''
-
-    def repair(self, widget):
-        self.disable()
-        RunAsync(
-            task_func=self.manager.repair_bottle,
-            config=self.config
-        )
-
-    '''Display file dialog for executable'''
-
-    def run_executable(self, *_args):
-        def set_path(_dialog, response):
-            if response != Gtk.ResponseType.ACCEPT:
-                return
-
-            self.window.show_toast(_("Launching \"{0}\" in \"{1}\"…").format(
-                    dialog.get_file().get_basename(),
-                    self.config.Name)
-                )
-
-            path = dialog.get_file().get_path()
-            _executor = WineExecutor(self.config, exec_path=path)
-            RunAsync(_executor.run)
-
-        dialog = Gtk.FileChooserNative.new(
-            title=_("Select Executable"),
-            action=Gtk.FileChooserAction.OPEN,
-            parent=self.window,
-            accept_label=_("Run")
-        )
-
-        add_executable_filters(dialog)
-        add_all_filters(dialog)
-        dialog.set_modal(True)
-        dialog.connect("response", set_path)
-        dialog.show()
-
-    def show_details(self, widget=None, config=None):
-        if config is None:
-            config = self.config
-        self.window.page_details.view_preferences.update_combo_components()
-        self.window.show_details_view(config=config)
-
-    def disable(self):
-        self.window.go_back()
-        self.set_visible(False)
+def _prepare_name(component: "Component") -> str:
+    return str(component.name.split(".")[-1])
 
 
-@Gtk.Template(resource_path='/com/usebottles/bottles/list.ui')
-class BottleView(Adw.Bin):
-    __gtype_name__ = 'BottleView'
-    __bottles = {}
+# TODO: add support and tests for list operations (concatenation, deletion, insertion, etc.)
+class List(t.List[T]):
+    def __init__(self, *items: T):
+        """The List Object is used to represents list collection of :class:`~lightning.app.core.work.LightningWork` or
+        :class:`~lightning.app.core.flow.LightningFlow`.
 
-    # region Widgets
-    list_bottles = Gtk.Template.Child()
-    list_steam = Gtk.Template.Child()
-    group_bottles = Gtk.Template.Child()
-    group_steam = Gtk.Template.Child()
-    pref_page = Gtk.Template.Child()
-    bottle_status = Gtk.Template.Child()
-    btn_create = Gtk.Template.Child()
-    entry_search = Gtk.Template.Child()
-    search_bar = Gtk.Template.Child()
-    no_bottles_found = Gtk.Template.Child()
+        Example:
 
-    # endregion
+            >>> from lightning.app import LightningFlow, LightningWork
+            >>> from lightning.app.structures import List
+            >>> class CounterWork(LightningWork):
+            ...     def __init__(self):
+            ...         super().__init__()
+            ...         self.counter = 0
+            ...     def run(self):
+            ...         self.counter += 1
+            ...
+            >>> class RootFlow(LightningFlow):
+            ...     def __init__(self):
+            ...         super().__init__()
+            ...         self.list = List(*[CounterWork(), CounterWork()])
+            ...     def run(self):
+            ...         for work in self.list:
+            ...             work.run()
+            ...
+            >>> flow = RootFlow()
+            >>> flow.run()
+            >>> assert flow.list[0].counter == 1
 
-    def __init__(self, window, arg_bottle=None, **kwargs):
-        super().__init__(**kwargs)
+        Arguments:
+            items: A sequence of LightningWork or LightningFlow.
 
-        # common variables and references
-        self.window = window
-        self.arg_bottle = arg_bottle
-
-        # connect signals
-        self.btn_create.connect("clicked", self.window.show_add_view)
-        self.entry_search.connect('changed', self.__search_bottles)
-
-        # backend signals
-        SignalManager.connect(Signals.ManagerLocalBottlesLoaded, self.backend_local_bottle_loaded)
-
-        self.update_bottles()
-
-    def __search_bottles(self, widget, event=None, data=None):
         """
-        This function search in the list of bottles the
-        text written in the search entry.
-        """
-        terms = widget.get_text()
-        self.list_bottles.set_filter_func(
-            self.__filter_bottles,
-            terms
-        )
+        super().__init__()
+        from lightning.app.runners.backends import Backend
 
-    @staticmethod
-    def __filter_bottles(row, terms=None):
-        text = row.get_title().lower()
-        if terms.lower() in text:
-            return True
-        return False
+        self._name: t.Optional[str] = ""
+        self._last_index = 0
+        self._backend: t.Optional[Backend] = None
+        for item in items:
+            self.append(item)
 
-    def idle_update_bottles(self, show=False):
-        self.__bottles = {}
-        while self.list_bottles.get_first_child():
-            self.list_bottles.remove(self.list_bottles.get_first_child())
+    def append(self, v):
+        from lightning.app.core import LightningFlow, LightningWork
 
-        while self.list_steam.get_first_child():
-            self.list_steam.remove(self.list_steam.get_first_child())
+        _set_child_name(self, v, str(self._last_index))
+        if self._backend:
+            if isinstance(v, LightningFlow):
+                LightningFlow._attach_backend(v, self._backend)
+            elif isinstance(v, LightningWork):
+                self._backend._wrap_run_method(_LightningAppRef().get_current(), v)
+        v._name = f"{self.name}.{self._last_index}"
+        self._last_index += 1
+        super().append(v)
 
-        local_bottles = self.window.manager.local_bottles
+    @property
+    def name(self):
+        """Returns the name of this List object."""
+        return self._name or "root"
 
-        if len(local_bottles) == 0:
-            self.pref_page.set_visible(False)
-            self.bottle_status.set_visible(True)
-        else:
-            self.pref_page.set_visible(True)
-            self.bottle_status.set_visible(False)
+    @property
+    def works(self):
+        from lightning.app.core import LightningFlow, LightningWork
 
-        for name, config in local_bottles.items():
-            _entry = BottleViewEntry(self.window, config)
-            self.__bottles[config.Path] = _entry
+        works = [item for item in self if isinstance(item, LightningWork)]
+        for flow in [item for item in self if isinstance(item, LightningFlow)]:
+            for child_work in flow.works(recurse=False):
+                works.append(child_work)
+        return works
 
-            if config.Environment != "Steam":
-                self.list_bottles.append(_entry)
-            else:
-                self.list_steam.append(_entry)
+    @property
+    def flows(self):
+        from lightning.app.core import LightningFlow
+        from lightning.app.structures import Dict as _Dict
+        from lightning.app.structures import List as _List
 
-            if self.list_steam.get_first_child() is None:
-                self.group_steam.set_visible(False)
-                self.group_bottles.set_title("")
-            else:
-                self.group_steam.set_visible(True)
-                self.group_bottles.set_title(_("Your Bottles"))
+        flows = {}
+        for item in self:
+            if isinstance(item, LightningFlow):
+                flows[item.name] = item
+                for child_flow in item.flows.values():
+                    flows[child_flow.name] = child_flow
+            if isinstance(item, (_Dict, _List)):
+                for child_flow in item.flows.values():
+                    flows[child_flow.name] = child_flow
+        return flows
 
-        if (self.arg_bottle is not None and self.arg_bottle in local_bottles.keys()) \
-                or (show is not None and show in local_bottles.keys()):
-            _config = None
-            if self.arg_bottle:
-                _config = local_bottles[self.arg_bottle]
-            if show:
-                _config = local_bottles[show]
-            if not _config:
-                raise NotImplementedError("neither 'arg_bottle' nor 'show' are set")
+    @property
+    def state(self):
+        """Returns the state of its flows and works."""
+        from lightning.app.core import LightningFlow, LightningWork
 
-            self.window.page_details.view_preferences.update_combo_components()
-            self.window.show_details_view(config=_config)
-            self.arg_bottle = None
+        works = [item for item in self if isinstance(item, LightningWork)]
+        children = [item for item in self if isinstance(item, LightningFlow)]
+        return {
+            "works": {_prepare_name(w): w.state for w in works},
+            "flows": {_prepare_name(flow): flow.state for flow in children},
+        }
 
-    def backend_local_bottle_loaded(self, _: Result):
-        self.update_bottles()
+    @property
+    def state_vars(self):
+        from lightning.app.core import LightningFlow, LightningWork
 
-    def update_bottles(self, show=False):
-        GLib.idle_add(self.idle_update_bottles, show)
+        works = [item for item in self if isinstance(item, LightningWork)]
+        children = [item for item in self if isinstance(item, LightningFlow)]
+        return {
+            "works": {_prepare_name(w): w.state_vars for w in works},
+            "flows": {_prepare_name(flow): flow.state_vars for flow in children},
+        }
 
-    def disable_bottle(self, config):
-        self.__bottles[config.Path].disable()
+    @property
+    def state_with_changes(self):
+        from lightning.app.core import LightningFlow, LightningWork
+
+        works = [item for item in self if isinstance(item, LightningWork)]
+        children = [item for item in self if isinstance(item, LightningFlow)]
+        return {
+            "works": {str(_prepare_name(w)): w.state_with_changes for w in works},
+            "flows": {_prepare_name(flow): flow.state_with_changes for flow in children},
+        }
+
+    def set_state(self, state):
+        """Method to set the state of the list and its children."""
+        from lightning.app.core import LightningFlow, LightningWork
+
+        works = [item for item in self if isinstance(item, LightningWork)]
+        children = [item for item in self if isinstance(item, LightningFlow)]
+
+        current_state_keys = {_prepare_name(w) for w in self}
+        state_keys = set(list(state["works"].keys()) + list(state["flows"].keys()))
+
+        if current_state_keys != state_keys:
+            key_diff = (current_state_keys - state_keys) | (state_keys - current_state_keys)
+            raise Exception(
+                f"The provided state doesn't match the `List` {self.name}. Found `{key_diff}` un-matching keys"
+            )
+
+        for work_key, work_state in state["works"].items():
+            for work in works:
+                if _prepare_name(work) == work_key:
+                    work.set_state(work_state)
+        for child_key, child_state in state["flows"].items():
+            for child in children:
+                if _prepare_name(child) == child_key:
+                    child.set_state(child_state)
+
+    def __len__(self):
+        """Returns the number of elements within this List."""
+        return sum(1 for _ in self)

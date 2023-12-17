@@ -1,226 +1,198 @@
+# Owner(s): ["oncall: package/deploy"]
+
+from io import BytesIO
+from textwrap import dedent
+from unittest import skipIf
+
 import torch
-import pytest
-import sys
+from torch.package import PackageExporter, PackageImporter, sys_importer
+from torch.testing._internal.common_utils import IS_FBCODE, IS_SANDCASTLE, run_tests
+
+try:
+    from torchvision.models import resnet18
+
+    HAS_TORCHVISION = True
+except ImportError:
+    HAS_TORCHVISION = False
+skipIfNoTorchVision = skipIf(not HAS_TORCHVISION, "no torchvision")
+
+try:
+    from .common import PackageTestCase
+except ImportError:
+    # Support the case where we run this file directly.
+    from common import PackageTestCase
 
 
-def copy_mlp(llama_mlp, orig_llama_mlp) -> None:
-    orig_llama_mlp.w1.weight.copy_(llama_mlp.c_fc1.weight)
-    orig_llama_mlp.w3.weight.copy_(llama_mlp.c_fc2.weight)
-    orig_llama_mlp.w2.weight.copy_(llama_mlp.c_proj.weight)
+@skipIf(True, "Does not work with recent torchvision, see https://github.com/pytorch/pytorch/issues/81115")
+@skipIfNoTorchVision
+class ModelTest(PackageTestCase):
+    """End-to-end tests packaging an entire model."""
 
-
-def copy_attention(llama_attn, orig_llama_attn) -> None:
-    n_embd = llama_attn.c_attn.weight.shape[1]
-    orig_llama_attn.wq.weight.copy_(llama_attn.c_attn.weight[:n_embd])
-    orig_llama_attn.wk.weight.copy_(llama_attn.c_attn.weight[n_embd:-n_embd])
-    orig_llama_attn.wv.weight.copy_(llama_attn.c_attn.weight[-n_embd:])
-    orig_llama_attn.wo.weight.copy_(llama_attn.c_proj.weight)
-
-
-def copy_block(llama_block, orig_llama_block) -> None:
-    orig_llama_block.attention_norm.weight.copy_(llama_block.rms_1.scale)
-    copy_attention(llama_block.attn, orig_llama_block.attention)
-    orig_llama_block.ffn_norm.weight.copy_(llama_block.rms_2.scale)
-    copy_mlp(llama_block.mlp, orig_llama_block.feed_forward)
-
-
-def copy_weights(llama_model, orig_llama_model) -> None:
-    orig_llama_model.tok_embeddings.weight.copy_(llama_model.transformer.wte.weight)
-    for llama_block, orig_llama_block in zip(llama_model.transformer.h, orig_llama_model.layers):
-        copy_block(llama_block, orig_llama_block)
-    orig_llama_model.norm.weight.copy_(llama_model.transformer.ln_f.scale)
-    orig_llama_model.output.weight.copy_(llama_model.lm_head.weight)
-
-
-@torch.no_grad()
-@pytest.mark.parametrize("kv_cache", (False, True))
-def test_to_orig_llama(lit_llama, orig_llama, kv_cache) -> None:
-    block_size = 64
-    vocab_size = 32000
-    n_layer = 16
-    n_head = 16
-    n_embd = 32
-    batch_size = 3
-
-    llama_config = lit_llama.LLaMAConfig(
-        block_size=block_size, vocab_size=vocab_size, n_layer=n_layer, n_head=n_head, n_embd=n_embd
+    @skipIf(
+        IS_FBCODE or IS_SANDCASTLE,
+        "Tests that use temporary files are disabled in fbcode",
     )
-    orig_llama_config = orig_llama.ModelArgs(
-        dim=n_embd,
-        n_layers=n_layer,
-        n_heads=n_head,
-        vocab_size=vocab_size,
-        norm_eps=1e-5,
-        max_seq_len=block_size,
-        max_batch_size=batch_size,
-    )
+    def test_resnet(self):
+        resnet = resnet18()
 
-    seq_len = orig_llama_config.max_seq_len
-    token_sample = torch.randint(0, orig_llama_config.vocab_size, size=(batch_size, seq_len), dtype=torch.int64)
+        f1 = self.temp()
 
-    llama_model = lit_llama.LLaMA(llama_config)
-    llama_model.apply(llama_model._init_weights)
-    orig_llama_model = orig_llama.Transformer(orig_llama_config)
+        # create a package that will save it along with its code
+        with PackageExporter(f1) as e:
+            # put the pickled resnet in the package, by default
+            # this will also save all the code files references by
+            # the objects in the pickle
+            e.intern("**")
+            e.save_pickle("model", "model.pkl", resnet)
 
-    copy_weights(llama_model, orig_llama_model)
+        # we can now load the saved model
+        i = PackageImporter(f1)
+        r2 = i.load_pickle("model", "model.pkl")
 
-    orig_llama_embed = orig_llama_model.tok_embeddings(token_sample)
-    llama_embed = llama_model.transformer.wte(token_sample)
-    assert torch.allclose(orig_llama_embed, llama_embed)
+        # test that it works
+        input = torch.rand(1, 3, 224, 224)
+        ref = resnet(input)
+        self.assertEqual(r2(input), ref)
 
-    llama_rope = llama_model.build_rope_cache(token_sample)
-    llama_mask = llama_model.build_mask_cache(token_sample)
-    orig_llama_mask = torch.full((1, 1, seq_len, seq_len), float("-inf"))
-    orig_llama_mask = torch.triu(orig_llama_mask, diagonal=1)
-    if kv_cache:
-        orig_llama_block_out = orig_llama_model.layers[0](
-            orig_llama_embed, 0, orig_llama_model.freqs_cis[:seq_len], orig_llama_mask
-        )
-        theirs_k_cache = orig_llama_model.layers[0].attention.cache_k
-        theirs_v_cache = orig_llama_model.layers[0].attention.cache_v
-        head_size = n_embd // n_head
-        kv_cache_shape = (batch_size, n_head, block_size, head_size)
-        ours_kv_cache = torch.zeros(kv_cache_shape), torch.zeros(kv_cache_shape)
-        (llama_block_out, ours_kv_cache) = llama_model.transformer.h[0](
-            llama_embed, llama_rope, llama_mask, seq_len, torch.arange(block_size), ours_kv_cache
-        )
-        ours_k_cache = ours_kv_cache[0].permute(0, 2, 1, 3)
-        ours_v_cache = ours_kv_cache[1].permute(0, 2, 1, 3)
-        torch.testing.assert_close(ours_k_cache, theirs_k_cache)
-        torch.testing.assert_close(ours_v_cache, theirs_v_cache)
-    else:
-        orig_llama_block_out = orig_llama_model.layers[0](
-            orig_llama_embed, 0, orig_llama_model.freqs_cis[:seq_len], orig_llama_mask
-        )
-        (llama_block_out, _) = llama_model.transformer.h[0](llama_embed, llama_rope, llama_mask, seq_len)
-    assert torch.allclose(orig_llama_block_out, llama_block_out)
+        # functions exist also to get at the private modules in each package
+        torchvision = i.import_module("torchvision")
 
-    expected = orig_llama_model(token_sample, 0)
-    out = llama_model(token_sample)
-    assert torch.allclose(out, expected)
+        f2 = BytesIO()
+        # if we are doing transfer learning we might want to re-save
+        # things that were loaded from a package.
+        # We need to tell the exporter about any modules that
+        # came from imported packages so that it can resolve
+        # class names like torchvision.models.resnet.ResNet
+        # to their source code.
+        with PackageExporter(f2, importer=(i, sys_importer)) as e:
+            # e.importers is a list of module importing functions
+            # that by default contains importlib.import_module.
+            # it is searched in order until the first success and
+            # that module is taken to be what torchvision.models.resnet
+            # should be in this code package. In the case of name collisions,
+            # such as trying to save a ResNet from two different packages,
+            # we take the first thing found in the path, so only ResNet objects from
+            # one importer will work. This avoids a bunch of name mangling in
+            # the source code. If you need to actually mix ResNet objects,
+            # we suggest reconstructing the model objects using code from a single package
+            # using functions like save_state_dict and load_state_dict to transfer state
+            # to the correct code objects.
+            e.intern("**")
+            e.save_pickle("model", "model.pkl", r2)
 
+        f2.seek(0)
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
-@torch.no_grad()
-def test_bfloat16_llama_init(lit_llama, orig_llama) -> None:
-    from lit_llama.utils import EmptyInitOnDevice
+        i2 = PackageImporter(f2)
+        r3 = i2.load_pickle("model", "model.pkl")
+        self.assertEqual(r3(input), ref)
 
-    block_size = 64
-    vocab_size = 32000
-    n_layer = 16
-    n_head = 16
-    n_embd = 32
+    @skipIfNoTorchVision
+    def test_model_save(self):
 
-    llama_config = lit_llama.LLaMAConfig(
-        block_size=block_size, vocab_size=vocab_size, n_layer=n_layer, n_head=n_head, n_embd=n_embd
-    )
-    llama_model = lit_llama.LLaMA(llama_config)
-    llama_model.apply(llama_model._init_weights)
+        # This example shows how you might package a model
+        # so that the creator of the model has flexibility about
+        # how they want to save it but the 'server' can always
+        # use the same API to load the package.
 
-    batch_size = 3
+        # The convension is for each model to provide a
+        # 'model' package with a 'load' function that actual
+        # reads the model out of the archive.
 
-    token_sample = torch.randint(0, vocab_size, size=(batch_size, block_size), dtype=torch.int64)
+        # How the load function is implemented is up to the
+        # the packager.
 
-    expected = llama_model(token_sample)
+        # get our normal torchvision resnet
+        resnet = resnet18()
 
-    with EmptyInitOnDevice(device="cuda", dtype=torch.bfloat16):
-        llama_model2 = lit_llama.LLaMA(llama_config)
-    llama_model2.load_state_dict(llama_model.state_dict(keep_vars=True))
+        f1 = BytesIO()
+        # Option 1: save by pickling the whole model
+        # + single-line, similar to torch.jit.save
+        # - more difficult to edit the code after the model is created
+        with PackageExporter(f1) as e:
+            e.intern("**")
+            e.save_pickle("model", "pickled", resnet)
+            # note that this source is the same for all models in this approach
+            # so it can be made part of an API that just takes the model and
+            # packages it with this source.
+            src = dedent(
+                """\
+                import importlib
+                import torch_package_importer as resources
 
-    out = llama_model2(token_sample.cuda()).float().cpu()
-    torch.testing.assert_close(out, expected, atol=5e-3, rtol=1e-3)
+                # server knows to call model.load() to get the model,
+                # maybe in the future it passes options as arguments by convension
+                def load():
+                    return resources.load_pickle('model', 'pickled')
+                """
+            )
+            e.save_source_string("model", src, is_package=True)
 
+        f2 = BytesIO()
+        # Option 2: save with state dict
+        # - more code to write to save/load the model
+        # + but this code can be edited later to adjust adapt the model later
+        with PackageExporter(f2) as e:
+            e.intern("**")
+            e.save_pickle("model", "state_dict", resnet.state_dict())
+            src = dedent(
+                """\
+                import importlib
+                import torch_package_importer as resources
 
-def copy_adapter_weights(llama_model, orig_llama_model) -> None:
-    # copy the gating parameter
-    for llama_block, orig_llama_block in zip(llama_model.transformer.h, orig_llama_model.layers):
-        if hasattr(llama_block.attn, "gating_factor"):
-            llama_block.attn.gating_factor.copy_(orig_llama_block.attention.gate)
+                from torchvision.models.resnet import resnet18
+                def load():
+                    # if you want, you can later edit how resnet is constructed here
+                    # to edit the model in the package, while still loading the original
+                    # state dict weights
+                    r = resnet18()
+                    state_dict = resources.load_pickle('model', 'state_dict')
+                    r.load_state_dict(state_dict)
+                    return r
+                """
+            )
+            e.save_source_string("model", src, is_package=True)
 
-    # In the original model, there is one embedding layer for all blocks combined
-    orig_adapter_wte = orig_llama_model.adapter_query.weight.reshape(
-        orig_llama_model.params.adapter_layer, orig_llama_model.params.adapter_len, orig_llama_model.params.dim
-    )
+        # regardless of how we chose to package, we can now use the model in a server in the same way
+        input = torch.rand(1, 3, 224, 224)
+        results = []
+        for m in [f1, f2]:
+            m.seek(0)
+            importer = PackageImporter(m)
+            the_model = importer.import_module("model").load()
+            r = the_model(input)
+            results.append(r)
 
-    # In ours, the embedding layer is split across the individual attention layers
-    index = 0
-    for llama_block in llama_model.transformer.h:
-        if hasattr(llama_block.attn, "adapter_wte"):
-            llama_block.attn.adapter_wte.weight.copy_(orig_adapter_wte[index])
-            index += 1
+        self.assertEqual(*results)
 
+    @skipIfNoTorchVision
+    def test_script_resnet(self):
+        resnet = resnet18()
 
-def enable_gate(model):
-    for name, param in model.named_parameters():
-        if "gating_factor" in name or "gate" in name:
-            param.fill_(1)
+        f1 = BytesIO()
+        # Option 1: save by pickling the whole model
+        # + single-line, similar to torch.jit.save
+        # - more difficult to edit the code after the model is created
+        with PackageExporter(f1) as e:
+            e.intern("**")
+            e.save_pickle("model", "pickled", resnet)
 
+        f1.seek(0)
 
-@torch.no_grad()
-def test_adapter_parity(orig_llama_adapter):
-    """Test parity between our implementation of LLaMA-Adapter and the reference code."""
-    import lit_llama.adapter as lit_llama
+        i = PackageImporter(f1)
+        loaded = i.load_pickle("model", "pickled")
 
-    orig_llama = orig_llama_adapter
+        # Model should script successfully.
+        scripted = torch.jit.script(loaded)
 
-    block_size = 32
-    vocab_size = 100
-    n_layer = 2
-    n_head = 4
-    n_embd = 16
-    adapter_prompt_length: int = 10
-    adapter_start_layer: int = 0
+        # Scripted model should save and load successfully.
+        f2 = BytesIO()
+        torch.jit.save(scripted, f2)
+        f2.seek(0)
+        loaded = torch.jit.load(f2)
 
-    llama_config = lit_llama.LLaMAConfig(
-        block_size=block_size,
-        vocab_size=vocab_size,
-        n_layer=n_layer,
-        n_head=n_head,
-        n_embd=n_embd,
-        adapter_prompt_length=adapter_prompt_length,
-        adapter_start_layer=adapter_start_layer,
-    )
-    orig_llama_config = orig_llama.ModelArgs(
-        dim=n_embd,
-        n_layers=n_layer,
-        n_heads=n_head,
-        vocab_size=vocab_size,
-        norm_eps=1e-5,
-        max_seq_len=block_size,
-        adapter_len=adapter_prompt_length,
-        adapter_layer=(n_layer - adapter_start_layer),
-    )
-
-    batch_size = 3
-    token_sample = torch.randint(
-        0, orig_llama_config.vocab_size, size=(batch_size, orig_llama_config.max_seq_len), dtype=torch.int64
-    )
-
-    llama_model = lit_llama.LLaMA(llama_config)
-    llama_model.apply(llama_model._init_weights)
-    orig_llama_model = orig_llama.Transformer(orig_llama_config)
-
-    copy_weights(llama_model, orig_llama_model)
-    copy_adapter_weights(llama_model, orig_llama_model)
-
-    # make the gate non-zero, otherwise the adapter is disabled and the model
-    # identical to regular LLaMA
-    enable_gate(llama_model)
-    enable_gate(orig_llama_model)
-
-    expected = orig_llama_model(token_sample, 0)
-    out = llama_model(token_sample)
-    assert torch.allclose(out, expected)
+        input = torch.rand(1, 3, 224, 224)
+        self.assertEqual(loaded(input), resnet(input))
 
 
-@pytest.mark.skipif(sys.platform in ("win32", "darwin"), reason="torch.compile not supported on this platform")
-def test_model_compile(lit_llama):
-    llama_config = lit_llama.LLaMAConfig(block_size=8, vocab_size=8, n_layer=2, n_head=2, n_embd=4)
-    model = lit_llama.LLaMA(llama_config)
-    model.apply(model._init_weights)
-
-    model = torch.compile(model)
-
-    sample = torch.randint(model.config.vocab_size, size=(2, model.config.block_size), dtype=torch.int64)
-    for _ in range(3):
-        _ = model(sample)
+if __name__ == "__main__":
+    run_tests()

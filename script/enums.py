@@ -1,138 +1,105 @@
-#!/usr/bin/env python
+import graphene
 
-"""
-Copyright (c) 2014-2023 Maltrail developers (https://github.com/stamparm/maltrail/)
-See the file 'LICENSE' for copying permission
-"""
+from ...payment import (
+    ChargeStatus,
+    StorePaymentMethod,
+    TokenizedPaymentFlow,
+    TransactionAction,
+    TransactionEventType,
+    TransactionKind,
+)
+from ...payment.interface import (
+    PaymentGatewayInitializeTokenizationResult,
+    PaymentMethodTokenizationResult,
+    StoredPaymentMethodRequestDeleteResult,
+)
+from ..core.doc_category import DOC_CATEGORY_PAYMENTS
+from ..core.enums import to_enum
+from ..core.types import BaseEnum
 
-import sys
+TransactionKindEnum = to_enum(TransactionKind, type_name="TransactionKind")
+TransactionKindEnum.doc_category = DOC_CATEGORY_PAYMENTS
 
-from thirdparty import six
+PaymentChargeStatusEnum = to_enum(ChargeStatus, type_name="PaymentChargeStatusEnum")
+PaymentChargeStatusEnum.doc_category = DOC_CATEGORY_PAYMENTS
 
-class _(type):
-    def __getattr__(self, attr):
-        return attr
+TransactionActionEnum = to_enum(
+    TransactionAction,
+    type_name="TransactionActionEnum",
+    description=TransactionAction.__doc__,
+)
+TransactionActionEnum.doc_category = DOC_CATEGORY_PAYMENTS
 
-@six.add_metaclass(_)
-class TRAIL(object):
-    pass
+TransactionEventTypeEnum = to_enum(
+    TransactionEventType, description=TransactionEventType.__doc__
+)
+TransactionEventTypeEnum.doc_category = DOC_CATEGORY_PAYMENTS
 
-if sys.version_info >= (3, 0):
-    class BLOCK_MARKER:
-        NOP = 0x00
-        READ = 0x01
-        WRITE = 0x02
-        END = 0xff
-else:
-    class BLOCK_MARKER:
-        NOP = b'\x00'
-        READ = b'\x01'
-        WRITE = b'\x02'
-        END = b'\xff'
 
-class PROTO:
-    TCP = "TCP"
-    UDP = "UDP"
-    ICMP = "ICMP"
+class OrderAction(BaseEnum):
+    CAPTURE = "CAPTURE"
+    MARK_AS_PAID = "MARK_AS_PAID"
+    REFUND = "REFUND"
+    VOID = "VOID"
 
-class HTTP_HEADER:
-    ACCEPT = "Accept"
-    ACCEPT_CHARSET = "Accept-Charset"
-    ACCEPT_ENCODING = "Accept-Encoding"
-    ACCEPT_LANGUAGE = "Accept-Language"
-    AUTHORIZATION = "Authorization"
-    CACHE_CONTROL = "Cache-Control"
-    CONNECTION = "Connection"
-    CONTENT_ENCODING = "Content-Encoding"
-    CONTENT_LENGTH = "Content-Length"
-    CONTENT_RANGE = "Content-Range"
-    CONTENT_TYPE = "Content-Type"
-    CONTENT_SECURITY_POLICY = "Content-Security-Policy"
-    COOKIE = "Cookie"
-    EXPIRES = "Expires"
-    HOST = "Host"
-    IF_MODIFIED_SINCE = "If-Modified-Since"
-    LAST_MODIFIED = "Last-Modified"
-    LOCATION = "Location"
-    PRAGMA = "Pragma"
-    PROXY_AUTHORIZATION = "Proxy-Authorization"
-    PROXY_CONNECTION = "Proxy-Connection"
-    RANGE = "Range"
-    REFERER = "Referer"
-    SERVER = "Server"
-    SET_COOKIE = "Set-Cookie"
-    TRANSFER_ENCODING = "Transfer-Encoding"
-    URI = "URI"
-    USER_AGENT = "User-Agent"
-    VIA = "Via"
-    X_POWERED_BY = "X-Powered-By"
+    class Meta:
+        doc_category = DOC_CATEGORY_PAYMENTS
 
-class CACHE_TYPE:
-    DOMAIN = 0
-    USER_AGENT = 1
-    PATH = 2
-    POST_DATA = 3
-    DOMAIN_WHITELISTED = 4
-    LOCAL_PREFIX = 4
+    @property
+    def description(self):
+        if self == OrderAction.CAPTURE:
+            return "Represents the capture action."
+        if self == OrderAction.MARK_AS_PAID:
+            return "Represents a mark-as-paid action."
+        if self == OrderAction.REFUND:
+            return "Represents a refund action."
+        if self == OrderAction.VOID:
+            return "Represents a void action."
+        raise ValueError(f"Unsupported enum value: {self.value}")
 
-class COLOR:
-    BLUE = "\033[34m"
-    BOLD_MAGENTA = "\033[35;1m"
-    BOLD_GREEN = "\033[32;1m"
-    BOLD_LIGHT_MAGENTA = "\033[95;1m"
-    LIGHT_GRAY = "\033[37m"
-    BOLD_RED = "\033[31;1m"
-    BOLD_LIGHT_GRAY = "\033[37;1m"
-    YELLOW = "\033[33m"
-    DARK_GRAY = "\033[90m"
-    BOLD_CYAN = "\033[36;1m"
-    LIGHT_RED = "\033[91m"
-    CYAN = "\033[36m"
-    MAGENTA = "\033[35m"
-    LIGHT_MAGENTA = "\033[95m"
-    LIGHT_GREEN = "\033[92m"
-    RESET = "\033[0m"
-    BOLD_DARK_GRAY = "\033[90;1m"
-    BOLD_LIGHT_YELLOW = "\033[93;1m"
-    BOLD_LIGHT_RED = "\033[91;1m"
-    BOLD_LIGHT_GREEN = "\033[92;1m"
-    LIGHT_YELLOW = "\033[93m"
-    BOLD_LIGHT_BLUE = "\033[94;1m"
-    BOLD_LIGHT_CYAN = "\033[96;1m"
-    LIGHT_BLUE = "\033[94m"
-    BOLD_WHITE = "\033[97;1m"
-    LIGHT_CYAN = "\033[96m"
-    BLACK = "\033[30m"
-    BOLD_YELLOW = "\033[33;1m"
-    BOLD_BLUE = "\033[34;1m"
-    GREEN = "\033[32m"
-    WHITE = "\033[97m"
-    BOLD_BLACK = "\033[30;1m"
-    RED = "\033[31m"
-    UNDERLINE = "\033[4m"
 
-class BACKGROUND:
-    BLUE = "\033[44m"
-    LIGHT_GRAY = "\033[47m"
-    YELLOW = "\033[43m"
-    DARK_GRAY = "\033[100m"
-    LIGHT_RED = "\033[101m"
-    CYAN = "\033[46m"
-    MAGENTA = "\033[45m"
-    LIGHT_MAGENTA = "\033[105m"
-    LIGHT_GREEN = "\033[102m"
-    RESET = "\033[0m"
-    LIGHT_YELLOW = "\033[103m"
-    LIGHT_BLUE = "\033[104m"
-    LIGHT_CYAN = "\033[106m"
-    BLACK = "\033[40m"
-    GREEN = "\033[42m"
-    WHITE = "\033[107m"
-    RED = "\033[41m"
+def description(enum):
+    if enum is None:
+        return "Enum representing the type of a payment storage in a gateway."
+    elif enum == StorePaymentMethodEnum.NONE:
+        return "Storage is disabled. The payment is not stored."
+    elif enum == StorePaymentMethodEnum.ON_SESSION:
+        return (
+            "On session storage type. "
+            "The payment is stored only to be reused when "
+            "the customer is present in the checkout flow."
+        )
+    elif enum == StorePaymentMethodEnum.OFF_SESSION:
+        return (
+            "Off session storage type. "
+            "The payment is stored to be reused even if the customer is absent."
+        )
+    return None
 
-class SEVERITY:
-    NONE = "none"
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    CRITICAL = "critical"
+
+StorePaymentMethodEnum = to_enum(
+    StorePaymentMethod, type_name="StorePaymentMethodEnum", description=description
+)
+StorePaymentMethodEnum.doc_category = DOC_CATEGORY_PAYMENTS
+
+TokenizedPaymentFlowEnum = to_enum(
+    TokenizedPaymentFlow,
+    type_name="TokenizedPaymentFlowEnum",
+    description=TokenizedPaymentFlow.__doc__,
+)
+TokenizedPaymentFlowEnum.doc_category = DOC_CATEGORY_PAYMENTS
+
+PaymentGatewayInitializeTokenizationResultEnum = graphene.Enum.from_enum(
+    PaymentGatewayInitializeTokenizationResult,
+)
+PaymentGatewayInitializeTokenizationResultEnum.doc_category = DOC_CATEGORY_PAYMENTS
+
+PaymentMethodTokenizationResultEnum = graphene.Enum.from_enum(
+    PaymentMethodTokenizationResult
+)
+PaymentMethodTokenizationResultEnum.doc_category = DOC_CATEGORY_PAYMENTS
+
+StoredPaymentMethodRequestDeleteResultEnum = graphene.Enum.from_enum(
+    StoredPaymentMethodRequestDeleteResult,
+)
+StoredPaymentMethodRequestDeleteResultEnum.doc_category = DOC_CATEGORY_PAYMENTS

@@ -1,195 +1,387 @@
-# library.py
-#
-# Copyright 2022 brombinmirko <send@mirko.pm>
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, in version 3 of the License.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
-#
+from collections.abc import Iterable
+from functools import wraps
+from importlib import import_module
+from inspect import getfullargspec, unwrap
 
-from gettext import gettext as _
+from django.utils.html import conditional_escape
 
-from gi.repository import Gtk, Gdk
-
-from bottles.backend.logger import Logger
-from bottles.backend.managers.library import LibraryManager
-from bottles.backend.managers.thumbnail import ThumbnailManager
-from bottles.backend.models.result import Result
-from bottles.backend.utils.threading import RunAsync
-from bottles.backend.wine.executor import WineExecutor
-from bottles.backend.wine.winedbg import WineDbg
-from bottles.frontend.utils.gtk import GtkUtils
-
-logging = Logger()
+from .base import Node, Template, token_kwargs
+from .exceptions import TemplateSyntaxError
 
 
-@Gtk.Template(resource_path='/com/usebottles/bottles/library-entry.ui')
-class LibraryEntry(Gtk.Box):
-    __gtype_name__ = 'LibraryEntry'
+class InvalidTemplateLibrary(Exception):
+    pass
 
-    # region Widgets
-    btn_run = Gtk.Template.Child()
-    btn_stop = Gtk.Template.Child()
-    btn_launch_steam = Gtk.Template.Child()
-    btn_remove = Gtk.Template.Child()
-    label_name = Gtk.Template.Child()
-    label_bottle = Gtk.Template.Child()
-    label_no_cover = Gtk.Template.Child()
-    img_cover = Gtk.Template.Child()
-    revealer_run = Gtk.Template.Child()
-    revealer_details = Gtk.Template.Child()
-    overlay = Gtk.Template.Child()
 
-    # endregion
+class Library:
+    """
+    A class for registering template tags and filters. Compiled filter and
+    template tag functions are stored in the filters and tags attributes.
+    The filter, simple_tag, and inclusion_tag methods provide a convenient
+    way to register callables as tags.
+    """
 
-    def __init__(self, library, uuid, entry, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.library = library
-        self.window = library.window
-        self.manager = library.window.manager
-        self.name = entry['name']
-        self.uuid = uuid
-        self.entry = entry
-        self.config = self.__get_config()
+    def __init__(self):
+        self.filters = {}
+        self.tags = {}
 
-        # This happens when a Library entry is an "orphan" (no bottles associated)
-        if self.config is None:
-            library_manager = LibraryManager()
-            library_manager.remove_from_library(self.uuid)
-            raise Exception
+    def tag(self, name=None, compile_function=None):
+        if name is None and compile_function is None:
+            # @register.tag()
+            return self.tag_function
+        elif name is not None and compile_function is None:
+            if callable(name):
+                # @register.tag
+                return self.tag_function(name)
+            else:
+                # @register.tag('somename') or @register.tag(name='somename')
+                def dec(func):
+                    return self.tag(name, func)
 
-        self.program = self.__get_program()
-
-        if len(entry['name']) >= 15:
-            name = entry['name'][:13] + "…"
+                return dec
+        elif name is not None and compile_function is not None:
+            # register.tag('somename', somefunc)
+            self.tags[name] = compile_function
+            return compile_function
         else:
-            name = entry['name']
-
-        self.label_name.set_text(name)
-        self.label_bottle.set_text(entry['bottle']['name'])
-        self.label_no_cover.set_label(self.name)
-
-        if entry.get('thumbnail'):
-            path = ThumbnailManager.get_path(self.config, entry['thumbnail'])
-
-            if path is None:
-                # redownloading *should* never fail as it was successfully downloaded before
-                logging.info("Redownloading grid image...")
-                library_manager = LibraryManager()
-                result = library_manager.download_thumbnail(self.uuid, self.config)
-                if result:
-                    entry = library_manager.get_library().get(uuid)
-                    path = ThumbnailManager.get_path(self.config, entry['thumbnail'])
-
-            if path is not None: 
-                # Gtk.Picture.set_pixbuf deprecated in GTK 4.12
-                texture = Gdk.Texture.new_from_filename(path)
-                self.img_cover.set_paintable(texture)
-                self.img_cover.set_visible(True)
-                self.label_no_cover.set_visible(False)
-
-        motion_ctrl = Gtk.EventControllerMotion.new()
-        motion_ctrl.connect("enter", self.__on_motion_enter)
-        motion_ctrl.connect("leave", self.__on_motion_leave)
-        self.overlay.add_controller(motion_ctrl)
-        self.btn_run.connect("clicked", self.run_executable)
-        self.btn_launch_steam.connect("clicked", self.run_steam)
-        self.btn_stop.connect("clicked", self.stop_process)
-        self.btn_remove.connect("clicked", self.__remove_entry)
-
-    def __get_config(self):
-        bottles = self.manager.local_bottles
-        if self.entry['bottle']['name'] in bottles:
-            return bottles[self.entry['bottle']['name']]
-        parent = self.get_parent()
-        if parent:
-            parent.remove(self)  # TODO: Remove from list
-
-    def __get_program(self):
-        programs = self.manager.get_programs(self.config)
-        programs = [p for p in programs if p["id"] == self.entry["id"] or p["name"] == self.entry["name"]]
-        if len(programs) == 0:
-            return None  # TODO: remove entry from library
-        return programs[0]
-
-    @GtkUtils.run_in_main_loop
-    def __reset_buttons(self, result: Result | bool = None, error=False):
-        match result:
-            case Result():
-                status = result.status
-            case bool():
-                status = result
-            case _:
-                logging.error(f"result should be Result or bool, but it was {type(result)}")
-                status = False
-
-        self.btn_remove.set_visible(status)
-        self.btn_stop.set_visible(not status)
-        self.btn_run.set_visible(status)
-
-    def __is_alive(self):
-        winedbg = WineDbg(self.config)
-
-        @GtkUtils.run_in_main_loop
-        def set_watcher(result=False, error=False):
-            nonlocal winedbg
-            self.__reset_buttons()
-
-            RunAsync(
-                winedbg.wait_for_process,
-                callback=self.__reset_buttons,
-                name=self.program["executable"],
-                timeout=5
+            raise ValueError(
+                "Unsupported arguments to Library.tag: (%r, %r)"
+                % (name, compile_function),
             )
 
-        RunAsync(
-            winedbg.is_process_alive,
-            callback=set_watcher,
-            name=self.program["executable"]
+    def tag_function(self, func):
+        self.tags[func.__name__] = func
+        return func
+
+    def filter(self, name=None, filter_func=None, **flags):
+        """
+        Register a callable as a template filter. Example:
+
+        @register.filter
+        def lower(value):
+            return value.lower()
+        """
+        if name is None and filter_func is None:
+            # @register.filter()
+            def dec(func):
+                return self.filter_function(func, **flags)
+
+            return dec
+        elif name is not None and filter_func is None:
+            if callable(name):
+                # @register.filter
+                return self.filter_function(name, **flags)
+            else:
+                # @register.filter('somename') or @register.filter(name='somename')
+                def dec(func):
+                    return self.filter(name, func, **flags)
+
+                return dec
+        elif name is not None and filter_func is not None:
+            # register.filter('somename', somefunc)
+            self.filters[name] = filter_func
+            for attr in ("expects_localtime", "is_safe", "needs_autoescape"):
+                if attr in flags:
+                    value = flags[attr]
+                    # set the flag on the filter for FilterExpression.resolve
+                    setattr(filter_func, attr, value)
+                    # set the flag on the innermost decorated function
+                    # for decorators that need it, e.g. stringfilter
+                    setattr(unwrap(filter_func), attr, value)
+            filter_func._filter_name = name
+            return filter_func
+        else:
+            raise ValueError(
+                "Unsupported arguments to Library.filter: (%r, %r)"
+                % (name, filter_func),
+            )
+
+    def filter_function(self, func, **flags):
+        return self.filter(func.__name__, func, **flags)
+
+    def simple_tag(self, func=None, takes_context=None, name=None):
+        """
+        Register a callable as a compiled template tag. Example:
+
+        @register.simple_tag
+        def hello(*args, **kwargs):
+            return 'world'
+        """
+
+        def dec(func):
+            (
+                params,
+                varargs,
+                varkw,
+                defaults,
+                kwonly,
+                kwonly_defaults,
+                _,
+            ) = getfullargspec(unwrap(func))
+            function_name = name or func.__name__
+
+            @wraps(func)
+            def compile_func(parser, token):
+                bits = token.split_contents()[1:]
+                target_var = None
+                if len(bits) >= 2 and bits[-2] == "as":
+                    target_var = bits[-1]
+                    bits = bits[:-2]
+                args, kwargs = parse_bits(
+                    parser,
+                    bits,
+                    params,
+                    varargs,
+                    varkw,
+                    defaults,
+                    kwonly,
+                    kwonly_defaults,
+                    takes_context,
+                    function_name,
+                )
+                return SimpleNode(func, takes_context, args, kwargs, target_var)
+
+            self.tag(function_name, compile_func)
+            return func
+
+        if func is None:
+            # @register.simple_tag(...)
+            return dec
+        elif callable(func):
+            # @register.simple_tag
+            return dec(func)
+        else:
+            raise ValueError("Invalid arguments provided to simple_tag")
+
+    def inclusion_tag(self, filename, func=None, takes_context=None, name=None):
+        """
+        Register a callable as an inclusion tag:
+
+        @register.inclusion_tag('results.html')
+        def show_results(poll):
+            choices = poll.choice_set.all()
+            return {'choices': choices}
+        """
+
+        def dec(func):
+            (
+                params,
+                varargs,
+                varkw,
+                defaults,
+                kwonly,
+                kwonly_defaults,
+                _,
+            ) = getfullargspec(unwrap(func))
+            function_name = name or func.__name__
+
+            @wraps(func)
+            def compile_func(parser, token):
+                bits = token.split_contents()[1:]
+                args, kwargs = parse_bits(
+                    parser,
+                    bits,
+                    params,
+                    varargs,
+                    varkw,
+                    defaults,
+                    kwonly,
+                    kwonly_defaults,
+                    takes_context,
+                    function_name,
+                )
+                return InclusionNode(
+                    func,
+                    takes_context,
+                    args,
+                    kwargs,
+                    filename,
+                )
+
+            self.tag(function_name, compile_func)
+            return func
+
+        return dec
+
+
+class TagHelperNode(Node):
+    """
+    Base class for tag helper nodes such as SimpleNode and InclusionNode.
+    Manages the positional and keyword arguments to be passed to the decorated
+    function.
+    """
+
+    def __init__(self, func, takes_context, args, kwargs):
+        self.func = func
+        self.takes_context = takes_context
+        self.args = args
+        self.kwargs = kwargs
+
+    def get_resolved_arguments(self, context):
+        resolved_args = [var.resolve(context) for var in self.args]
+        if self.takes_context:
+            resolved_args = [context] + resolved_args
+        resolved_kwargs = {k: v.resolve(context) for k, v in self.kwargs.items()}
+        return resolved_args, resolved_kwargs
+
+
+class SimpleNode(TagHelperNode):
+    child_nodelists = ()
+
+    def __init__(self, func, takes_context, args, kwargs, target_var):
+        super().__init__(func, takes_context, args, kwargs)
+        self.target_var = target_var
+
+    def render(self, context):
+        resolved_args, resolved_kwargs = self.get_resolved_arguments(context)
+        output = self.func(*resolved_args, **resolved_kwargs)
+        if self.target_var is not None:
+            context[self.target_var] = output
+            return ""
+        if context.autoescape:
+            output = conditional_escape(output)
+        return output
+
+
+class InclusionNode(TagHelperNode):
+    def __init__(self, func, takes_context, args, kwargs, filename):
+        super().__init__(func, takes_context, args, kwargs)
+        self.filename = filename
+
+    def render(self, context):
+        """
+        Render the specified template and context. Cache the template object
+        in render_context to avoid reparsing and loading when used in a for
+        loop.
+        """
+        resolved_args, resolved_kwargs = self.get_resolved_arguments(context)
+        _dict = self.func(*resolved_args, **resolved_kwargs)
+
+        t = context.render_context.get(self)
+        if t is None:
+            if isinstance(self.filename, Template):
+                t = self.filename
+            elif isinstance(getattr(self.filename, "template", None), Template):
+                t = self.filename.template
+            elif not isinstance(self.filename, str) and isinstance(
+                self.filename, Iterable
+            ):
+                t = context.template.engine.select_template(self.filename)
+            else:
+                t = context.template.engine.get_template(self.filename)
+            context.render_context[self] = t
+        new_context = context.new(_dict)
+        # Copy across the CSRF token, if present, because inclusion tags are
+        # often used for forms, and we need instructions for using CSRF
+        # protection to be as simple as possible.
+        csrf_token = context.get("csrf_token")
+        if csrf_token is not None:
+            new_context["csrf_token"] = csrf_token
+        return t.render(new_context)
+
+
+def parse_bits(
+    parser,
+    bits,
+    params,
+    varargs,
+    varkw,
+    defaults,
+    kwonly,
+    kwonly_defaults,
+    takes_context,
+    name,
+):
+    """
+    Parse bits for template tag helpers simple_tag and inclusion_tag, in
+    particular by detecting syntax errors and by extracting positional and
+    keyword arguments.
+    """
+    if takes_context:
+        if params and params[0] == "context":
+            params = params[1:]
+        else:
+            raise TemplateSyntaxError(
+                "'%s' is decorated with takes_context=True so it must "
+                "have a first argument of 'context'" % name
+            )
+    args = []
+    kwargs = {}
+    unhandled_params = list(params)
+    unhandled_kwargs = [
+        kwarg for kwarg in kwonly if not kwonly_defaults or kwarg not in kwonly_defaults
+    ]
+    for bit in bits:
+        # First we try to extract a potential kwarg from the bit
+        kwarg = token_kwargs([bit], parser)
+        if kwarg:
+            # The kwarg was successfully extracted
+            param, value = kwarg.popitem()
+            if param not in params and param not in kwonly and varkw is None:
+                # An unexpected keyword argument was supplied
+                raise TemplateSyntaxError(
+                    "'%s' received unexpected keyword argument '%s'" % (name, param)
+                )
+            elif param in kwargs:
+                # The keyword argument has already been supplied once
+                raise TemplateSyntaxError(
+                    "'%s' received multiple values for keyword argument '%s'"
+                    % (name, param)
+                )
+            else:
+                # All good, record the keyword argument
+                kwargs[str(param)] = value
+                if param in unhandled_params:
+                    # If using the keyword syntax for a positional arg, then
+                    # consume it.
+                    unhandled_params.remove(param)
+                elif param in unhandled_kwargs:
+                    # Same for keyword-only arguments
+                    unhandled_kwargs.remove(param)
+        else:
+            if kwargs:
+                raise TemplateSyntaxError(
+                    "'%s' received some positional argument(s) after some "
+                    "keyword argument(s)" % name
+                )
+            else:
+                # Record the positional argument
+                args.append(parser.compile_filter(bit))
+                try:
+                    # Consume from the list of expected positional arguments
+                    unhandled_params.pop(0)
+                except IndexError:
+                    if varargs is None:
+                        raise TemplateSyntaxError(
+                            "'%s' received too many positional arguments" % name
+                        )
+    if defaults is not None:
+        # Consider the last n params handled, where n is the
+        # number of defaults.
+        unhandled_params = unhandled_params[: -len(defaults)]
+    if unhandled_params or unhandled_kwargs:
+        # Some positional arguments were not supplied
+        raise TemplateSyntaxError(
+            "'%s' did not receive value(s) for the argument(s): %s"
+            % (name, ", ".join("'%s'" % p for p in unhandled_params + unhandled_kwargs))
         )
+    return args, kwargs
 
-    def __remove_entry(self, *args):
-        self.library.remove_entry(self)
 
-    def run_executable(self, widget, with_terminal=False):
-        self.window.show_toast(_("Launching \"{0}\"…").format(self.program["name"]))
-        RunAsync(
-            WineExecutor.run_program,
-            callback=self.__reset_buttons,
-            config=self.config,
-            program=self.program
+def import_library(name):
+    """
+    Load a Library object from a template tag module.
+    """
+    try:
+        module = import_module(name)
+    except ImportError as e:
+        raise InvalidTemplateLibrary(
+            "Invalid template library specified. ImportError raised when "
+            "trying to load '%s': %s" % (name, e)
         )
-        self.__reset_buttons()
-
-    def run_steam(self, widget):
-        self.manager.steam_manager.launch_app(self.config.CompatData)
-
-    def stop_process(self, widget):
-        self.window.show_toast(_("Stopping \"{0}\"…").format(self.program["name"]))
-        winedbg = WineDbg(self.config)
-        winedbg.kill_process(name=self.program["executable"])
-        self.__reset_buttons(True)
-
-    def __on_motion_enter(self, *args):
-        self.revealer_run.set_reveal_child(True)
-        self.revealer_details.set_reveal_child(True)
-
-    def __on_motion_leave(self, *args):
-        self.revealer_run.set_reveal_child(False)
-        self.revealer_details.set_reveal_child(False)
-
-    # hide() and show() are essentialy workarounds to avoid keeping
-    # the empty space of the hidden entry in the GtkFlowBox
-    def hide(self):
-        self.get_parent().set_visible(False)
-
-    def show(self):
-        self.get_parent().set_visible(True)
+    try:
+        return module.register
+    except AttributeError:
+        raise InvalidTemplateLibrary(
+            "Module  %s does not have a variable named 'register'" % name,
+        )

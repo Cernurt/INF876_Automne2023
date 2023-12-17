@@ -1,176 +1,242 @@
-import asyncio
-import os
-from typing import Optional
+# Copyright 2021 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import subprocess
+import sys
+import warnings
+from argparse import ArgumentParser
+from pathlib import Path
 
-import typer
-from dotenv import load_dotenv
-from rich.console import Console
-from rich.markdown import Markdown
-from tqdm import tqdm
+from packaging import version
 
-from . import run
-from .core.config import ContinueConfig, RetrievalSettings
-from .headless import get_headless_autopilot
-from .headless.headless_ide import LocalIdeProtocol
-from .libs.index.build_index import build_index
-from .libs.index.chunkers.chunk import Chunk
-from .libs.index.pipelines.main import main_retrieval_pipeline
-from .libs.util.ext_to_lang import ext_to_lang
-from .libs.util.paths import getConfigFilePath
-from .server.main import run_server
-
-load_dotenv()
-app = typer.Typer(invoke_without_command=True)
-
-console = Console()
-
-
-CONTINUE_ASCII = r"""
-
-_________               _____ _____                       
-__  ____/______ _______ __  /____(_)_______ ____  _______ 
-_  /     _  __ \__  __ \_  __/__  / __  __ \_  / / /_  _ \
-/ /___   / /_/ /_  / / // /_  _  /  _  / / // /_/ / /  __/
-\____/   \____/ /_/ /_/ \__/  /_/   /_/ /_/ \__,_/  \___/ 
-
-"""
+from .. import AutoFeatureExtractor, AutoImageProcessor, AutoProcessor, AutoTokenizer
+from ..utils import logging
+from ..utils.import_utils import is_optimum_available
+from .convert import export, validate_model_outputs
+from .features import FeaturesManager
+from .utils import get_preprocessor
 
 
-def main_command(
-    port: int = typer.Option(65432, help="server port"),
-    host: str = typer.Option("127.0.0.1", help="server host"),
-    meilisearch_url: Optional[str] = typer.Option(
-        None, help="The URL of the MeiliSearch server if running manually"
-    ),
-    disable_meilisearch: bool = typer.Option(
-        False, help="Disable the MeiliSearch server"
-    ),
-    config: Optional[str] = typer.Option(
-        None, help="The path to the configuration file"
-    ),
-    headless: bool = typer.Option(False, help="Run in headless mode"),
-):
-    if headless:
-        run(config or getConfigFilePath())
+MIN_OPTIMUM_VERSION = "1.5.0"
+
+ENCODER_DECODER_MODELS = ["vision-encoder-decoder"]
+
+
+def export_with_optimum(args):
+    if is_optimum_available():
+        from optimum.version import __version__ as optimum_version
+
+        parsed_optimum_version = version.parse(optimum_version)
+        if parsed_optimum_version < version.parse(MIN_OPTIMUM_VERSION):
+            raise RuntimeError(
+                f"transformers.onnx requires optimum >= {MIN_OPTIMUM_VERSION} but {optimum_version} is installed. You "
+                "can upgrade optimum by running: pip install -U optimum[exporters]"
+            )
     else:
-        print(CONTINUE_ASCII)
-        run_server(
-            port=port,
-            host=host,
-            meilisearch_url=meilisearch_url,
-            disable_meilisearch=disable_meilisearch,
+        raise RuntimeError(
+            "transformers.onnx requires optimum to run, you can install the library by running: pip install "
+            "optimum[exporters]"
         )
+    cmd_line = [
+        sys.executable,
+        "-m",
+        "optimum.exporters.onnx",
+        f"--model {args.model}",
+        f"--task {args.feature}",
+        f"--framework {args.framework}" if args.framework is not None else "",
+        f"{args.output}",
+    ]
+    proc = subprocess.Popen(" ".join(cmd_line), stdout=subprocess.PIPE, shell=True)
+    proc.wait()
 
-
-@app.callback()
-def main(
-    ctx: typer.Context,
-    port: int = typer.Option(65432, help="server port"),
-    host: str = typer.Option("127.0.0.1", help="server host"),
-    meilisearch_url: Optional[str] = typer.Option(
-        None, help="The URL of the MeiliSearch server if running manually"
-    ),
-    disable_meilisearch: bool = typer.Option(
-        False, help="Disable the MeiliSearch server"
-    ),
-    config: Optional[str] = typer.Option(
-        None, help="The path to the configuration file"
-    ),
-    headless: bool = typer.Option(False, help="Run in headless mode"),
-):
-    if ctx.invoked_subcommand is None:
-        main_command(
-            port=port,
-            host=host,
-            meilisearch_url=meilisearch_url,
-            config=config,
-            headless=headless,
-            disable_meilisearch=disable_meilisearch,
-        )
-
-
-def print_chunk(chunk: Chunk):
-    # A nice colored representation of the piece of the file
-    language = ext_to_lang(chunk.digest.split(".")[-1])
-    console.print(
-        Markdown(f"\n**{chunk.digest}**\n\n```{language}\n{chunk.content}\n```\n---\n")
+    logger.info(
+        "The export was done by optimum.exporters.onnx. We recommend using to use this package directly in future, as "
+        "transformers.onnx is deprecated, and will be removed in v5. You can find more information here: "
+        "https://huggingface.co/docs/optimum/exporters/onnx/usage_guides/export_a_model."
     )
 
 
-@app.command()
-def search(
-    query: str = typer.Argument(..., help="The query to search for"),
-    config: Optional[str] = typer.Option(
-        None, "--config", help="The path to the configuration file"
-    ),
-    directory: str = typer.Option(None, "--directory", help="The directory to index"),
-):
-    if directory is None:
-        directory = "."
+def export_with_transformers(args):
+    args.output = args.output if args.output.is_file() else args.output.joinpath("model.onnx")
+    if not args.output.parent.exists():
+        args.output.parent.mkdir(parents=True)
 
-    print(f"Searching {directory}...")
+    # Allocate the model
+    model = FeaturesManager.get_model_from_feature(
+        args.feature, args.model, framework=args.framework, cache_dir=args.cache_dir
+    )
 
-    # Make absolute
-    directory = os.path.abspath(directory)
+    model_kind, model_onnx_config = FeaturesManager.check_supported_model_or_raise(model, feature=args.feature)
+    onnx_config = model_onnx_config(model.config)
 
-    async def run():
-        autopilot = await get_headless_autopilot(config=config, directory=directory)
+    if model_kind in ENCODER_DECODER_MODELS:
+        encoder_model = model.get_encoder()
+        decoder_model = model.get_decoder()
 
-        results = await main_retrieval_pipeline(
-            query,
-            autopilot.sdk,
-            openai_api_key=None,  # os.environ.get("OPENAI_API_KEY"),
+        encoder_onnx_config = onnx_config.get_encoder_config(encoder_model.config)
+        decoder_onnx_config = onnx_config.get_decoder_config(
+            encoder_model.config, decoder_model.config, feature=args.feature
         )
 
-        console.print(Markdown(f"## Results for `{query}`"))
-        for result in results:
-            print_chunk(result)
+        if args.opset is None:
+            args.opset = max(encoder_onnx_config.default_onnx_opset, decoder_onnx_config.default_onnx_opset)
 
-    asyncio.run(run())
+        if args.opset < min(encoder_onnx_config.default_onnx_opset, decoder_onnx_config.default_onnx_opset):
+            raise ValueError(
+                f"Opset {args.opset} is not sufficient to export {model_kind}. At least "
+                f" {min(encoder_onnx_config.default_onnx_opset, decoder_onnx_config.default_onnx_opset)} is required."
+            )
 
+        preprocessor = AutoFeatureExtractor.from_pretrained(args.model)
 
-@app.command()
-def index(
-    directory: str = typer.Argument(None, help="The directory to index"),
-    config: Optional[str] = typer.Option(
-        None, help="The path to the configuration file"
-    ),
-    openai_api_key: Optional[str] = typer.Option(
-        None, help="The OpenAI API key to use for indexing"
-    ),
-):
-    if directory is None:
-        directory = "."
+        onnx_inputs, onnx_outputs = export(
+            preprocessor,
+            encoder_model,
+            encoder_onnx_config,
+            args.opset,
+            args.output.parent.joinpath("encoder_model.onnx"),
+        )
 
-    # Make absolute
-    directory = os.path.abspath(directory)
+        validate_model_outputs(
+            encoder_onnx_config,
+            preprocessor,
+            encoder_model,
+            args.output.parent.joinpath("encoder_model.onnx"),
+            onnx_outputs,
+            args.atol if args.atol else encoder_onnx_config.atol_for_validation,
+        )
 
-    print(f"Indexing {directory}...")
+        preprocessor = AutoTokenizer.from_pretrained(args.model)
 
-    async def run():
-        nonlocal config
-        config_obj = None
-        if config is None:
-            config_obj = ContinueConfig.load_default()
+        onnx_inputs, onnx_outputs = export(
+            preprocessor,
+            decoder_model,
+            decoder_onnx_config,
+            args.opset,
+            args.output.parent.joinpath("decoder_model.onnx"),
+        )
+
+        validate_model_outputs(
+            decoder_onnx_config,
+            preprocessor,
+            decoder_model,
+            args.output.parent.joinpath("decoder_model.onnx"),
+            onnx_outputs,
+            args.atol if args.atol else decoder_onnx_config.atol_for_validation,
+        )
+        logger.info(
+            f"All good, model saved at: {args.output.parent.joinpath('encoder_model.onnx').as_posix()},"
+            f" {args.output.parent.joinpath('decoder_model.onnx').as_posix()}"
+        )
+
+    else:
+        # Instantiate the appropriate preprocessor
+        if args.preprocessor == "auto":
+            preprocessor = get_preprocessor(args.model)
+        elif args.preprocessor == "tokenizer":
+            preprocessor = AutoTokenizer.from_pretrained(args.model)
+        elif args.preprocessor == "image_processor":
+            preprocessor = AutoImageProcessor.from_pretrained(args.model)
+        elif args.preprocessor == "feature_extractor":
+            preprocessor = AutoFeatureExtractor.from_pretrained(args.model)
+        elif args.preprocessor == "processor":
+            preprocessor = AutoProcessor.from_pretrained(args.model)
         else:
-            config_obj = ContinueConfig.from_filepath(config)
+            raise ValueError(f"Unknown preprocessor type '{args.preprocessor}'")
 
-        if config_obj.retrieval_settings is None:
-            config_obj.retrieval_settings = RetrievalSettings()
+        # Ensure the requested opset is sufficient
+        if args.opset is None:
+            args.opset = onnx_config.default_onnx_opset
 
-        config_obj.retrieval_settings.openai_api_key = openai_api_key
+        if args.opset < onnx_config.default_onnx_opset:
+            raise ValueError(
+                f"Opset {args.opset} is not sufficient to export {model_kind}. "
+                f"At least  {onnx_config.default_onnx_opset} is required."
+            )
 
-        pbar = tqdm(total=100)
-        async for progress in build_index(
-            ide=LocalIdeProtocol(workspace_directory=directory), config=config_obj
-        ):
-            pbar.update(int(progress * 100) - pbar.n)
+        onnx_inputs, onnx_outputs = export(
+            preprocessor,
+            model,
+            onnx_config,
+            args.opset,
+            args.output,
+        )
 
-        pbar.close()
-        print("Indexing complete")
+        if args.atol is None:
+            args.atol = onnx_config.atol_for_validation
 
-    asyncio.run(run())
+        validate_model_outputs(onnx_config, preprocessor, model, args.output, onnx_outputs, args.atol)
+        logger.info(f"All good, model saved at: {args.output.as_posix()}")
+        warnings.warn(
+            "The export was done by transformers.onnx which is deprecated and will be removed in v5. We recommend"
+            " using optimum.exporters.onnx in future. You can find more information here:"
+            " https://huggingface.co/docs/optimum/exporters/onnx/usage_guides/export_a_model.",
+            FutureWarning,
+        )
+
+
+def main():
+    parser = ArgumentParser("Hugging Face Transformers ONNX exporter")
+    parser.add_argument(
+        "-m", "--model", type=str, required=True, help="Model ID on huggingface.co or path on disk to load model from."
+    )
+    parser.add_argument(
+        "--feature",
+        default="default",
+        help="The type of features to export the model with.",
+    )
+    parser.add_argument("--opset", type=int, default=None, help="ONNX opset version to export the model with.")
+    parser.add_argument(
+        "--atol", type=float, default=None, help="Absolute difference tolerance when validating the model."
+    )
+    parser.add_argument(
+        "--framework",
+        type=str,
+        choices=["pt", "tf"],
+        default=None,
+        help=(
+            "The framework to use for the ONNX export."
+            " If not provided, will attempt to use the local checkpoint's original framework"
+            " or what is available in the environment."
+        ),
+    )
+    parser.add_argument("output", type=Path, help="Path indicating where to store generated ONNX model.")
+    parser.add_argument("--cache_dir", type=str, default=None, help="Path indicating where to store cache.")
+    parser.add_argument(
+        "--preprocessor",
+        type=str,
+        choices=["auto", "tokenizer", "feature_extractor", "image_processor", "processor"],
+        default="auto",
+        help="Which type of preprocessor to use. 'auto' tries to automatically detect it.",
+    )
+    parser.add_argument(
+        "--export_with_transformers",
+        action="store_true",
+        help=(
+            "Whether to use transformers.onnx instead of optimum.exporters.onnx to perform the ONNX export. It can be "
+            "useful when exporting a model supported in transformers but not in optimum, otherwise it is not "
+            "recommended."
+        ),
+    )
+
+    args = parser.parse_args()
+    if args.export_with_transformers or not is_optimum_available():
+        export_with_transformers(args)
+    else:
+        export_with_optimum(args)
 
 
 if __name__ == "__main__":
-    app()
+    logger = logging.get_logger("transformers.onnx")  # pylint: disable=invalid-name
+    logger.setLevel(logging.INFO)
+    main()

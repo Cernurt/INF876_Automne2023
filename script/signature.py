@@ -1,11 +1,10 @@
-from inspect import Parameter
-
+from jedi._compatibility import Parameter
 from jedi.cache import memoize_method
 from jedi import debug
 from jedi import parser_utils
 
 
-class _SignatureMixin:
+class _SignatureMixin(object):
     def to_string(self):
         def param_strings():
             is_positional = False
@@ -68,7 +67,7 @@ class AbstractSignature(_SignatureMixin):
 
 class TreeSignature(AbstractSignature):
     def __init__(self, value, function_value=None, is_bound=False):
-        super().__init__(value, is_bound)
+        super(TreeSignature, self).__init__(value, is_bound)
         self._function_value = function_value or value
 
     def bind(self, value):
@@ -91,12 +90,10 @@ class TreeSignature(AbstractSignature):
 
     @memoize_method
     def get_param_names(self, resolve_stars=False):
-        params = self._function_value.get_param_names()
+        params = super(TreeSignature, self).get_param_names(resolve_stars=False)
         if resolve_stars:
             from jedi.inference.star_args import process_params
             params = process_params(params)
-        if self.is_bound:
-            return params[1:]
         return params
 
     def matches_signature(self, arguments):
@@ -122,7 +119,7 @@ class TreeSignature(AbstractSignature):
 
 class BuiltinSignature(AbstractSignature):
     def __init__(self, value, return_string, function_value=None, is_bound=False):
-        super().__init__(value, is_bound)
+        super(BuiltinSignature, self).__init__(value, is_bound)
         self._return_string = return_string
         self.__function_value = function_value
 

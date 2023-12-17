@@ -1,89 +1,140 @@
-# Copyright (c) 2021 Ultimaker B.V.
-# Cura is released under the terms of the LGPLv3 or higher.
-from typing import Optional, Dict, Any, List, Union
-from copy import deepcopy
-from cura.OAuth2.KeyringAttribute import KeyringAttribute
+from django.contrib.gis import gdal
 
 
-class BaseModel:
-    def __init__(self, **kwargs: Any) -> None:
-        self.__dict__.update(kwargs)
+class SpatialRefSysMixin:
+    """
+    The SpatialRefSysMixin is a class used by the database-dependent
+    SpatialRefSys objects to reduce redundant code.
+    """
 
-
-class OAuth2Settings(BaseModel):
-    """OAuth OAuth2Settings data template."""
-
-    CALLBACK_PORT = None  # type: Optional[int]
-    OAUTH_SERVER_URL = None  # type: Optional[str]
-    CLIENT_ID = None  # type: Optional[str]
-    CLIENT_SCOPES = None  # type: Optional[str]
-    CALLBACK_URL = None  # type: Optional[str]
-    AUTH_DATA_PREFERENCE_KEY = ""  # type: str
-    AUTH_SUCCESS_REDIRECT = "https://ultimaker.com"  # type: str
-    AUTH_FAILED_REDIRECT = "https://ultimaker.com"  # type: str
-
-
-class UserProfile(BaseModel):
-    """User profile data template."""
-
-    user_id = None  # type: Optional[str]
-    username = None  # type: Optional[str]
-    profile_image_url = None  # type: Optional[str]
-    organization_id = None  # type: Optional[str]
-    subscriptions = None  # type: Optional[List[Dict[str, Any]]]
-
-
-class AuthenticationResponse(BaseModel):
-    """Authentication data template."""
-
-    # Data comes from the token response with success flag and error message added.
-    success = True  # type: bool
-    token_type = None  # type: Optional[str]
-    expires_in = None  # type: Optional[str]
-    scope = None  # type: Optional[str]
-    err_message = None  # type: Optional[str]
-    received_at = None  # type: Optional[str]
-    access_token = KeyringAttribute()
-    refresh_token = KeyringAttribute()
-    
-    def __init__(self, **kwargs: Any) -> None:
-        self.access_token = kwargs.pop("access_token", None)
-        self.refresh_token = kwargs.pop("refresh_token", None)
-        super(AuthenticationResponse, self).__init__(**kwargs)
-
-    def dump(self) -> Dict[str, Union[bool, Optional[str]]]:
+    @property
+    def srs(self):
         """
-        Dumps the dictionary of Authentication attributes. KeyringAttributes are transformed to public attributes
-        If the keyring was used, these will have a None value, otherwise they will have the secret value
-
-        :return: Dictionary of Authentication attributes
+        Return a GDAL SpatialReference object.
         """
-        dumped = deepcopy(vars(self))
-        dumped["access_token"] = dumped.pop("_access_token")
-        dumped["refresh_token"] = dumped.pop("_refresh_token")
-        return dumped
+        # TODO: Is caching really necessary here?  Is complexity worth it?
+        if hasattr(self, "_srs"):
+            # Returning a clone of the cached SpatialReference object.
+            return self._srs.clone()
+        else:
+            # Attempting to cache a SpatialReference object.
 
+            # Trying to get from WKT first.
+            try:
+                self._srs = gdal.SpatialReference(self.wkt)
+                return self.srs
+            except Exception as e:
+                msg = e
 
-class ResponseStatus(BaseModel):
-    """Response status template."""
+            try:
+                self._srs = gdal.SpatialReference(self.proj4text)
+                return self.srs
+            except Exception as e:
+                msg = e
 
-    code = 200  # type: int
-    message = ""  # type: str
+            raise Exception(
+                "Could not get OSR SpatialReference from WKT: %s\nError:\n%s"
+                % (self.wkt, msg)
+            )
 
+    @property
+    def ellipsoid(self):
+        """
+        Return a tuple of the ellipsoid parameters:
+        (semimajor axis, semiminor axis, and inverse flattening).
+        """
+        return self.srs.ellipsoid
 
-class ResponseData(BaseModel):
-    """Response data template."""
+    @property
+    def name(self):
+        "Return the projection name."
+        return self.srs.name
 
-    status = None  # type: ResponseStatus
-    data_stream = None  # type: Optional[bytes]
-    redirect_uri = None  # type: Optional[str]
-    content_type = "text/html"  # type: str
+    @property
+    def spheroid(self):
+        "Return the spheroid name for this spatial reference."
+        return self.srs["spheroid"]
 
+    @property
+    def datum(self):
+        "Return the datum for this spatial reference."
+        return self.srs["datum"]
 
-HTTP_STATUS = {
-"""Possible HTTP responses."""
+    @property
+    def projected(self):
+        "Is this Spatial Reference projected?"
+        return self.srs.projected
 
-    "OK": ResponseStatus(code = 200, message = "OK"),
-    "NOT_FOUND": ResponseStatus(code = 404, message = "NOT FOUND"),
-    "REDIRECT": ResponseStatus(code = 302, message = "REDIRECT")
-}  # type: Dict[str, ResponseStatus]
+    @property
+    def local(self):
+        "Is this Spatial Reference local?"
+        return self.srs.local
+
+    @property
+    def geographic(self):
+        "Is this Spatial Reference geographic?"
+        return self.srs.geographic
+
+    @property
+    def linear_name(self):
+        "Return the linear units name."
+        return self.srs.linear_name
+
+    @property
+    def linear_units(self):
+        "Return the linear units."
+        return self.srs.linear_units
+
+    @property
+    def angular_name(self):
+        "Return the name of the angular units."
+        return self.srs.angular_name
+
+    @property
+    def angular_units(self):
+        "Return the angular units."
+        return self.srs.angular_units
+
+    @property
+    def units(self):
+        "Return a tuple of the units and the name."
+        if self.projected or self.local:
+            return (self.linear_units, self.linear_name)
+        elif self.geographic:
+            return (self.angular_units, self.angular_name)
+        else:
+            return (None, None)
+
+    @classmethod
+    def get_units(cls, wkt):
+        """
+        Return a tuple of (unit_value, unit_name) for the given WKT without
+        using any of the database fields.
+        """
+        return gdal.SpatialReference(wkt).units
+
+    @classmethod
+    def get_spheroid(cls, wkt, string=True):
+        """
+        Class method used by GeometryField on initialization to
+        retrieve the `SPHEROID[..]` parameters from the given WKT.
+        """
+        srs = gdal.SpatialReference(wkt)
+        sphere_params = srs.ellipsoid
+        sphere_name = srs["spheroid"]
+
+        if not string:
+            return sphere_name, sphere_params
+        else:
+            # `string` parameter used to place in format acceptable by PostGIS
+            if len(sphere_params) == 3:
+                radius, flattening = sphere_params[0], sphere_params[2]
+            else:
+                radius, flattening = sphere_params
+            return 'SPHEROID["%s",%s,%s]' % (sphere_name, radius, flattening)
+
+    def __str__(self):
+        """
+        Return the string representation, a 'pretty' OGC WKT.
+        """
+        return str(self.srs)

@@ -1,136 +1,149 @@
-# steam.py
-#
-# Copyright 2022 brombinmirko <send@mirko.pm>
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, in version 3 of the License.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
-#
+from __future__ import unicode_literals
 
-import os, subprocess, shlex
-from typing import Union, TextIO
-from typing import TextIO
+import re
 
-from bottles.backend.logger import Logger
-from bottles.backend.models.vdict import VDFDict
-from bottles.backend.utils import vdf
+from .common import InfoExtractor
+from ..utils import (
+    extract_attributes,
+    ExtractorError,
+    get_element_by_class,
+    js_to_json,
+)
 
-logging = Logger()
 
-class SteamUtils:
+class SteamIE(InfoExtractor):
+    _VALID_URL = r"""(?x)
+        https?://store\.steampowered\.com/
+            (agecheck/)?
+            (?P<urltype>video|app)/ #If the page is only for videos or for a game
+            (?P<gameID>\d+)/?
+            (?P<videoID>\d*)(?P<extra>\??) # For urltype == video we sometimes get the videoID
+        |
+        https?://(?:www\.)?steamcommunity\.com/sharedfiles/filedetails/\?id=(?P<fileID>[0-9]+)
+    """
+    _VIDEO_PAGE_TEMPLATE = 'http://store.steampowered.com/video/%s/'
+    _AGECHECK_TEMPLATE = 'http://store.steampowered.com/agecheck/video/%s/?snr=1_agecheck_agecheck__age-gate&ageDay=1&ageMonth=January&ageYear=1970'
+    _TESTS = [{
+        'url': 'http://store.steampowered.com/video/105600/',
+        'playlist': [
+            {
+                'md5': '6a294ee0c4b1f47f5bb76a65e31e3592',
+                'info_dict': {
+                    'id': '2040428',
+                    'ext': 'mp4',
+                    'title': 'Terraria 1.3 Trailer',
+                    'playlist_index': 1,
+                }
+            },
+            {
+                'md5': '911672b20064ca3263fa89650ba5a7aa',
+                'info_dict': {
+                    'id': '2029566',
+                    'ext': 'mp4',
+                    'title': 'Terraria 1.2 Trailer',
+                    'playlist_index': 2,
+                }
+            }
+        ],
+        'info_dict': {
+            'id': '105600',
+            'title': 'Terraria',
+        },
+        'params': {
+            'playlistend': 2,
+        }
+    }, {
+        'url': 'http://steamcommunity.com/sharedfiles/filedetails/?id=242472205',
+        'info_dict': {
+            'id': 'X8kpJBlzD2E',
+            'ext': 'mp4',
+            'upload_date': '20140617',
+            'title': 'FRONTIERS - Trapping',
+            'description': 'md5:bf6f7f773def614054089e5769c12a6e',
+            'uploader': 'AAD Productions',
+            'uploader_id': 'AtomicAgeDogGames',
+        }
+    }]
 
-    @staticmethod
-    def parse_acf(data: str) -> VDFDict:
-        """
-        Parses an ACF file. Just a wrapper for vdf.loads.
-        """
-        return vdf.loads(data)
-
-    @staticmethod
-    def parse_vdf(data: str) -> VDFDict:
-        """
-        Parses a VDF file. Just a wrapper for vdf.loads.
-        """
-        return vdf.loads(data)
-
-    @staticmethod
-    def to_vdf(data: VDFDict, fp: TextIO):
-        """
-        Saves a VDF file. Just a wrapper for vdf.dumps.
-        """
-        vdf.dump(data, fp, pretty=True)
-
-    @staticmethod
-    def is_proton(path: str) -> bool:
-        """
-        Checks if a directory is a Proton directory.
-        """
-        toolmanifest = os.path.join(path, f"toolmanifest.vdf")
-        if not os.path.isfile(toolmanifest):
-            return False
-
-        f = open(toolmanifest, "r", errors="replace")
-        data = SteamUtils.parse_vdf(f.read())
-        compat_layer_name = data.get("manifest", {}) \
-            .get("compatmanager_layer_name", {})
-
-        commandline = data.get("manifest", {}) \
-            .get("commandline", {})
-
-        return "proton" in compat_layer_name or "proton" in commandline
-
-    @staticmethod
-    def get_associated_runtime(path: str) -> str:
-        """
-        Get the associated runtime of a Proton directory.
-        """
-        toolmanifest = os.path.join(path, f"toolmanifest.vdf")
-        if not os.path.isfile(toolmanifest):
-            logging.error(f"toolmanifest.vdf not found in Proton directory: {path}")
-            return None
-
-        runtime = "scout"
-        f = open(toolmanifest, "r", errors="replace")
-        data = SteamUtils.parse_vdf(f.read())
-        tool_appid = data.get("manifest", {}) \
-            .get("require_tool_appid", {})
-
-        if "1628350" in tool_appid:
-            runtime = "sniper"
-        elif "1391110" in tool_appid:
-            runtime = "soldier"
-
-        return runtime
-
-    @staticmethod
-    def get_dist_directory(path: str) -> str:
-        """
-        Get the sub-directory containing the wine libraries and binaries.
-        """
-        dist_directory = path
-        if os.path.isdir(os.path.join(path, f"dist")):
-            dist_directory = os.path.join(path, f"dist")
-        elif os.path.isdir(os.path.join(path, f"files")):
-            dist_directory = os.path.join(path, f"files")
+    def _real_extract(self, url):
+        m = re.match(self._VALID_URL, url)
+        fileID = m.group('fileID')
+        if fileID:
+            videourl = url
+            playlist_id = fileID
         else:
-            logging.warning(f"No /dist or /files sub-directory was found under this Proton directory: {path}")
+            gameID = m.group('gameID')
+            playlist_id = gameID
+            videourl = self._VIDEO_PAGE_TEMPLATE % playlist_id
 
-        return dist_directory
+        self._set_cookie('steampowered.com', 'mature_content', '1')
 
-    @staticmethod
-    def handle_launch_options(launch_options: str) -> tuple[str, str, str]:
-        """
-        Handle launch options. Supports the %command% pattern.
-        Return prefix, arguments, and environment variables.
-        """
-        env_vars = {}
-        prefix, args = "", ""
-        if "%command%" in launch_options:
-            _c = launch_options.split("%command%")
-            prefix = _c[0] if len(_c) > 0 else ""
-            args = _c[1] if len(_c) > 1 else ""
+        webpage = self._download_webpage(videourl, playlist_id)
+
+        if re.search('<h2>Please enter your birth date to continue:</h2>', webpage) is not None:
+            videourl = self._AGECHECK_TEMPLATE % playlist_id
+            self.report_age_confirmation()
+            webpage = self._download_webpage(videourl, playlist_id)
+
+        flash_vars = self._parse_json(self._search_regex(
+            r'(?s)rgMovieFlashvars\s*=\s*({.+?});', webpage,
+            'flash vars'), playlist_id, js_to_json)
+
+        playlist_title = None
+        entries = []
+        if fileID:
+            playlist_title = get_element_by_class('workshopItemTitle', webpage)
+            for movie in flash_vars.values():
+                if not movie:
+                    continue
+                youtube_id = movie.get('YOUTUBE_VIDEO_ID')
+                if not youtube_id:
+                    continue
+                entries.append({
+                    '_type': 'url',
+                    'url': youtube_id,
+                    'ie_key': 'Youtube',
+                })
         else:
-            args = launch_options
+            playlist_title = get_element_by_class('apphub_AppName', webpage)
+            for movie_id, movie in flash_vars.items():
+                if not movie:
+                    continue
+                video_id = self._search_regex(r'movie_(\d+)', movie_id, 'video id', fatal=False)
+                title = movie.get('MOVIE_NAME')
+                if not title or not video_id:
+                    continue
+                entry = {
+                    'id': video_id,
+                    'title': title.replace('+', ' '),
+                }
+                formats = []
+                flv_url = movie.get('FILENAME')
+                if flv_url:
+                    formats.append({
+                        'format_id': 'flv',
+                        'url': flv_url,
+                    })
+                highlight_element = self._search_regex(
+                    r'(<div[^>]+id="highlight_movie_%s"[^>]+>)' % video_id,
+                    webpage, 'highlight element', fatal=False)
+                if highlight_element:
+                    highlight_attribs = extract_attributes(highlight_element)
+                    if highlight_attribs:
+                        entry['thumbnail'] = highlight_attribs.get('data-poster')
+                        for quality in ('', '-hd'):
+                            for ext in ('webm', 'mp4'):
+                                video_url = highlight_attribs.get('data-%s%s-source' % (ext, quality))
+                                if video_url:
+                                    formats.append({
+                                        'format_id': ext + quality,
+                                        'url': video_url,
+                                    })
+                if not formats:
+                    continue
+                entry['formats'] = formats
+                entries.append(entry)
+        if not entries:
+            raise ExtractorError('Could not find any videos')
 
-        try:
-            prefix_list = shlex.split(prefix.strip())
-        except ValueError:
-            prefix_list = prefix.split(shlex.quote(prefix.strip()))
-
-        for p in prefix_list.copy():
-            if "=" in p:
-                k, v = p.split("=", 1)
-                v = shlex.quote(v) if " " in v else v
-                env_vars[k] = v
-                prefix_list.remove(p)
-
-        prefix = " ".join(prefix_list)
-        return prefix, args, env_vars
+        return self.playlist_result(entries, playlist_id, playlist_title)

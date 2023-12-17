@@ -1,138 +1,334 @@
-import curses
-import random
-import time
-import sys
-import os
-
-
-class Snake:
-    def __init__(self, stdscr: curses.window):
-        self.__is_running = None
-        self.stdscr = stdscr
-        self.stdscr.nodelay(True)
-        self.stdscr.timeout(0)
-        curses.curs_set(0)
-        curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
-        curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-        curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_WHITE)
-
-        self.snake = [[4, 10], [4, 9], [4, 8]]
-        self.food = [0, 0]
-        self.score = 0
-        self.life = 3
-        self.direction = 'RIGHT'
-
-        self.generate_food()
-
-    def generate_food(self):
-        self.food = [int(random.random() * 20), int(random.random() * 20)]
-        while self.food in self.snake:
-            bounds = self.stdscr.getmaxyx()
-            self.food = [int(random.random() * (bounds[0] - 2)) + 1, int(random.random() * (bounds[1] - 2)) + 1]
-
-    def draw(self):
-        self.stdscr.clear()
-        self.stdscr.box()
-        self.stdscr.addstr(
-            self.stdscr.getmaxyx()[0] - 1, self.stdscr.getmaxyx()[1] // 2 - len(str(self.score)) // 2,
-            f'Score: {self.score}',
-            curses.color_pair(3)
-        )
-
-        for i, j in self.snake:
-            try:
-                self.stdscr.addstr(i, j, '◍', curses.color_pair(1))
-            except:
-                self.__is_running = False
-
-        self.stdscr.addstr(self.food[0], self.food[1], '🍎', curses.color_pair(2))
-        self.stdscr.refresh()
-
-    def move(self):
-        new_head = [self.snake[0][0], self.snake[0][1]]
-
-        if self.direction == 'UP':
-            new_head[0] -= 1
-        elif self.direction == 'DOWN':
-            new_head[0] += 1
-        elif self.direction == 'LEFT':
-            new_head[1] -= 1
-        elif self.direction == 'RIGHT':
-            new_head[1] += 1
-
-        self.snake.insert(0, new_head)
-
-        if self.snake[0] == self.food:
-            self.score += 1
-            self.generate_food()
-        else:
-            self.snake.pop()
-
-    def get_input(self):
-        key = self.stdscr.getch()
-        if key == curses.KEY_UP and self.direction != 'DOWN':
-            self.direction = 'UP'
-        elif key == curses.KEY_DOWN and self.direction != 'UP':
-            self.direction = 'DOWN'
-        elif key == curses.KEY_LEFT and self.direction != 'RIGHT':
-            self.direction = 'LEFT'
-        elif key == curses.KEY_RIGHT and self.direction != 'LEFT':
-            self.direction = 'RIGHT'
-        elif key == ord('q'):
-            exit()
-
-    def get_result(self):
-        return f'Your score is {self.score}'
-
-    def run(self):
-        self.__is_running = True
-        while self.__is_running:
-            self.get_input()
-            self.move()
-            self.draw()
-            time.sleep(0.1)
-
-
-result = "Game over!"
-
-
-def main(stdscr):
-    global result
-    snake = Snake(stdscr)
-    snake.run()
-    result = snake.get_result()
-
-
-if __name__ == '__main__':
-    os.system('clear')
-    logo = """
-.▄▄ ·  ▐ ▄  ▄▄▄· ▄ •▄ ▄▄▄ .
-▐█ ▀. •█▌▐█▐█ ▀█ █▌▄▌▪▀▄.▀·
-▄▀▀▀█▄▐█▐▐▌▄█▀▀█ ▐▀▀▄·▐▀▀▪▄
-▐█▄▪▐███▐█▌▐█ ▪▐▌▐█.█▌▐█▄▄▌
- ▀▀▀▀ ▀▀ █▪ ▀  ▀ ·▀  ▀ ▀▀▀ 
-"""
-    print(logo)
-    print('\u2550' * 27)
-    print("""
-1. Play
-2. Exit
-""")
-    print('\u2550' * 27)
-    print("\nDo you want to play a game? (1/2)\n")
-    choice = input()
-    if choice == '1':
-        curses.wrapper(main)
-        os.system('tput reset')
-
-        print('\u2554' + '\u2550' * (len(result) + 2) + '\u2557')
-        print('\u2551' + " " + result + " " + '\u2551')
-        print('\u255a' + '\u2550' * (len(result) + 2) + '\u255d')
-        print("Start again? (y/n)")
-
-        if input() == 'y':
-            os.execl(sys.executable, os.path.abspath(__file__), *sys.argv)
-        else:
-            exit()
-    elif choice == '2':
-        exit()
+from abc import ABCMeta, abstractmethod
+from enum import Enum, unique
+from random import randrange
+from threading import Thread
+
+import pygame
+
+
+class Color(object):
+    """颜色"""
+
+    GRAY = (242, 242, 242)
+    BLACK = (0, 0, 0)
+    GREEN = (0, 255, 0)
+    PINK = (255, 20, 147)
+
+
+@unique
+class Direction(Enum):
+    """方向"""
+
+    UP = 0
+    RIGHT = 1
+    DOWN = 2
+    LEFT = 3
+
+
+class GameObject(object, metaclass=ABCMeta):
+    """游戏中的对象"""
+
+    def __init__(self, x=0, y=0, color=Color.BLACK):
+        """
+        初始化方法
+
+        :param x: 横坐标
+        :param y: 纵坐标
+        :param color: 颜色
+        """
+        self._x = x
+        self._y = y
+        self._color = color
+
+    @property
+    def x(self):
+        return self._x
+
+    @property
+    def y(self):
+        return self._y
+
+    @abstractmethod
+    def draw(self, screen):
+        """
+        绘制
+
+        :param screen: 屏幕
+        """
+        pass
+
+
+class Wall(GameObject):
+    """围墙"""
+
+    def __init__(self, x, y, width, height, color=Color.BLACK):
+        """
+        初始化方法
+
+        :param x: 横坐标
+        :param y: 纵坐标
+        :param width: 宽度
+        :param height: 高度
+        :param color: 颜色
+        """
+        super().__init__(x, y, color)
+        self._width = width
+        self._height = height
+
+    @property
+    def width(self):
+        return self._width
+
+    @property
+    def height(self):
+        return self._height
+
+    def draw(self, screen):
+        pygame.draw.rect(screen, self._color,
+                         (self._x, self._y, self._width, self._height), 4)
+
+
+class Food(GameObject):
+    """食物"""
+
+    def __init__(self, x, y, size, color=Color.PINK):
+        """
+        初始化方法
+
+        :param x: 横坐标
+        :param y: 纵坐标
+        :param size: 大小
+        :param color: 颜色
+        """
+        super().__init__(x, y, color)
+        self._size = size
+        self._hidden = False
+
+    def draw(self, screen):
+        if not self._hidden:
+            pygame.draw.circle(screen, self._color,
+                               (self._x + self._size // 2, self._y + self._size // 2),
+                               self._size // 2, 0)
+        self._hidden = not self._hidden
+
+
+class SnakeNode(GameObject):
+    """蛇身上的节点"""
+
+    def __init__(self, x, y, size, color=Color.GREEN):
+        """
+        初始化方法
+
+        :param x: 横坐标
+        :param y: 纵坐标
+        :param size: 大小
+        :param color: 颜色
+        """
+        super().__init__(x, y, color)
+        self._size = size
+
+    @property
+    def size(self):
+        return self._size
+
+    def draw(self, screen):
+        pygame.draw.rect(screen, self._color,
+                         (self._x, self._y, self._size, self._size), 0)
+        pygame.draw.rect(screen, Color.BLACK,
+                         (self._x, self._y, self._size, self._size), 1)
+
+
+class Snake(GameObject):
+    """蛇"""
+
+    def __init__(self, x, y, size=20, length=5):
+        """
+        初始化方法
+
+        :param x: 横坐标
+        :param y: 纵坐标
+        :param size: 大小
+        :param length: 初始长度
+        """
+        super().__init__()
+        self._dir = Direction.LEFT
+        self._nodes = []
+        self._alive = True
+        self._new_dir = None
+        for index in range(length):
+            node = SnakeNode(x + index * size, y, size)
+            self._nodes.append(node)
+
+    @property
+    def dir(self):
+        return self._dir
+
+    @property
+    def alive(self):
+        return self._alive
+
+    @property
+    def head(self):
+        return self._nodes[0]
+
+    def change_dir(self, new_dir):
+        """
+        改变方向
+
+        :param new_dir: 新方向
+        """
+        if new_dir != self._dir and \
+                (self._dir.value + new_dir.value) % 2 != 0:
+            self._new_dir = new_dir
+
+    def move(self):
+        """移动"""
+        if self._new_dir:
+            self._dir, self._new_dir = self._new_dir, None
+        snake_dir = self._dir
+        x, y, size = self.head.x, self.head.y, self.head.size
+        if snake_dir == Direction.UP:
+            y -= size
+        elif snake_dir == Direction.RIGHT:
+            x += size
+        elif snake_dir == Direction.DOWN:
+            y += size
+        else:
+            x -= size
+        new_head = SnakeNode(x, y, size)
+        self._nodes.insert(0, new_head)
+        self._nodes.pop()
+
+    def collide(self, wall):
+        """
+        撞墙
+
+        :param wall: 围墙
+        """
+        head = self.head
+        if head.x < wall.x or head.x + head.size > wall.x + wall.width \
+                or head.y < wall.y or head.y + head.size > wall.y + wall.height:
+            self._alive = False
+
+    def eat_food(self, food):
+        """
+        吃食物
+
+        :param food: 食物
+
+        :return: 吃到食物返回True否则返回False
+        """
+        if self.head.x == food.x and self.head.y == food.y:
+            tail = self._nodes[-1]
+            self._nodes.append(tail)
+            return True
+        return False
+
+    def eat_self(self):
+        """咬自己"""
+        for index in range(4, len(self._nodes)):
+            node = self._nodes[index]
+            if node.x == self.head.x and node.y == self.head.y:
+                self._alive = False
+
+    def draw(self, screen):
+        for node in self._nodes:
+            node.draw(screen)
+
+
+def main():
+
+    def refresh():
+        """刷新游戏窗口"""
+        screen.fill(Color.GRAY)
+        wall.draw(screen)
+        food.draw(screen)
+        snake.draw(screen)
+        pygame.display.flip()
+
+    def handle_key_event(key_event):
+        """处理按键事件"""
+        key = key_event.key
+        if key == pygame.K_F2:
+            reset_game()
+        elif key in (pygame.K_a, pygame.K_w, pygame.K_d, pygame.K_s):
+            if snake.alive:
+                if key == pygame.K_w:
+                    new_dir = Direction.UP
+                elif key == pygame.K_d:
+                    new_dir = Direction.RIGHT
+                elif key == pygame.K_s:
+                    new_dir = Direction.DOWN
+                else:
+                    new_dir = Direction.LEFT
+                snake.change_dir(new_dir)
+
+    def create_food():
+        """创建食物"""
+        unit_size = snake.head.size
+        max_row = wall.height // unit_size
+        max_col = wall.width // unit_size
+        row = randrange(0, max_row)
+        col = randrange(0, max_col)
+        return Food(wall.x + unit_size * col, wall.y + unit_size * row, unit_size)
+
+    def reset_game():
+        """重置游戏"""
+        nonlocal food, snake
+        food = create_food()
+        snake = Snake(250, 290)
+
+    def background_task():
+        nonlocal running, food
+        while running:
+            if snake.alive:
+                refresh()
+            clock.tick(10)
+            if snake.alive:
+                snake.move()
+                snake.collide(wall)
+                if snake.eat_food(food):
+                    food = create_food()
+                snake.eat_self()
+
+    """
+    class BackgroundTask(Thread):
+
+        def run(self):
+            nonlocal running, food
+            while running:
+                if snake.alive:
+                    refresh()
+                clock.tick(10)
+                if snake.alive:
+                    snake.move()
+                    snake.collide(wall)
+                    if snake.eat_food(food):
+                        food = create_food()
+                    snake.eat_self()
+    """
+
+    wall = Wall(10, 10, 600, 600)
+    snake = Snake(250, 290)
+    food = create_food()
+    pygame.init()
+    screen = pygame.display.set_mode((620, 620))
+    pygame.display.set_caption('贪吃蛇')
+    # 创建控制游戏每秒帧数的时钟
+    clock = pygame.time.Clock()
+    running = True
+    # 启动后台线程负责刷新窗口和让蛇移动
+    # BackgroundTask().start()
+    Thread(target=background_task).start()
+    # 处理事件的消息循环
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                handle_key_event(event)
+    pygame.quit()
+
+
+if __name__ == '__main__':
+    main()

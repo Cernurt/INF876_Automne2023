@@ -1,169 +1,102 @@
-import itertools
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Type, Union, cast
+from pathlib import Path
 
-from django.db.models import Field as DjangoField
-from django.db.models import ManyToManyRel, ManyToOneRel, Model
-from pydantic import create_model as create_pydantic_model
+from webapp.display.layouts.models import MenuItem
+from webapp.display.page import Page, PageRenderer
+from webapp.endpoint.view import bp
+from webapp.worker.config import load_config, load_menu
+from webapp.worker.reload import setup_livereload
+from webapp.worker.style import setup_style
 
-from ninja.errors import ConfigError
-from ninja.orm.fields import get_schema_field
-from ninja.schema import Schema
+from sanic import Request, Sanic, html, redirect
 
-# MAYBE:
-# Schema = create_schema(Model, exclude=['id'])
-#
-# @api.post
-# def operation_create(request, payload: Schema):
-#     orm_instance = payload.orm.apply(Model())
-#     orm_instance.save()
-#
-# @api.post("/{id}")
-# def operation_edit(request, id: int, payload: Schema):
-#     orm_instance = payload.orm.apply(Model.objects.get(id=id))
-#     orm_instance.save()
-
-__all__ = ["SchemaFactory", "factory", "create_schema"]
-
-SchemaKey = Tuple[Type[Model], str, int, str, str, str, str]
+KNOWN_REDIRECTS = {
+    "guide/deployment/configuration.html": "guide/running/configuration.html",
+    "guide/deployment/development.html": "guide/running/development.html",
+    "guide/deployment/running.html": "guide/running/running.html",
+    "guide/deployment/manager.html": "guide/running/manager.html",
+    "guide/deployment/app-loader.html": "guide/running/app-loader.html",
+    "guide/deployment/inspector.html": "guide/running/inspector.html",
+}
 
 
-class SchemaFactory:
-    def __init__(self) -> None:
-        self.schemas: Dict[SchemaKey, Type[Schema]] = {}
-        self.schema_names: Set[str] = set()
+def _compile_sidebar_order(items: list[MenuItem]) -> list[str]:
+    order = []
+    for item in items:
+        if item.path:
+            order.append(item.path.removesuffix(".html") + ".md")
+        if item.items:
+            order.extend(_compile_sidebar_order(item.items))
+    return order
 
-    def create_schema(
-        self,
-        model: Type[Model],
-        *,
-        name: str = "",
-        depth: int = 0,
-        fields: Optional[List[str]] = None,
-        exclude: Optional[List[str]] = None,
-        optional_fields: Optional[List[str]] = None,
-        custom_fields: Optional[List[Tuple[str, Any, Any]]] = None,
-        base_class: Type[Schema] = Schema,
-    ) -> Type[Schema]:
-        name = name or model.__name__
 
-        if fields and exclude:
-            raise ConfigError("Only one of 'fields' or 'exclude' should be set.")
+def create_app(root: Path) -> Sanic:
+    app = Sanic("Documentation")
+    app.config.PUBLIC_DIR = root / "public"
+    app.config.CONTENT_DIR = root / "content"
+    app.config.CONFIG_DIR = root / "config"
+    app.config.STYLE_DIR = root / "style"
+    app.config.NODE_MODULES_DIR = root / "node_modules"
+    app.config.LANGUAGES = ["en"]
+    app.config.SIDEBAR = load_menu(
+        app.config.CONFIG_DIR / "en" / "sidebar.yaml"
+    )
+    app.config.NAVBAR = load_menu(app.config.CONFIG_DIR / "en" / "navbar.yaml")
+    app.config.GENERAL = load_config(
+        app.config.CONFIG_DIR / "en" / "general.yaml"
+    )
 
-        key = self.get_key(
-            model, name, depth, fields, exclude, optional_fields, custom_fields
-        )
-        if key in self.schemas:
-            return self.schemas[key]
+    setup_livereload(app)
+    setup_style(app)
+    app.blueprint(bp)
 
-        model_fields_list = list(self._selected_model_fields(model, fields, exclude))
-        if optional_fields:
-            if optional_fields == "__all__":
-                optional_fields = [f.name for f in model_fields_list]
+    app.static("/assets/", app.config.PUBLIC_DIR / "assets")
 
-        definitions = {}
-        for fld in model_fields_list:
-            python_type, field_info = get_schema_field(
-                fld,
-                depth=depth,
-                optional=optional_fields and (fld.name in optional_fields),
+    @app.before_server_start
+    async def setup(app: Sanic):
+        app.ext.dependency(PageRenderer(base_title="Sanic User Guide"))
+        page_order = _compile_sidebar_order(app.config.SIDEBAR)
+        app.ctx.pages = Page.load_pages(app.config.CONTENT_DIR, page_order)
+        app.ctx.get_page = Page.get
+
+    @app.get("/", name="root")
+    @app.get("/index.html", name="index")
+    async def index(request: Request):
+        return redirect(request.app.url_for("page", language="en", path=""))
+
+    @app.get("/<language:str>", name="page-without-path")
+    @app.get("/<language:str>/<path:path>")
+    async def page(
+        request: Request,
+        page_renderer: PageRenderer,
+        language: str,
+        path: str = "",
+    ):
+        # TODO: Add more language support
+        if language != "api" and language not in app.config.LANGUAGES:
+            return redirect(
+                request.app.url_for("page", language="en", path=path)
             )
-            definitions[fld.name] = (python_type, field_info)
-
-        if custom_fields:
-            for fld_name, python_type, field_info in custom_fields:
-                # if not isinstance(field_info, FieldInfo):
-                #     field_info = Field(field_info)
-                definitions[fld_name] = (python_type, field_info)
-
-        if name in self.schema_names:
-            name = self._get_unique_name(name)
-
-        schema: Type[Schema] = create_pydantic_model(
-            name,
-            __config__=None,
-            __base__=base_class,
-            __module__=base_class.__module__,
-            __validators__={},
-            **definitions,
-        )  # type: ignore
-        # __model_name: str,
-        # *,
-        # __config__: ConfigDict | None = None,
-        # __base__: None = None,
-        # __module__: str = __name__,
-        # __validators__: dict[str, AnyClassMethod] | None = None,
-        # __cls_kwargs__: dict[str, Any] | None = None,
-        # **field_definitions: Any,
-        self.schemas[key] = schema
-        self.schema_names.add(name)
-        return schema
-
-    def get_key(
-        self,
-        model: Type[Model],
-        name: str,
-        depth: int,
-        fields: Union[str, List[str], None],
-        exclude: Optional[List[str]],
-        optional_fields: Optional[Union[List[str], str]],
-        custom_fields: Optional[List[Tuple[str, str, Any]]],
-    ) -> SchemaKey:
-        "returns a hashable value for all given parameters"
-        # TODO: must be a test that compares all kwargs from init to get_key
-        return (
-            model,
-            name,
-            depth,
-            str(fields),
-            str(exclude),
-            str(optional_fields),
-            str(custom_fields),
+        if path in KNOWN_REDIRECTS:
+            return redirect(
+                request.app.url_for(
+                    "page", language=language, path=KNOWN_REDIRECTS[path]
+                ),
+                status=301,
+            )
+        builder = page_renderer.render(request, language, path)
+        title_text = page_renderer.title()
+        return html(
+            str(builder),
+            headers={
+                "vary": "hx-request",
+                "x-title": title_text,
+            },
         )
 
-    def _get_unique_name(self, name: str) -> str:
-        "Returns a unique name by adding counter suffix"
-        for num in itertools.count(start=2):  # pragma: no branch
-            result = f"{name}{num}"
-            if result not in self.schema_names:
-                break
-        return result
+    @app.on_request
+    async def set_language(request: Request):
+        request.ctx.language = request.match_info.get(
+            "language", Page.DEFAULT_LANGUAGE
+        )
 
-    def _selected_model_fields(
-        self,
-        model: Type[Model],
-        fields: Optional[List[str]] = None,
-        exclude: Optional[List[str]] = None,
-    ) -> Iterator[DjangoField]:
-        "Returns iterator for model fields based on `exclude` or `fields` arguments"
-        all_fields = {f.name: f for f in self._model_fields(model)}
-
-        if not fields and not exclude:
-            for f in all_fields.values():
-                yield f
-
-        invalid_fields = (set(fields or []) | set(exclude or [])) - all_fields.keys()
-        if invalid_fields:
-            raise ConfigError(
-                f"DjangoField(s) {invalid_fields} are not in model {model}"
-            )
-
-        if fields:
-            for name in fields:
-                yield all_fields[name]
-        if exclude:
-            for f in all_fields.values():
-                if f.name not in exclude:
-                    yield f
-
-    def _model_fields(self, model: Type[Model]) -> Iterator[DjangoField]:
-        "returns iterator with all the fields that can be part of schema"
-        for fld in model._meta.get_fields():
-            if isinstance(fld, (ManyToOneRel, ManyToManyRel)):
-                # skipping relations
-                continue
-            yield cast(DjangoField, fld)
-
-
-factory = SchemaFactory()
-
-create_schema = factory.create_schema
+    return app

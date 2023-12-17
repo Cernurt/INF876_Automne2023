@@ -1,141 +1,60 @@
-# -*- coding: utf-8 -*-
-"""
-    jinja2.testsuite.imports
-    ~~~~~~~~~~~~~~~~~~~~~~~~
+# Copyright The Lightning AI team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""General utilities."""
+import functools
+import sys
 
-    Tests the import features (with includes).
+from lightning_utilities.core.imports import RequirementCache, package_available
 
-    :copyright: (c) 2010 by the Jinja Team.
-    :license: BSD, see LICENSE for more details.
-"""
-import unittest
+from lightning.pytorch.utilities.rank_zero import rank_zero_warn
 
-from jinja2.testsuite import JinjaTestCase
+_PYTHON_GREATER_EQUAL_3_11_0 = (sys.version_info.major, sys.version_info.minor) >= (3, 11)
+_TORCHMETRICS_GREATER_EQUAL_0_8_0 = RequirementCache("torchmetrics>=0.8.0")
+_TORCHMETRICS_GREATER_EQUAL_0_9_1 = RequirementCache("torchmetrics>=0.9.1")
+_TORCHMETRICS_GREATER_EQUAL_0_11 = RequirementCache("torchmetrics>=0.11.0")  # using new API with task
+_TORCHMETRICS_GREATER_EQUAL_1_0_0 = RequirementCache("torchmetrics>=1.0.0")
 
-from jinja2 import Environment, DictLoader
-from jinja2.exceptions import TemplateNotFound, TemplatesNotFound
-
-
-test_env = Environment(loader=DictLoader(dict(
-    module='{% macro test() %}[{{ foo }}|{{ bar }}]{% endmacro %}',
-    header='[{{ foo }}|{{ 23 }}]',
-    o_printer='({{ o }})'
-)))
-test_env.globals['bar'] = 23
-
-
-class ImportsTestCase(JinjaTestCase):
-
-    def test_context_imports(self):
-        t = test_env.from_string('{% import "module" as m %}{{ m.test() }}')
-        assert t.render(foo=42) == '[|23]'
-        t = test_env.from_string('{% import "module" as m without context %}{{ m.test() }}')
-        assert t.render(foo=42) == '[|23]'
-        t = test_env.from_string('{% import "module" as m with context %}{{ m.test() }}')
-        assert t.render(foo=42) == '[42|23]'
-        t = test_env.from_string('{% from "module" import test %}{{ test() }}')
-        assert t.render(foo=42) == '[|23]'
-        t = test_env.from_string('{% from "module" import test without context %}{{ test() }}')
-        assert t.render(foo=42) == '[|23]'
-        t = test_env.from_string('{% from "module" import test with context %}{{ test() }}')
-        assert t.render(foo=42) == '[42|23]'
-
-    def test_trailing_comma(self):
-        test_env.from_string('{% from "foo" import bar, baz with context %}')
-        test_env.from_string('{% from "foo" import bar, baz, with context %}')
-        test_env.from_string('{% from "foo" import bar, with context %}')
-        test_env.from_string('{% from "foo" import bar, with, context %}')
-        test_env.from_string('{% from "foo" import bar, with with context %}')
-
-    def test_exports(self):
-        m = test_env.from_string('''
-            {% macro toplevel() %}...{% endmacro %}
-            {% macro __private() %}...{% endmacro %}
-            {% set variable = 42 %}
-            {% for item in [1] %}
-                {% macro notthere() %}{% endmacro %}
-            {% endfor %}
-        ''').module
-        assert m.toplevel() == '...'
-        assert not hasattr(m, '__missing')
-        assert m.variable == 42
-        assert not hasattr(m, 'notthere')
+_OMEGACONF_AVAILABLE = package_available("omegaconf")
+_TORCHVISION_AVAILABLE = RequirementCache("torchvision")
+_LIGHTNING_COLOSSALAI_AVAILABLE = RequirementCache("lightning-colossalai")
+_LIGHTNING_BAGUA_AVAILABLE = RequirementCache("lightning-bagua")
 
 
-class IncludesTestCase(JinjaTestCase):
-
-    def test_context_include(self):
-        t = test_env.from_string('{% include "header" %}')
-        assert t.render(foo=42) == '[42|23]'
-        t = test_env.from_string('{% include "header" with context %}')
-        assert t.render(foo=42) == '[42|23]'
-        t = test_env.from_string('{% include "header" without context %}')
-        assert t.render(foo=42) == '[|23]'
-
-    def test_choice_includes(self):
-        t = test_env.from_string('{% include ["missing", "header"] %}')
-        assert t.render(foo=42) == '[42|23]'
-
-        t = test_env.from_string('{% include ["missing", "missing2"] ignore missing %}')
-        assert t.render(foo=42) == ''
-
-        t = test_env.from_string('{% include ["missing", "missing2"] %}')
-        self.assert_raises(TemplateNotFound, t.render)
-        try:
-            t.render()
-        except TemplatesNotFound as e:
-            assert e.templates == ['missing', 'missing2']
-            assert e.name == 'missing2'
-        else:
-            assert False, 'thou shalt raise'
-
-        def test_includes(t, **ctx):
-            ctx['foo'] = 42
-            assert t.render(ctx) == '[42|23]'
-
-        t = test_env.from_string('{% include ["missing", "header"] %}')
-        test_includes(t)
-        t = test_env.from_string('{% include x %}')
-        test_includes(t, x=['missing', 'header'])
-        t = test_env.from_string('{% include [x, "header"] %}')
-        test_includes(t, x='missing')
-        t = test_env.from_string('{% include x %}')
-        test_includes(t, x='header')
-        t = test_env.from_string('{% include x %}')
-        test_includes(t, x='header')
-        t = test_env.from_string('{% include [x] %}')
-        test_includes(t, x='header')
-
-    def test_include_ignoring_missing(self):
-        t = test_env.from_string('{% include "missing" %}')
-        self.assert_raises(TemplateNotFound, t.render)
-        for extra in '', 'with context', 'without context':
-            t = test_env.from_string('{% include "missing" ignore missing ' +
-                                     extra + ' %}')
-            assert t.render() == ''
-
-    def test_context_include_with_overrides(self):
-        env = Environment(loader=DictLoader(dict(
-            main="{% for item in [1, 2, 3] %}{% include 'item' %}{% endfor %}",
-            item="{{ item }}"
-        )))
-        assert env.get_template("main").render() == "123"
-
-    def test_unoptimized_scopes(self):
-        t = test_env.from_string("""
-            {% macro outer(o) %}
-            {% macro inner() %}
-            {% include "o_printer" %}
-            {% endmacro %}
-            {{ inner() }}
-            {% endmacro %}
-            {{ outer("FOO") }}
-        """)
-        assert t.render().strip() == '(FOO)'
+@functools.lru_cache(maxsize=128)
+def _try_import_module(module_name: str) -> bool:
+    try:
+        __import__(module_name)
+        return True
+    # Also on AttributeError for failed imports like pl.LightningModule
+    except (ImportError, AttributeError) as err:
+        rank_zero_warn(f"Import of {module_name} package failed for some compatibility issues:\n{err}")
+        return False
 
 
-def suite():
-    suite = unittest.TestSuite()
-    suite.addTest(unittest.makeSuite(ImportsTestCase))
-    suite.addTest(unittest.makeSuite(IncludesTestCase))
-    return suite
+_LIGHTNING_GRAPHCORE_AVAILABLE = RequirementCache("lightning-graphcore>=0.1.0")
+
+
+def _graphcore_available_and_importable() -> bool:
+    # This is defined as a function instead of a constant to avoid circular imports, because `lightning_graphcore`
+    # also imports Lightning
+    return bool(_LIGHTNING_GRAPHCORE_AVAILABLE) and _try_import_module("lightning_graphcore")
+
+
+_LIGHTNING_HABANA_AVAILABLE = RequirementCache("lightning-habana>=1.2.0")
+
+
+def _habana_available_and_importable() -> bool:
+    # This is defined as a function instead of a constant to avoid circular imports, because `lightning_habana`
+    # also imports Lightning
+    return bool(_LIGHTNING_HABANA_AVAILABLE) and _try_import_module("lightning_habana")

@@ -1,9 +1,10 @@
+from jedi._compatibility import unicode, force_unicode
 from jedi import debug
-from jedi.inference.base_value import ValueSet, NO_VALUES, ValueWrapper
+from jedi.inference.base_value import ValueSet, NO_VALUES
 from jedi.inference.gradual.base import BaseTypingValue
 
 
-class TypeVarClass(ValueWrapper):
+class TypeVarClass(BaseTypingValue):
     def py__call__(self, arguments):
         unpacked = arguments.unpack()
 
@@ -17,9 +18,9 @@ class TypeVarClass(ValueWrapper):
         return ValueSet([TypeVar.create_cached(
             self.inference_state,
             self.parent_context,
-            tree_name=self.tree_node.name,
-            var_name=var_name,
-            unpacked_args=unpacked,
+            self._tree_name,
+            var_name,
+            unpacked
         )])
 
     def _find_string_name(self, lazy_value):
@@ -39,14 +40,17 @@ class TypeVarClass(ValueWrapper):
             return None
         else:
             safe_value = method(default=None)
-            if isinstance(safe_value, str):
+            if self.inference_state.environment.version_info.major == 2:
+                if isinstance(safe_value, bytes):
+                    return force_unicode(safe_value)
+            if isinstance(safe_value, (str, unicode)):
                 return safe_value
             return None
 
 
 class TypeVar(BaseTypingValue):
     def __init__(self, parent_context, tree_name, var_name, unpacked_args):
-        super().__init__(parent_context, tree_name)
+        super(TypeVar, self).__init__(parent_context, tree_name)
         self._var_name = var_name
 
         self._constraints_lazy_values = []
@@ -98,30 +102,16 @@ class TypeVar(BaseTypingValue):
         else:
             if found:
                 return found
-        return ValueSet({self})
+        return self._get_classes() or ValueSet({self})
 
     def execute_annotation(self):
         return self._get_classes().execute_annotation()
 
-    def infer_type_vars(self, value_set):
-        def iterate():
-            for v in value_set:
-                cls = v.py__class__()
-                if v.is_function() or v.is_class():
-                    cls = TypeWrapper(cls, v)
-                yield cls
-
+    def infer_type_vars(self, value_set, is_class_value=False):
         annotation_name = self.py__name__()
-        return {annotation_name: ValueSet(iterate())}
+        if not is_class_value:
+            return {annotation_name: value_set.py__class__()}
+        return {annotation_name: value_set}
 
     def __repr__(self):
         return '<%s: %s>' % (self.__class__.__name__, self.py__name__())
-
-
-class TypeWrapper(ValueWrapper):
-    def __init__(self, wrapped_value, original_value):
-        super().__init__(wrapped_value)
-        self._original_value = original_value
-
-    def execute_annotation(self):
-        return ValueSet({self._original_value})

@@ -1,103 +1,216 @@
-from .helpers.file_func import get_home, get_path, get_config_dir
-from .helpers.obj_factory import Singleton
-from . import __version__ as version
-from .externals.moduleman.registrant import MulRegistrant
-from .externals.moduleman.loader import DirLoader
-from .externals.settings.settings import SettingsBase
-from .exception import FuzzExceptNoPluginError, FuzzExceptPluginLoadError
+# -*- coding: utf-8 -*-
+from itertools import chain
+from operator import itemgetter
 
-import os
+import jedi
+from jedi.api.completion import Parameter
 
+from .console_logging import getLogger
+from .utils import unique
 
-ERROR_CODE = -1
-BASELINE_CODE = -2
+logger = getLogger(__name__)
 
 
-class Settings(SettingsBase):
-    def get_config_file(self):
-        config_file = "wfuzz.ini"
+class JediFacade:
+    """Facade to call Jedi API.
 
-        config = os.path.join(get_config_dir(check=False), config_file)
-        legacy_config = os.path.join(get_home(check=False), config_file)
 
-        if os.path.exists(config):
-            return config
-        elif os.path.exists(legacy_config):
-            return legacy_config
-        return os.path.join(get_config_dir(check=True), config_file)
-
-    def set_defaults(self):
-        return dict(
-            plugins=[("bing_apikey", ""), ("shodan_apikey", "")],
-            kbase=[
-                (
-                    "discovery.blacklist",
-                    ".svg-.css-.js-.jpg-.gif-.png-.jpeg-.mov-.avi-.flv-.ico",
-                )
-            ],
-            connection=[
-                ("concurrent", "10"),
-                ("conn_delay", "90"),
-                ("req_delay", "90"),
-                ("retries", "3"),
-                ("User-Agent", "Wfuzz/%s" % version),
-            ],
-            general=[
-                ("default_printer", "raw"),
-                ("cancel_on_plugin_except", "0"),
-                ("concurrent_plugins", "3"),
-                ("lookup_dirs", "."),
-                ("encode_space", "1"),
-            ],
+     Action       | Method
+    ===============================
+     autocomplete | get_autocomplete
+    -------------------------------
+     goto         | get_goto
+    -------------------------------
+     usages       | get_usages
+    -------------------------------
+     funcargs     | get_funcargs
+    --------------------------------
+    """
+    def __init__(
+        self,
+        project,
+        complete_funcargs,
+        source,
+        line,
+        column,
+        filename=''
+    ):
+        filename = filename or None
+        self.script = jedi.Script(
+            source=source,
+            path=filename,
+            project=project,
         )
+        self._line = line
+        self._column = column
+        self.auto_complete_function_params = complete_funcargs
 
-
-class MyRegistrant(MulRegistrant):
-    def get_plugin(self, identifier):
+    def get(self, _action, *args, **kwargs):
+        """Action dispatcher."""
         try:
-            return MulRegistrant.get_plugin(self, identifier)
-        except KeyError as e:
-            raise FuzzExceptNoPluginError(
-                "Requested plugin %s. Error: %s" % (identifier, str(e))
+            return getattr(self, 'get_' + _action)(*args, **kwargs)
+        except Exception:
+            logger.exception('`JediFacade.get_{0}` failed'.format(_action))
+
+    def get_goto(self, follow_imports=True):
+        """ Jedi "Go To Definition" """
+        return self._goto(follow_imports=follow_imports)
+
+    def get_usages(self, *args, **kwargs):
+        """ Jedi "Find Usage" """
+        return self._usages()
+
+    def get_funcargs(self, *args, **kwargs):
+        """Complete callable object parameters with Jedi."""
+        complete_all = self.auto_complete_function_params == 'all'
+        call_parameters = self._complete_call_assigments(
+            with_keywords=complete_all,
+        )
+        return ', '.join(p[1] for p in call_parameters)
+
+    def get_autocomplete(self, *args, **kwargs):
+        """Jedi completion."""
+        completions = chain(
+            self._complete_call_assigments(with_keywords=True),
+            self._completion()
+        )
+        return list(unique(completions, itemgetter(0)))
+
+    def get_docstring(self, *args, **kwargs):
+        return self._docstring()
+
+    def get_signature(self, *args, **kwargs):
+        return self._docstring(signature=1)
+
+    def _docstring(self, signature=0):
+        """ Jedi show doctring or signature
+
+        :rtype: str
+        """
+        defs = self.script.infer(line=self._line, column=self._column)
+        assert isinstance(defs, list)
+
+        if len(defs) > 0:
+            if signature:
+                calltip_signature = defs[0].docstring().split('\n\n')[0]
+                return calltip_signature.replace('\n', ' ').replace(' = ', '=')
+            else:
+                return defs[0].docstring()
+
+    def _completion(self):
+        """Regular completions.
+
+        :rtype: list of (str, str)
+        """
+        completions = self.script.complete(
+            line=self._line,
+            column=self._column,
+            fuzzy=True,
+        )
+        for complete in completions:
+            yield complete.name + '\t' + complete.type, complete.name
+
+    def _goto(self, follow_imports):
+        """Jedi "go to Definitions" functionality.
+
+        :rtype: list of (str, int, int) or None
+        """
+        definitions = self.script.goto(
+            line=self._line,
+            column=self._column,
+            follow_imports=follow_imports,
+        )
+        if all(d.type == 'import' for d in definitions):
+            # check if it an import string and if it is get definition
+            definitions = self.script.infer(
+                line=self._line,
+                column=self._column,
             )
+        return [(i.module_path, i.line, i.column + 1)
+                for i in definitions if not i.in_builtin_module()]
 
+    def _usages(self):
+        """Jedi "find usages" functionality.
 
-class Facade(metaclass=Singleton):
-    def __init__(self):
-
-        self.__plugins = dict(
-            printers=None, scripts=None, encoders=None, iterators=None, payloads=None,
+        :rtype: list of (str, int, int)
+        """
+        usages = self.script.get_references(
+            line=self._line,
+            column=self._column,
         )
+        return [
+            (i.module_path, i.line, i.column + 1)
+            for i in usages if not i.in_builtin_module()
+        ]
 
-        self.sett = Settings()
+    def _complete_call_assigments(self, with_keywords=True):
+        """Get function or class parameters and build Sublime Snippet string
+        for completion
 
-    def _load(self, cat):
+        :rtype: str
+        """
         try:
-            if cat not in self.__plugins:
-                raise FuzzExceptNoPluginError("Non-existent plugin category %s" % cat)
+            call_definition = self.script.get_signatures(
+                line=self._line,
+                column=self._column,
+            )[0]
+        except IndexError:
+            # probably not a function/class call
+            return
 
-            if not self.__plugins[cat]:
-                loader_list = []
-                loader_list.append(
-                    DirLoader(**{"base_dir": cat, "base_path": get_path("../plugins")})
-                )
-                loader_list.append(
-                    DirLoader(**{"base_dir": cat, "base_path": get_home()})
-                )
-                self.__plugins[cat] = MyRegistrant(loader_list)
+        yield from get_function_parameters(call_definition, with_keywords)
 
-            return self.__plugins[cat]
-        except Exception as e:
-            raise FuzzExceptPluginLoadError("Error loading plugins: %s" % str(e))
 
-    def proxy(self, which):
-        return self._load(which)
+def get_function_parameters(call_signature, with_keywords=True):
+    """Return list function parameters, prepared for sublime completion.
 
-    def get_registrants(self):
-        return self.__plugins.keys()
+    Tuple contains parameter name and default value
 
-    def __getattr__(self, name):
-        if name in ["printers", "payloads", "iterators", "encoders", "scripts"]:
-            return self._load(name)
+    Parameters list excludes: self, *args and **kwargs parameters
+
+    :type call_signature: jedi.api.classes.CallSignature
+    :rtype: list of (str, str or None)
+    """
+    if not call_signature:
+        return []
+
+    params = []
+    for param in call_signature.params:
+        logger.debug('Parameter: {0}'.format((
+            type(param._name),
+            param._name.get_kind(),
+            param._name.string_name,
+            param.description,
+        )))
+
+        # print call sign looks like: "value, ..., sep, end, file, flush"
+        # and all params after '...' are non required and not a keywords
+        if not with_keywords and param.name == '...':
+            break
+
+        if (not param.name or
+                param.name in ('self', '...') or
+                param._name.get_kind() == Parameter.VAR_POSITIONAL or
+                param._name.get_kind() == Parameter.VAR_KEYWORD):
+            continue
+
+        param_description = param.description.replace('param ', '')
+        is_keyword = '=' in param_description
+
+        if is_keyword and with_keywords:
+            default_value = param_description.rsplit('=', 1)[1].lstrip()
+            params.append((param.name, default_value))
+        elif is_keyword and not with_keywords:
+            continue
         else:
-            raise AttributeError
+            params.append((param.name, None))
+
+    yield from format_function_parameters(params)
+
+
+def format_function_parameters(parameters):
+    for index, (name, value) in enumerate(parameters, 1):
+        if value is not None:
+            yield (name + '\tparam', '%s=${%d:%s}' % (name, index, value))
+        else:
+            yield (name + '\tparam', '${%d:%s}' % (index, name))

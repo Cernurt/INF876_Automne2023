@@ -1,80 +1,186 @@
-import concurrent.futures
-from typing import List
+import torch
+from ..modules import Module
+from . import comm
+from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Sequence, Set, TypeVar, Union, cast
+from torch._utils import _get_device_index
 
-import replicate
-from pydantic import Field
+from collections import OrderedDict
 
-from ...core.main import ChatMessage
-from .base import LLM
+if TYPE_CHECKING:
+    import torch.jit
+    import torch.jit._state
+
+__all__ = ['replicate']
+
+def _is_script_module(module: Module) -> bool:
+    import torch.jit
+    return isinstance(module, torch.jit.ScriptModule)
 
 
-class ReplicateLLM(LLM):
-    """
-    Replicate is a great option for newly released language models or models that you've deployed through their platform. Sign up for an account [here](https://replicate.ai/), copy your API key, and then select any model from the [Replicate Streaming List](https://replicate.com/collections/streaming-language-models). Change `~/.continue/config.json` to look like this:
+def _is_script_method(module: Module) -> bool:
+    import torch.jit
+    return isinstance(module, torch._C.ScriptMethod)
 
-    ```json title="~/.continue/config.json"
-    {
-        "models": [{
-            "title": "Replicate CodeLLama",
-            "provider": "replicate",
-            "model": "codellama-13b",
-            "api_key": "YOUR_API_KEY"
-        }]
-    }
-    ```
 
-    If you don't specify the `model` parameter, it will default to `replicate/llama-2-70b-chat:58d078176e02c219e11eb4da5a02a7830a283b14cf8f94537af893ccff5ee781`.
-    """
+def _init_script_module() -> "torch.jit.ScriptModule":
+    import torch.jit
+    return torch.jit.ScriptModule()
 
-    api_key: str = Field(..., description="Replicate API key")
 
-    model: str = "replicate/llama-2-70b-chat:58d078176e02c219e11eb4da5a02a7830a283b14cf8f94537af893ccff5ee781"
+def _is_jit_enabled() -> "torch.jit._state.EnabledProxy":
+    import torch.jit._state
+    return torch.jit._state._enabled
 
-    @property
-    def _client(self) -> replicate.Client:
-        return replicate.Client(api_token=self.api_key)
 
-    def get_model_name(self):
-        return {
-            "codellama-7b": "meta/codellama-7b-instruct:6527b83e01e41412db37de5110a8670e3701ee95872697481a355e05ce12af0e",
-            "codellama-13b": "meta/codellama-13b-instruct:1f01a52ff933873dff339d5fb5e1fd6f24f77456836f514fa05e91c1a42699c7",
-            "codellama-34b": "meta/codellama-34b-instruct:8281a5c610f6e88237ff3ddaf3c33b56f60809e2bdd19fbec2fda742aa18167e",
-            "llama2-7b": "meta/llama-2-7b-chat:8e6975e5ed6174911a6ff3d60540dfd4844201974602551e10e9e87ab143d81e",
-            "llama2-13b": "meta/llama-2-13b-chat:f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d",
-            "zephyr-7b": "nateraw/zephyr-7b-beta:b79f33de5c6c4e34087d44eaea4a9d98ce5d3f3a09522f7328eea0685003a931",
-            "mistral-7b": "mistralai/mistral-7b-instruct-v0.1:83b6a56e7c828e667f21fd596c338fd4f0039b46bcfa18d973e8e70e455fda70",
-            "wizardcoder-34b": "andreasjansson/wizardcoder-python-34b-v1-gguf:67eed332a5389263b8ede41be3ee7dc119fa984e2bde287814c4abed19a45e54",
-        }.get(self.model, self.model)
+# Check if we can safely replicate the module.
+# there are two types of module:
+# 1. python modules
+# 2. ScriptModule
+#
+# currently a module cannot be replicated properly if the descendants of
+# any ScriptModule contains python module (type 1 above)
+def _replicatable_module(module: Module, memo: Optional[Set[Module]] = None) -> bool:
 
-    async def _complete(self, prompt: str, options):
-        def helper():
-            output = self._client.run(
-                self.get_model_name(), input={"message": prompt, "prompt": prompt}
-            )
-            completion = ""
-            for item in output:
-                completion += item
+    # module.modules() contains module itself as the first element
+    def descendant_modules(module: Module) -> Iterator[Module]:
+        gen = module.modules()
+        next(gen)
+        return gen
 
-            return completion
+    if not _is_jit_enabled():
+        return True
+    if memo is None:
+        memo = set()
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(helper)
-            completion = future.result()
+    # memoize visited modules
+    memo.add(module)
+    if _is_script_module(module):
+        memo.update(descendant_modules(module))
+        return all(_is_script_module(descendant) for
+                   descendant in descendant_modules(module))
 
-        return completion
+    for child in module.children():
+        # since any unreplicatable module will cause the check to return
+        # False early, visited modules here can be safely ignored.
+        if child in memo:
+            continue
+        if not _replicatable_module(child, memo):
+            return False
 
-    async def _stream_complete(self, prompt, options):
-        for item in self._client.run(
-            self.get_model_name(), input={"message": prompt, "prompt": prompt}
-        ):
-            yield item
+    return True
 
-    async def _stream_chat(self, messages: List[ChatMessage], options):
-        for item in self._client.run(
-            self.get_model_name(),
-            input={
-                "message": messages[-1].content,
-                "prompt": messages[-1].content,
-            },
-        ):
-            yield ChatMessage(role="assistant", content=item)
+def _broadcast_coalesced_reshape(
+    tensors: Sequence[torch.Tensor],
+    devices: Sequence[Union[int, torch.device]],
+    detach: bool = False,
+) -> List[List[torch.Tensor]]:
+    from ._functions import Broadcast
+    if detach:
+        return comm.broadcast_coalesced(tensors, devices)
+    else:
+        # Use the autograd function to broadcast if not detach
+        if len(tensors) > 0:
+            tensor_copies = Broadcast.apply(devices, *tensors)
+            return [tensor_copies[i:i + len(tensors)]
+                    for i in range(0, len(tensor_copies), len(tensors))]
+        else:
+            return []
+
+
+T = TypeVar("T", bound=Module)
+
+
+def replicate(
+    network: T,
+    devices: Sequence[Union[int, torch.device]],
+    detach: bool = False,
+) -> List[T]:
+    if not _replicatable_module(network):
+        raise RuntimeError("Cannot replicate network where python modules are "
+                           "childrens of ScriptModule")
+
+    if not devices:
+        return []
+
+    devices = [_get_device_index(x, True) for x in devices]
+    num_replicas = len(devices)
+
+    params = list(network.parameters())
+    param_indices = {param: idx for idx, param in enumerate(params)}
+    param_copies = _broadcast_coalesced_reshape(params, devices, detach)
+
+    buffers = list(network.buffers())
+    buffers_rg: List[torch.Tensor] = []
+    buffers_not_rg: List[torch.Tensor] = []
+    for buf in buffers:
+        if buf.requires_grad and not detach:
+            buffers_rg.append(buf)
+        else:
+            buffers_not_rg.append(buf)
+
+    buffer_indices_rg = {buf: idx for idx, buf in enumerate(buffers_rg)}
+    buffer_indices_not_rg = {buf: idx for idx, buf in enumerate(buffers_not_rg)}
+
+    buffer_copies_rg = _broadcast_coalesced_reshape(buffers_rg, devices, detach=detach)
+    buffer_copies_not_rg = _broadcast_coalesced_reshape(buffers_not_rg, devices, detach=True)
+
+    modules = list(network.modules())
+    module_copies: List[List[Module]] = [[] for _ in devices]
+    module_indices: Dict[Module, int] = {}
+
+    for i, module in enumerate(modules):
+        module_indices[module] = i
+        for j in range(num_replicas):
+            replica = module._replicate_for_data_parallel()
+            # This is a temporary fix for DDP. DDP needs to access the
+            # replicated model parameters. It used to do so through
+            # `mode.parameters()`. The fix added in #33907 for DP stops the
+            # `parameters()` API from exposing the replicated parameters.
+            # Hence, we add a `_former_parameters` dict here to support DDP.
+            replica._former_parameters = OrderedDict()
+
+            module_copies[j].append(replica)
+
+    for i, module in enumerate(modules):
+        for key, child in module._modules.items():
+            if child is None:
+                for j in range(num_replicas):
+                    replica = module_copies[j][i]
+                    replica._modules[key] = None
+            else:
+                module_idx = module_indices[child]
+                for j in range(num_replicas):
+                    replica = module_copies[j][i]
+                    setattr(replica, key, module_copies[j][module_idx])
+        for key, param in module._parameters.items():
+            if param is None:
+                for j in range(num_replicas):
+                    replica = module_copies[j][i]
+                    replica._parameters[key] = None
+            else:
+                param_idx = param_indices[param]
+                for j in range(num_replicas):
+                    replica = module_copies[j][i]
+                    param_copy = param_copies[j][param_idx]
+                    # parameters in replicas are no longer leaves,
+                    # so setattr them as non-parameter attributes
+                    setattr(replica, key, param_copy)
+                    # expose the parameter for DDP
+                    replica._former_parameters[key] = param_copy
+        for key, buf in module._buffers.items():  # type: ignore[assignment]
+            if buf is None:
+                for j in range(num_replicas):
+                    replica = module_copies[j][i]
+                    replica._buffers[key] = None
+            else:
+                if buf.requires_grad and not detach:
+                    buffer_copies = buffer_copies_rg
+                    buffer_idx = buffer_indices_rg[buf]
+                else:
+                    buffer_copies = buffer_copies_not_rg
+                    buffer_idx = buffer_indices_not_rg[buf]
+                for j in range(num_replicas):
+                    replica = module_copies[j][i]
+                    setattr(replica, key, buffer_copies[j][buffer_idx])
+
+    return [cast(T, module_copies[j][0]) for j in range(num_replicas)]

@@ -1,129 +1,94 @@
-from flask import request, redirect
+"""
+Built-in, globally-available admin actions.
+"""
+
+from django.contrib import messages
+from django.contrib.admin import helpers
+from django.contrib.admin.decorators import action
+from django.contrib.admin.utils import model_ngettext
+from django.core.exceptions import PermissionDenied
+from django.template.response import TemplateResponse
+from django.utils.translation import gettext as _
+from django.utils.translation import gettext_lazy
 
 
-from flask_admin import tools
-from flask_admin._compat import text_type
-from flask_admin.helpers import get_redirect_target, flash_errors
-
-
-def action(name, text, confirmation=None):
+@action(
+    permissions=["delete"],
+    description=gettext_lazy("Delete selected %(verbose_name_plural)s"),
+)
+def delete_selected(modeladmin, request, queryset):
     """
-        Use this decorator to expose actions that span more than one
-        entity (model, file, etc)
+    Default action which deletes the selected objects.
 
-        :param name:
-            Action name
-        :param text:
-            Action text.
-        :param confirmation:
-            Confirmation text. If not provided, action will be executed
-            unconditionally.
+    This action first displays a confirmation page which shows all the
+    deletable objects, or, if the user has no permission one of the related
+    childs (foreignkeys), a "permission denied" message.
+
+    Next, it deletes all selected objects and redirects back to the change list.
     """
-    def wrap(f):
-        f._action = (name, text, confirmation)
-        return f
+    opts = modeladmin.model._meta
+    app_label = opts.app_label
 
-    return wrap
+    # Populate deletable_objects, a data structure of all related objects that
+    # will also be deleted.
+    (
+        deletable_objects,
+        model_count,
+        perms_needed,
+        protected,
+    ) = modeladmin.get_deleted_objects(queryset, request)
 
+    # The user has already confirmed the deletion.
+    # Do the deletion and return None to display the change list view again.
+    if request.POST.get("post") and not protected:
+        if perms_needed:
+            raise PermissionDenied
+        n = len(queryset)
+        if n:
+            modeladmin.log_deletions(request, queryset)
+            modeladmin.delete_queryset(request, queryset)
+            modeladmin.message_user(
+                request,
+                _("Successfully deleted %(count)d %(items)s.")
+                % {"count": n, "items": model_ngettext(modeladmin.opts, n)},
+                messages.SUCCESS,
+            )
+        # Return None to display the change list page again.
+        return None
 
-class ActionsMixin(object):
-    """
-        Actions mixin.
+    objects_name = model_ngettext(queryset)
 
-        In some cases, you might work with more than one "entity" (model, file, etc) in
-        your admin view and will want to perform actions on a group of entities simultaneously.
+    if perms_needed or protected:
+        title = _("Cannot delete %(name)s") % {"name": objects_name}
+    else:
+        title = _("Are you sure?")
 
-        In this case, you can add this functionality by doing this:
-        1. Add this mixin to your administrative view class
-        2. Call `init_actions` in your class constructor
-        3. Expose actions view
-        4. Import `actions.html` library and add call library macros in your template
-    """
+    context = {
+        **modeladmin.admin_site.each_context(request),
+        "title": title,
+        "subtitle": None,
+        "objects_name": str(objects_name),
+        "deletable_objects": [deletable_objects],
+        "model_count": dict(model_count).items(),
+        "queryset": queryset,
+        "perms_lacking": perms_needed,
+        "protected": protected,
+        "opts": opts,
+        "action_checkbox_name": helpers.ACTION_CHECKBOX_NAME,
+        "media": modeladmin.media,
+    }
 
-    def __init__(self):
-        """
-            Default constructor.
-        """
-        self._actions = []
-        self._actions_data = {}
+    request.current_app = modeladmin.admin_site.name
 
-    def init_actions(self):
-        """
-            Initialize list of actions for the current administrative view.
-        """
-        self._actions = []
-        self._actions_data = {}
-
-        for p in dir(self):
-            attr = tools.get_dict_attr(self, p)
-
-            if hasattr(attr, '_action'):
-                name, text, desc = attr._action
-
-                self._actions.append((name, text))
-
-                # TODO: Use namedtuple
-                # Reason why we need getattr here - what's in attr is not
-                # bound to the object.
-                self._actions_data[name] = (getattr(self, p), text, desc)
-
-    def is_action_allowed(self, name):
-        """
-            Verify if action with `name` is allowed.
-
-            :param name:
-                Action name
-        """
-        return True
-
-    def get_actions_list(self):
-        """
-            Return a list and a dictionary of allowed actions.
-        """
-        actions = []
-        actions_confirmation = {}
-
-        for act in self._actions:
-            name, text = act
-
-            if self.is_action_allowed(name):
-                actions.append((name, text_type(text)))
-
-                confirmation = self._actions_data[name][2]
-                if confirmation:
-                    actions_confirmation[name] = text_type(confirmation)
-
-        return actions, actions_confirmation
-
-    def handle_action(self, return_view=None):
-        """
-            Handle action request.
-
-            :param return_view:
-                Name of the view to return to after the request.
-                If not provided, will return user to the return url in the form
-                or the list view.
-        """
-        form = self.action_form()
-
-        if self.validate_form(form):
-            # using getlist instead of FieldList for backward compatibility
-            ids = request.form.getlist('rowid')
-            action = form.action.data
-
-            handler = self._actions_data.get(action)
-
-            if handler and self.is_action_allowed(action):
-                response = handler[0](ids)
-
-                if response is not None:
-                    return response
-        else:
-            flash_errors(form, message='Failed to perform action. %(error)s')
-
-        if return_view:
-            url = self.get_url('.' + return_view)
-        else:
-            url = get_redirect_target() or self.get_url('.index_view')
-
-        return redirect(url)
+    # Display the confirmation page
+    return TemplateResponse(
+        request,
+        modeladmin.delete_selected_confirmation_template
+        or [
+            "admin/%s/%s/delete_selected_confirmation.html"
+            % (app_label, opts.model_name),
+            "admin/%s/delete_selected_confirmation.html" % app_label,
+            "admin/delete_selected_confirmation.html",
+        ],
+        context,
+    )

@@ -1,112 +1,86 @@
-from .constants import (
-    EXTRACT_IMAGES,
-    FORMAT_CHECKS,
-    GDOC,
-    PROXY,
+"""Form fields converter subset from graphene_django for use in Saleor."""
+
+from functools import singledispatch
+
+import graphene
+from django import forms
+from django.core.exceptions import ImproperlyConfigured
+
+from ..filters import (
+    EnumFilter,
+    EnumWhereFilter,
+    GlobalIDFormField,
+    GlobalIDMultipleChoiceField,
+    ListObjectTypeFilter,
+    ListObjectTypeWhereFilter,
+    ObjectTypeFilter,
+    ObjectTypeWhereFilter,
+    OperationObjectTypeFilter,
+    OperationObjectTypeWhereFilter,
 )
-from .postprocessor import KnowledgePostProcessor
-from .utils.dependencies import check_dependencies
-from .utils.registry import SubclassRegisteringABCMeta
-from functools import wraps
-import os
+from .common import NonNullList
 
 
-def get_format(filename, format=None):
-    if format is None:
-        if filename.startswith('https://docs.google.com/document/d/'):
-            format = GDOC
-        elif filename.startswith('http://') or filename.startswith('https://'):
-            format = PROXY
-        elif '.' in filename:
-            format = os.path.splitext(filename)[1]
-            if format.startswith('.'):
-                format = format[1:]
-        else:
-            raise RuntimeError(
-                "Unable to determine a format automatically. Please manually specify the format, and try again.")
-    return format
+def get_form_field_description(field):
+    if hasattr(field, "help_text"):
+        return field.help_text or None
+    elif hasattr(field, "extra"):
+        return field.extra.get("help_text") or None
 
 
-class KnowledgePostConverter(object, metaclass=SubclassRegisteringABCMeta):
-    _registry_keys = None  # File extensions
+@singledispatch
+def convert_form_field(field):
+    raise ImproperlyConfigured(
+        f"Don't know how to convert the Django form field {field} ({field.__class__}) "
+        "to Graphene type"
+    )
 
-    def __init__(self, kp, format=None, postprocessors=None, interactive=False, **kwargs):
-        check_dependencies(
-            self.dependencies,
-            f'Whoops! You are missing some dependencies required to use `{self.__class__.__name__}` instances.',
-        )
-        self.kp = kp
-        self.format = format
-        if postprocessors is None:
-            postprocessors = [(EXTRACT_IMAGES, {}), (FORMAT_CHECKS, {})]
-        self.postprocessors = postprocessors
-        self.interactive = interactive
-        self.init(**kwargs)
 
-    @property
-    def dependencies(self):
-        return []
+@convert_form_field.register(forms.CharField)
+def convert_form_field_to_string(field):
+    return graphene.String(
+        description=get_form_field_description(field), required=field.required
+    )
 
-    def init(self):
-        pass
 
-    def __get_wrapped_with_postprocessors(self, f):
-        @wraps(f)
-        def wrapped(*args, **kwargs):
-            try:
-                kp = self.kp
-                f(*args, **kwargs)
-                postprocessors = self.postprocessors
+@convert_form_field.register(forms.NullBooleanField)
+def convert_form_field_to_nullboolean(field):
+    return graphene.Boolean(description=get_form_field_description(field))
 
-                if f.__name__ == 'from_file':
-                    filename = args[0] if len(args) > 0 else kwargs['filename']
-                    kp.orig_context = os.path.dirname(filename)
 
-                if postprocessors is None:
-                    postprocessors = []
-                for postprocessor, kwargs in postprocessors:
-                    KnowledgePostProcessor._get_subclass_for(
-                        postprocessor)(**kwargs).process(kp)
+@convert_form_field.register(forms.DecimalField)
+@convert_form_field.register(forms.FloatField)
+def convert_form_field_to_float(field):
+    return graphene.Float(
+        description=get_form_field_description(field), required=field.required
+    )
 
-                return kp
-            finally:
-                self.cleanup()
 
-        return wrapped
+@convert_form_field.register(OperationObjectTypeWhereFilter)
+@convert_form_field.register(OperationObjectTypeFilter)
+@convert_form_field.register(ObjectTypeWhereFilter)
+@convert_form_field.register(ObjectTypeFilter)
+@convert_form_field.register(EnumWhereFilter)
+@convert_form_field.register(EnumFilter)
+def convert_convert_enum(field):
+    return field.input_class(description=get_form_field_description(field))
 
-    def __getattribute__(self, attr):
-        if attr in ['from_file', 'from_string']:
-            return self.__get_wrapped_with_postprocessors(object.__getattribute__(self, attr))
-        return object.__getattribute__(self, attr)
 
-    def kp_write(self, md, headers=None, images={}):
-        return self.kp.write(md, headers=headers, images=images, interactive=self.interactive)
+@convert_form_field.register(GlobalIDFormField)
+def convert_form_field_to_id(field):
+    return graphene.ID(required=field.required)
 
-    def from_file(self, filename, **opts):
-        raise NotImplementedError
 
-    def from_string(self, string, **opts):
-        raise NotImplementedError
+@convert_form_field.register(ListObjectTypeWhereFilter)
+@convert_form_field.register(ListObjectTypeFilter)
+def convert_list_object_type(field):
+    return NonNullList(field.input_class, description=get_form_field_description(field))
 
-    def to_file(self, filename, **opts):
-        raise NotImplementedError
 
-    def to_string(self, **opts):
-        raise NotImplementedError
-
-    def cleanup(self):
-        pass
-
-    @classmethod
-    def for_file(cls, kp, filename, format=None, postprocessors=None, interactive=False):
-        return cls.for_format(kp, get_format(filename, format), postprocessors=postprocessors, interactive=interactive)
-
-    @classmethod
-    def for_format(cls, kp, format, postprocessors=None, interactive=False):
-        if format.lower() not in cls._registry:
-            keys = ','.join(list(cls._registry.keys()))
-            raise ValueError(
-                f"The knowledge repository does not support files of type '{format}'. Supported types are: {keys}."
-            )
-        return cls._get_subclass_for(format.lower())(kp, format=format, postprocessors=postprocessors,
-                                                     interactive=interactive)
+@convert_form_field.register(GlobalIDMultipleChoiceField)
+def convert_form_field_to_list(field):
+    return NonNullList(
+        graphene.ID,
+        required=field.required,
+        description=get_form_field_description(field),
+    )

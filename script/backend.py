@@ -1,176 +1,143 @@
-import re
-from datetime import datetime
-from g4f import ChatCompletion
-from flask import request, Response, stream_with_context
-from requests import get
-from server.config import special_instructions
+# Copyright The Lightning AI team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from abc import ABC, abstractmethod
+from functools import partial
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
+
+from lightning.app.core.queues import QueuingSystem
+from lightning.app.utilities.proxies import ProxyWorkRun, unwrap
+
+if TYPE_CHECKING:
+    import lightning.app
 
 
-class Backend_Api:
-    def __init__(self, bp, config: dict) -> None:
-        """
-        Initialize the Backend_Api class.
-        :param app: Flask application instance
-        :param config: Configuration dictionary
-        """
-        self.bp = bp
-        self.routes = {
-            '/backend-api/v2/conversation': {
-                'function': self._conversation,
-                'methods': ['POST']
-            }
-        }
+class Backend(ABC):
+    """The Backend provides and interface for the framework to communicate with resources in the cloud."""
 
-    def _conversation(self):
-        """  
-        Handles the conversation route.  
+    def __init__(self, entrypoint_file: str, queues: QueuingSystem, queue_id: str) -> None:
+        self.queues: QueuingSystem = queues
+        self.queue_id = queue_id
+        self.entrypoint_file = entrypoint_file
 
-        :return: Response object containing the generated conversation stream  
-        """
-        conversation_id = request.json['conversation_id']
+    @abstractmethod
+    def create_work(self, app: "lightning.app.LightningApp", work: "lightning.app.LightningWork") -> None:
+        pass
 
-        try:
-            jailbreak = request.json['jailbreak']
-            model = request.json['model']
-            messages = build_messages(jailbreak)
+    @abstractmethod
+    def update_work_statuses(self, works: List["lightning.app.LightningWork"]) -> None:
+        pass
 
-            # Generate response
-            response = ChatCompletion.create(
-                model=model,
-                chatId=conversation_id,
-                messages=messages
+    @abstractmethod
+    def stop_all_works(self, works: List["lightning.app.LightningWork"]) -> None:
+        pass
+
+    @abstractmethod
+    def resolve_url(self, app, base_url: Optional[str] = None) -> None:
+        pass
+
+    @abstractmethod
+    def stop_work(self, app: "lightning.app.LightningApp", work: "lightning.app.LightningWork") -> None:
+        pass
+
+    def _dynamic_run_wrapper(
+        self,
+        *args: Any,
+        app: "lightning.app.LightningApp",
+        work: "lightning.app.LightningWork",
+        work_run: Callable,
+        **kwargs: Any,
+    ) -> None:
+        if not work.name:
+            # the name is empty, which means this work was never assigned to a parent flow
+            raise AttributeError(
+                f"Failed to create process for {work.__class__.__name__}."
+                f" Make sure to set this work as an attribute of a `LightningFlow` before calling the run method."
             )
 
-            return Response(stream_with_context(generate_stream(response, jailbreak)), mimetype='text/event-stream')
+        # 1. Create and register the queues associated the work
+        self._register_queues(app, work)
 
-        except Exception as e:
-            print(e)
-            print(e.__traceback__.tb_next)
+        work.run = work_run
 
-            return {
-                '_action': '_ask',
-                'success': False,
-                "error": f"an error occurred {str(e)}"
-            }, 400
+        # 2. Create the work
+        self.create_work(app, work)
 
+        # 3. Attach backend
+        work._backend = self
 
-def build_messages(jailbreak):
-    """  
-    Build the messages for the conversation.  
+        # 4. Create the work proxy to manipulate the work
+        work.run = ProxyWorkRun(
+            work_run=work_run,
+            work_name=work.name,
+            work=work,
+            caller_queue=app.caller_queues[work.name],
+        )
 
-    :param jailbreak: Jailbreak instruction string  
-    :return: List of messages for the conversation  
-    """
-    _conversation = request.json['meta']['content']['conversation']
-    internet_access = request.json['meta']['content']['internet_access']
-    prompt = request.json['meta']['content']['parts'][0]
+        # 5. Run the work proxy
+        return work.run(*args, **kwargs)
 
-    # Add the existing conversation
-    conversation = _conversation
+    def _wrap_run_method(self, app: "lightning.app.LightningApp", work: "lightning.app.LightningWork"):
+        if work.run.__name__ == "_dynamic_run_wrapper":
+            return
 
-    # Add web results if enabled
-    if internet_access:
-        current_date = datetime.now().strftime("%Y-%m-%d")
-        query = f'Current date: {current_date}. ' + prompt["content"]
-        search_results = fetch_search_results(query)
-        conversation.extend(search_results)
+        work.run = partial(self._dynamic_run_wrapper, app=app, work=work, work_run=unwrap(work.run))
 
-    # Add jailbreak instructions if enabled
-    if jailbreak_instructions := getJailbreak(jailbreak):
-        conversation.extend(jailbreak_instructions)
+    def _prepare_queues(self, app: "lightning.app.LightningApp"):
+        kw = {"queue_id": self.queue_id}
+        app.delta_queue = self.queues.get_delta_queue(**kw)
+        app.readiness_queue = self.queues.get_readiness_queue(**kw)
+        app.api_response_queue = self.queues.get_api_response_queue(**kw)
+        app.error_queue = self.queues.get_error_queue(**kw)
+        app.api_publish_state_queue = self.queues.get_api_state_publish_queue(**kw)
+        app.api_delta_queue = app.delta_queue
+        app.request_queues = {}
+        app.response_queues = {}
+        app.copy_request_queues = {}
+        app.copy_response_queues = {}
+        app.caller_queues = {}
+        app.work_queues = {}
+        app.flow_to_work_delta_queues = {}
 
-    # Add the prompt
-    conversation.append(prompt)
-
-    # Reduce conversation size to avoid API Token quantity error
-    if len(conversation) > 3:
-        conversation = conversation[-4:]
-
-    return conversation
-
-
-def fetch_search_results(query):
-    """  
-    Fetch search results for a given query.  
-
-    :param query: Search query string  
-    :return: List of search results  
-    """
-    search = get('https://ddg-api.herokuapp.com/search',
-                 params={
-                     'query': query,
-                     'limit': 3,
-                 })
-
-    snippets = ""
-    for index, result in enumerate(search.json()):
-        snippet = f'[{index + 1}] "{result["snippet"]}" URL:{result["link"]}.'
-        snippets += snippet
-
-    response = "Here are some updated web searches. Use this to improve user response:"
-    response += snippets
-
-    return [{'role': 'system', 'content': response}]
+    def _register_queues(self, app, work):
+        kw = {"queue_id": self.queue_id, "work_name": work.name}
+        app.request_queues.update({work.name: self.queues.get_orchestrator_request_queue(**kw)})
+        app.response_queues.update({work.name: self.queues.get_orchestrator_response_queue(**kw)})
+        app.copy_request_queues.update({work.name: self.queues.get_orchestrator_copy_request_queue(**kw)})
+        app.copy_response_queues.update({work.name: self.queues.get_orchestrator_copy_response_queue(**kw)})
+        app.caller_queues.update({work.name: self.queues.get_caller_queue(**kw)})
+        app.flow_to_work_delta_queues.update({work.name: self.queues.get_flow_to_work_delta_queue(**kw)})
 
 
-def generate_stream(response, jailbreak):
-    """
-    Generate the conversation stream.
+class WorkManager(ABC):
+    """The work manager is an interface for the backend, runtime to control the LightningWork."""
 
-    :param response: Response object from ChatCompletion.create
-    :param jailbreak: Jailbreak instruction string
-    :return: Generator object yielding messages in the conversation
-    """
-    if getJailbreak(jailbreak):
-        response_jailbreak = ''
-        jailbroken_checked = False
-        for message in response:
-            response_jailbreak += message
-            if jailbroken_checked:
-                yield message
-            else:
-                if response_jailbroken_success(response_jailbreak):
-                    jailbroken_checked = True
-                if response_jailbroken_failed(response_jailbreak):
-                    yield response_jailbreak
-                    jailbroken_checked = True
-    else:
-        yield from response
+    def __init__(self, app: "lightning.app.LightningApp", work: "lightning.app.LightningWork"):
+        pass
 
+    @abstractmethod
+    def start(self) -> None:
+        pass
 
-def response_jailbroken_success(response: str) -> bool:
-    """Check if the response has been jailbroken.
+    @abstractmethod
+    def kill(self) -> None:
+        pass
 
-    :param response: Response string
-    :return: Boolean indicating if the response has been jailbroken
-    """
-    act_match = re.search(r'ACT:', response, flags=re.DOTALL)
-    return bool(act_match)
+    @abstractmethod
+    def restart(self) -> None:
+        pass
 
-
-def response_jailbroken_failed(response):
-    """
-    Check if the response has not been jailbroken.
-
-    :param response: Response string
-    :return: Boolean indicating if the response has not been jailbroken
-    """
-    return False if len(response) < 4 else not (response.startswith("GPT:") or response.startswith("ACT:"))
-
-
-def getJailbreak(jailbreak):
-    """  
-    Check if jailbreak instructions are provided.  
-
-    :param jailbreak: Jailbreak instruction string  
-    :return: Jailbreak instructions if provided, otherwise None  
-    """
-    if jailbreak != "default":
-        special_instructions[jailbreak][0]['content'] += special_instructions['two_responses_instruction']
-        if jailbreak in special_instructions:
-            special_instructions[jailbreak]
-            return special_instructions[jailbreak]
-        else:
-            return None
-    else:
-        return None
+    @abstractmethod
+    def is_alive(self) -> bool:
+        pass

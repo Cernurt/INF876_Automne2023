@@ -1,352 +1,125 @@
 """
-Goes through TCP connections and tries to find FTP control channels and
-associated data channels. Optionally, it will write out any file data it
-sees into a separate directory.
+An asynchronous FTP file download handler for scrapy which somehow emulates an http response.
 
-If a data connection is seen, it prints a message indicating the user, pass,
-and file requested. If the --ftp_dump flag is set, it also dumps the file into the
---ftp_outdir directory.
+FTP connection parameters are passed using the request meta field:
+- ftp_user (required)
+- ftp_password (required)
+- ftp_passive (by default, enabled) sets FTP connection passive mode
+- ftp_local_filename
+        - If not given, file data will come in the response.body, as a normal scrapy Response,
+        which will imply that the entire file will be on memory.
+        - if given, file data will be saved in a local file with the given name
+        This helps when downloading very big files to avoid memory issues. In addition, for
+        convenience the local file name will also be given in the response body.
+
+The status of the built html response will be, by default
+- 200 in case of success
+- 404 in case specified file was not found in the server (ftp code 550)
+
+or raise corresponding ftp exception otherwise
+
+The matching from server ftp command return codes to html response codes is defined in the
+CODE_MAPPING attribute of the handler class. The key 'default' is used for any code
+that is not explicitly present among the map keys. You may need to overwrite this
+mapping if want a different behaviour than default.
+
+In case of status 200 request, response.headers will come with two keys:
+    'Local Filename' - with the value of the local filename if given
+    'Size' - with size of the downloaded data
 """
 
-import dshell.core
-import dshell.util
-from dshell.output.alertout import AlertOutput
-
-import os
 import re
-import sys
+from io import BytesIO
+from urllib.parse import unquote
 
-# constants for channel type
-CTRL_CONN = 0
-DATA_CONN = 1
+from twisted.internet.protocol import ClientCreator, Protocol
+from twisted.protocols.ftp import CommandFailed, FTPClient
 
-class DshellPlugin(dshell.core.ConnectionPlugin):
+from scrapy.http import Response
+from scrapy.responsetypes import responsetypes
+from scrapy.utils.httpobj import urlparse_cached
+from scrapy.utils.python import to_bytes
 
-    def __init__(self):
-        super().__init__(
-            name="ftp",
-            description="alerts on FTP traffic and, optionally, rips files",
-            longdescription="""
-Goes through TCP connections and tries to find FTP control channels and
-associated data channels. Optionally, it will write out any file data it
-sees into a separate directory.
 
-If a data connection is seen, it prints a message indicating the user, pass,
-and file requested. If the --ftp_dump flag is set, it also dumps the file into the
---ftp_outdir directory.
-""",
-            author="amm,dev195",
-            bpf="tcp",
-            output=AlertOutput(label=__name__),
-            optiondict={
-                "ports": {
-                    'help': 'comma-separated list of ports to watch for control connections (default: 21)',
-                    'metavar': 'PORT,PORT,PORT,[...]',
-                    'default': '21'},
-                "dump": {
-                    'action': 'store_true',
-                    'help': 'dump files from stream'},
-                "outdir": {
-                    'help': 'directory to write output files (default: "ftpout")',
-                    'metavar': 'DIRECTORY',
-                    'default': 'ftpout'}
-            }
+class ReceivedDataProtocol(Protocol):
+    def __init__(self, filename=None):
+        self.__filename = filename
+        self.body = open(filename, "wb") if filename else BytesIO()
+        self.size = 0
+
+    def dataReceived(self, data):
+        self.body.write(data)
+        self.size += len(data)
+
+    @property
+    def filename(self):
+        return self.__filename
+
+    def close(self):
+        self.body.close() if self.filename else self.body.seek(0)
+
+
+_CODE_RE = re.compile(r"\d+")
+
+
+class FTPDownloadHandler:
+    lazy = False
+
+    CODE_MAPPING = {
+        "550": 404,
+        "default": 503,
+    }
+
+    def __init__(self, settings):
+        self.default_user = settings["FTP_USER"]
+        self.default_password = settings["FTP_PASSWORD"]
+        self.passive_mode = settings["FTP_PASSIVE_MODE"]
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        return cls(crawler.settings)
+
+    def download_request(self, request, spider):
+        from twisted.internet import reactor
+
+        parsed_url = urlparse_cached(request)
+        user = request.meta.get("ftp_user", self.default_user)
+        password = request.meta.get("ftp_password", self.default_password)
+        passive_mode = (
+            1 if bool(request.meta.get("ftp_passive", self.passive_mode)) else 0
+        )
+        creator = ClientCreator(
+            reactor, FTPClient, user, password, passive=passive_mode
+        )
+        dfd = creator.connectTCP(parsed_url.hostname, parsed_url.port or 21)
+        return dfd.addCallback(self.gotClient, request, unquote(parsed_url.path))
+
+    def gotClient(self, client, request, filepath):
+        self.client = client
+        protocol = ReceivedDataProtocol(request.meta.get("ftp_local_filename"))
+        return client.retrieveFile(filepath, protocol).addCallbacks(
+            callback=self._build_response,
+            callbackArgs=(request, protocol),
+            errback=self._failed,
+            errbackArgs=(request,),
         )
 
-    def __update_bpf(self):
-        """
-        Dynamically change the BPF to allow processing of data transfer
-        channels.
-        """
-        dynfilters = []
-        for conn, metadata in self.conns.items():
-            try:
-                dynfilters += ["(host %s and host %s)" % metadata["tempippair"]]
-            except (KeyError, TypeError):
-                continue
-        for a, p in self.data_channel_map.keys():
-            dynfilters += ["(host %s and port %d)" % (a, p)]
-        self.bpf = "(%s) and ((%s)%s)" % (
-            self.original_bpf,
-            " or ".join( "port %d" % p for p in self.control_ports ),
-            " or " + " or ".join(dynfilters) if dynfilters else ""
-        )
-        self.recompile_bpf()
+    def _build_response(self, result, request, protocol):
+        self.result = result
+        protocol.close()
+        headers = {"local filename": protocol.filename or "", "size": protocol.size}
+        body = to_bytes(protocol.filename or protocol.body.read())
+        respcls = responsetypes.from_args(url=request.url, body=body)
+        return respcls(url=request.url, status=200, body=body, headers=headers)
 
-    def premodule(self):
-        # dictionary containing metadata for connections
-        self.conns = {}
-        # dictionary mapping data channels (host, port) to their control channels
-        self.data_channel_map = {}
-        # ports used for control channels
-        self.control_ports = set()
-        # Original BPF without manipulation
-        self.original_bpf = self.bpf
-        # set control ports using user-provided info
-        for p in self.ports.split(','):
-            try:
-                self.control_ports.add(int(p))
-            except ValueError as e:
-                self.error("{!r} is not a valid port. Skipping.".format(p))
-        if not self.control_ports:
-            self.error("Could not find any control ports. At least one must be set for this plugin.")
-            sys.exit(1)
-
-        # create output directory
-        # break if it cannot be created
-        if self.dump and not os.path.exists(self.outdir):
-            try:
-                os.makedirs(self.outdir)
-            except (IOError, OSError) as e:
-                self.error("Could not create output directory: {!r}: {!s}"
-                           .format(self.outdir, e))
-                sys.exit(1)
-
-    def connection_init_handler(self, conn):
-        # Create metadata containers for any new connections
-        if conn.serverport in self.control_ports:
-            self.conns[conn.addr] = {
-                'mode': CTRL_CONN,
-                'user': '',
-                'pass': '',
-                'path': [],
-                'datachan': None,
-                'lastcommand': '',
-                'tempippair': None,
-                'filedata': None,
-                'file': ['', '', '']
-            }
-        elif self.dump and (conn.clientip, conn.clientport) in self.data_channel_map:
-            self.conns[conn.addr] = {
-                'mode': DATA_CONN,
-                'ctrlchan': self.data_channel_map[(conn.clientip, conn.clientport)],
-                'filedata': None
-            }
-        elif self.dump and (conn.serverip, conn.serverport) in self.data_channel_map:
-            self.conns[conn.addr] = {
-                'mode': DATA_CONN,
-                'ctrlchan': self.data_channel_map[(conn.serverip, conn.serverport)],
-                'filedata': None
-            }
-        elif self.dump:
-            # This is a data connection with an unknown control connection. It
-            # may be a passive mode transfer without known port info, yet.
-            self.conns[conn.addr] = {
-                'mode': DATA_CONN,
-                'ctrlchan': None,
-                'filedata': None
-            }
-
-    def connection_close_handler(self, conn):
-        # After data channel closes, store file content in control channel's
-        # 'filedata' field.
-        # Control channel will write it to disk after it determines the
-        # filename.
-        try:
-            info = self.conns[conn.addr]
-        except KeyError:
-            return
-
-        if self.dump and info['mode'] == DATA_CONN:
-            # find the associated control channel
-            if info['ctrlchan'] == None:
-                if (conn.clientip, conn.clientport) in self.data_channel_map:
-                    info['ctrlchan'] = self.data_channel_map[(conn.clientip, conn.clientport)]
-                if (conn.serverip, conn.serverport) in self.data_channel_map:
-                    info['ctrlchan'] = self.data_channel_map[(conn.serverip, conn.serverport)]
-            try:
-                ctrlchan = self.conns[info['ctrlchan']]
-            except KeyError:
-                return
-            # add data to control channel dictionary
-            for blob in conn.blobs:
-                if ctrlchan['filedata']:
-                    ctrlchan['filedata'] += blob.data
-                else:
-                    ctrlchan['filedata'] = blob.data
-            # update port list and data channel knowledge
-            if (conn.serverip, conn.serverport) == ctrlchan['datachan']:
-                del self.data_channel_map[ctrlchan['datachan']]
-                ctrlchan['datachan'] = None
-                self.__update_bpf()
-            if (conn.clientip, conn.clientport) == ctrlchan['datachan']:
-                del self.data_channel_map[ctrlchan['datachan']]
-                ctrlchan['datachan'] = None
-                self.__update_bpf()
-            del self.conns[conn.addr]
-
-        elif info['mode'] == CTRL_CONN:
-            # clear control channels if they've been alerted on
-            if info['file'] == None:
-                del self.conns[conn.addr]
-
-    def postmodule(self):
-        for addr, info in self.conns.items():
-            if self.dump and 'filedata' in info and info['filedata']:
-                origname = info['file'][0] + '_' + os.path.join(*info['file'][1:3])
-                outname = dshell.util.gen_local_filename(self.outdir, origname)
-                with open(outname, 'wb') as fh:
-                    fh.write(info['filedata'])
-                numbytes = len(info['filedata'])
-                info['filedata'] = None
-                info['outfile'] = outname
-                msg = 'User: %s, Pass: %s, %s File: %s (Incomplete: %d bytes written to %s)' % (info['user'], info['pass'], info['file'][0], os.path.join(*info['file'][1:3]), numbytes, os.path.basename(outname))
-                self.write(msg, **info)
-
-
-    def blob_handler(self, conn, blob):
-        try:
-            info = self.conns[conn.addr]
-        except KeyError:
-            # connection was not initialized correctly
-            # set the blob to hidden and move on
-            blob.hidden = True
-            return
-
-        if info['mode'] == DATA_CONN:
-            return conn, blob
-
-        try:
-            data = blob.data
-            data = data.decode('ascii')
-        except UnicodeDecodeError as e:
-            # Could not convert command data to readable ASCII
-            blob.hidden = True
-            return
-
-        if blob.direction == 'cs':
-            # client-to-server: try and get the command issued
-            if ' ' not in data.rstrip():
-                command = data.rstrip()
-                param = ''
-            else:
-                command, param = data.rstrip().split(' ', 1)
-            command = command.upper()
-            info['lastcommand'] = command
-
-            if command == 'USER':
-                info['user'] = param
-
-            elif command == 'PASS':
-                info['pass'] = param
-
-            elif command == 'CWD':
-                info['path'].append(param)
-
-            elif command == 'PASV' or command == 'EPSV':
-                if self.dump:
-                    # Temporarily store the pair of IP addresses
-                    # to open up the BPF filter until blob_handler processes
-                    # the response with the full IP/Port information.
-                    # Note: Due to the way blob processing works, we don't
-                    # get this information until after the data channel is
-                    # established.
-                    info['tempippair'] = tuple(
-                        sorted((conn.clientip, conn.serverip))
-                    )
-                    self.__update_bpf()
-
-            # For file transfers (including LIST), store tuple
-            # (Direction, Path, Filename) in info['file']
-            elif command == 'LIST':
-                if param == '':
-                    info['file'] = (
-                        'RETR', os.path.normpath(os.path.join(*info['path']))
-                        if len(info['path'])
-                        else '', 'LIST'
-                    )
-                else:
-                    info['file'] = (
-                        'RETR', os.path.normpath(os.path.join(os.path.join(*info['path']), param))
-                        if len(info['path'])
-                        else '', 'LIST'
-                    )
-            elif command == 'RETR':
-                info['file'] = (
-                    'RETR', os.path.normpath(os.path.join(*info['path']))
-                    if len(info['path'])
-                    else '', param
+    def _failed(self, result, request):
+        message = result.getErrorMessage()
+        if result.type == CommandFailed:
+            m = _CODE_RE.search(message)
+            if m:
+                ftpcode = m.group()
+                httpcode = self.CODE_MAPPING.get(ftpcode, self.CODE_MAPPING["default"])
+                return Response(
+                    url=request.url, status=httpcode, body=to_bytes(message)
                 )
-            elif command == 'STOR':
-                info['file'] = (
-                    'STOR', os.path.normpath(os.path.join(*info['path']))
-                    if len(info['path'])
-                    else '', param
-                )
-
-        # Responses
-        else:
-            # Rollback directory change unless 2xx response
-            if info['lastcommand'] == 'CWD' and data[0] != '2':
-                info['path'].pop()
-            # Write out files upon resonse to transfer commands
-            if info['lastcommand'] in ('LIST', 'RETR', 'STOR'):
-                if self.dump and info['filedata']:
-                    origname = info['file'][0] + '_' + os.path.join(*info['file'][1:3])
-                    outname = dshell.util.gen_local_filename(self.outdir, origname)
-                    with open(outname, 'wb') as fh:
-                        fh.write(info['filedata'])
-                    numbytes = len(info['filedata'])
-                    info['filedata'] = None
-                    info['outfile'] = outname
-                    info.update(conn.info())
-                    msg = 'User: "{}", Pass: "{}", {} File: {} ({:,} bytes written to {})'.format(
-                        info['user'],
-                        info['pass'],
-                        info['file'][0],
-                        os.path.join(*info['file'][1:3]),
-                        numbytes,
-                        os.path.basename(outname)
-                    )
-                else:
-                    info.update(conn.info())
-                    msg = 'User: "{}", Pass: "{}", {} File: {}'.format(
-                        info['user'],
-                        info['pass'],
-                        info['file'][0],
-                        os.path.join(*info['file'][1:3])
-                    )
-                    if data[0] not in ('1','2'):
-                        msg += ' ({})'.format(data.rstrip())
-                info['ts'] = blob.ts
-                if (blob.sip == conn.sip):
-                    self.write(msg, **info, dir_arrow="->")
-                else:
-                    self.write(msg, **info, dir_arrow="<-")
-                info['file'] = None
-
-            # Handle EPSV mode port setting
-            if info['lastcommand'] == 'EPSV' and data[0] == '2':
-                ret = re.findall('\(\|\|\|\d+\|\)', data)
-                # TODO delimiters other than pipes
-                if ret:
-                    tport = int(ret[0].split('|')[3])
-                    info['datachan'] = (conn.serverip, tport)
-                    if self.dump:
-                        self.data_channel_map[(conn.serverip, tport)] = conn.addr
-                        info['tempippair'] = None
-                        self.__update_bpf()
-
-        # Look for ip/port information, assuming PSV response
-        ret = re.findall('\d+,\d+,\d+,\d+,\d+\,\d+', data)
-        if len(ret) == 1:
-            tip, tport = self.calculateTransfer(ret[0])    # transfer ip, transfer port
-            info['datachan'] = (tip, tport)                 # Update this control channel's knowledge of currently working data channel
-            if self.dump:
-                self.data_channel_map[(tip,tport)] = conn.addr     # Update plugin's global datachan knowledge
-                info['tempippair'] = None
-                self.__update_bpf()
-
-        return conn, blob
-
-
-    def calculateTransfer(self, val):
-        # calculate passive FTP data port
-        tmp = val.split(',')
-        ip = '.'.join(tmp[:4])
-        port = int(tmp[4])*256 + int(tmp[5])
-        return ip, port
-
-
-if __name__ == "__main__":
-    print(DshellPlugin())
+        raise result.type(result.value)
