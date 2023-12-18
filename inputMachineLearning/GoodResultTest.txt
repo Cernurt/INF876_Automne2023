@@ -1,0 +1,17 @@
+FILENAME:MEMORYPEAK:EXECUTIONTIME
+PythonScriptsValidation/bifid.py:10.190:738.202ms
+PythonScriptsValidation/binomial_heap.py:10.189:865.470ms
+PythonScriptsValidation/cache.py:10.188:405.643ms
+PythonScriptsValidation/circular_convolution.py:10.189:613.402ms
+PythonScriptsValidation/conjugate_gradient.py:10.190:784.205ms
+PythonScriptsValidation/conversion.py:10.189:400.747ms
+PythonScriptsValidation/count_negative_numbers_in_sorted_matrix.py:208.389:75648ms
+PythonScriptsValidation/decision_tree.py:10.190:1081ms
+PythonScriptsValidation/django.py:10.189:675.064ms
+PythonScriptsValidation/dynamic_arrays.py:10.189:667.605ms
+PythonScriptsValidation/finder.py:10.189:495.773ms
+PythonScriptsValidation/flow_analysis.py:10.189:465.062ms
+PythonScriptsValidation/generics.py:10.189:554.249ms
+PythonScriptsValidation/gradient_descent.py:10.189:1630ms
+PythonScriptsValidation/hamming_code.py:10.190:556.518ms
+PythonScriptsValidation/highest_response_ratio_next.py:10.189:711.333ms
